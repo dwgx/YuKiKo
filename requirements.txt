@@ -5,7 +5,7 @@ python-multipart==0.0.22
 PyYAML==6.0.2
 python-dotenv==1.2.2
 cryptography==44.0.0
-yt-dlp==2026.3.3
+yt-dlp==2026.6.9
 imageio-ffmpeg==0.6.0
 bilix==0.18.9
 bilibili-api-python==17.4.1
