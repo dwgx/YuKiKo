@@ -11,6 +11,6 @@ bilix==0.18.9
 bilibili-api-python==17.4.1
 f2==0.0.1.7
 rookiepy==0.5.6
-websockets==12.0
+websockets==16.0
 pilk==0.2.4
 opencc-python-reimplemented==0.1.7
