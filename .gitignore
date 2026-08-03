@@ -1,0 +1,70 @@
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+.pytest_cache/
+*.log
+
+# 本地环境变量
+.env
+.env.*
+!.env.example
+
+# 本地配置（可能包含密钥）
+config/config.yml
+config/*.local.yml
+config/plugins.yml
+plugins/config/*.local.yml
+plugins/config/*.yml
+napcat.sh
+
+# 运行日志与本地状态目录
+logs/
+storage/
+storage/logs/
+storage/cache/
+storage/tmp/
+storage/memory/
+storage/knowledge/*.db
+storage/knowledge/*.db-*
+storage/affinity/
+storage/emoji/
+storage/sticker/
+storage/image_templates/
+storage/.secret_key
+storage/admin_state.json
+storage/whitelist_groups.json
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# SSH 脚本（包含敏感信息）
+scripts/*ssh*.exp
+scripts/*ssh*.py
+scripts/*vps*.py
+scripts/*vps*.sh
+scripts/*vps*.ps1
+
+# Claude Code 本地文件
+.claude/
+
+# WebUI 前端
+webui/node_modules/
+webui/dist/
+webui/.vite/
+webui/*.tsbuildinfo
+
+# 数据库备份
+*.db.bak
+*.sqlite3
+
+# coverage
+htmlcov/
+.coverage
