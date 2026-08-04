@@ -243,6 +243,150 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         self.assertTrue(any("fallback" in item for item in errors))
         self.assertTrue(any("unknown_tool" in item for item in warnings))
 
+    # ── C2: mode 是死配置，已删除 ──────────────────────────────────────────
+
+    def test_dead_mode_knob_is_gone_from_config_and_prompt(self):
+        """`mode` 全仓无读点，只是每回合被打进 prompt，已删（MIGRATION_TODO C2）。
+
+        原值 `local_prefilter_llm_review` 还反向暗示"本地已预筛、模型只需复核"，
+        与"意图完全由模型读菜单判断"冲突。
+        """
+        payload = default_prompt_navigator_payload()
+        self.assertNotIn("mode", payload)
+
+        nav = PromptNavigator.from_payload(payload)
+        self.assertFalse(hasattr(nav.config, "mode"))
+
+        state = nav.initial_state(_Ctx(), ["think", "final_answer", "navigate_section"])
+        block = nav.render_system_block(state, nav.scoped_tools(state))
+        self.assertNotIn("模式:", block)
+        self.assertNotIn("local_prefilter_llm_review", block)
+
+    def test_stale_mode_key_in_yaml_is_ignored_not_fatal(self):
+        """线上 prompts.yml / master.template.yml 里还留着 `mode:`，加载必须照常。"""
+        payload = default_prompt_navigator_payload()
+        payload["mode"] = "local_prefilter_llm_review"
+        nav = PromptNavigator.from_payload(payload)
+        self.assertTrue(nav.enabled)
+        self.assertEqual(nav.config.default_section, "general_chat")
+        errors, _ = validate_prompt_navigator_payload(payload)
+        self.assertEqual(errors, [])
+
+    # ── 结构信号强弱分档 ───────────────────────────────────────────────────
+
+    def test_mention_alone_is_candidate_not_active_section(self):
+        """@ 了人只是弱信号：不得让不可逆群管理写操作在开局就可见。
+
+        原行为把任何 @ 别人的消息都直接落到 qq_admin_social，
+        于是"@小明 你觉得呢"这种纯闲聊一开局就能看到 set_group_kick /
+        set_group_ban。契约保留（qq_admin_social 仍要进候选、mention_target
+        仍要作为结构事实告诉模型），但起始分区回到 general_chat，
+        真要管理时由模型自己 navigate_section 过去。
+        """
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "@小明 你觉得呢"
+        ctx.at_other_user_ids = ["12345"]
+        state = nav.initial_state(
+            ctx,
+            ["think", "final_answer", "navigate_section", "set_group_ban", "admin_command"],
+        )
+        self.assertEqual(state.active_section, "general_chat")
+        self.assertIn("qq_admin_social", state.candidate_sections)
+        self.assertIn("mention_target", state.evidence)
+        # 开局看不到群管理写操作
+        self.assertNotIn("set_group_ban", nav.scoped_tools(state))
+        # 但模型可以自己走过去
+        self.assertTrue(nav.switch_section(state, "qq_admin_social")[0])
+        self.assertIn("set_group_ban", nav.scoped_tools(state))
+
+    def test_mention_does_not_outrank_structural_media_signal(self):
+        """@ 人 + 带图 时，起始分区必须是图片那一区，不是群管理。"""
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "@小明 看这个"
+        ctx.at_other_user_ids = ["12345"]
+        ctx.raw_segments = [{"type": "image", "data": {"url": "http://x/y.png"}}]
+        state = nav.initial_state(ctx, ["think", "final_answer", "navigate_section", "analyze_image"])
+        self.assertEqual(state.active_section, "multimodal_media")
+        self.assertIn("mention_target", state.evidence)
+
+    # ── URL 解析：TLD 边界 ────────────────────────────────────────────────
+
+    def test_image_filename_is_not_parsed_as_bare_domain(self):
+        """`photo.jpg` 曾被截成裸域名 `photo.jp`（jp 在 TLD 表里）。
+
+        后果是"帮我发个 photo.jpg"被判为消息含 URL，起始分区推去 web_research。
+        """
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        for text in ("帮我发个 photo.jpg", "封面用 cover.aiff", "装 pkg.appx", "改 server.cnf"):
+            with self.subTest(text=text):
+                ctx = _Ctx()
+                ctx.message_text = text
+                state = nav.initial_state(ctx, ["think", "final_answer", "navigate_section"])
+                self.assertNotIn("url", state.evidence)
+                self.assertEqual(state.active_section, "general_chat")
+
+    def test_real_bare_domains_still_detected(self):
+        """边界收紧不能把真域名一起收掉。"""
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        for text, expected in (
+            ("去 bilibili.com 看", "video_url"),
+            ("腾讯视频 v.qq.com 打不开", "video_url"),
+            ("你看看 skiapi.dev 这个站", "web_research"),
+            ("试试 example.com:8080/path", "web_research"),
+        ):
+            with self.subTest(text=text):
+                ctx = _Ctx()
+                ctx.message_text = text
+                state = nav.initial_state(
+                    ctx, ["think", "final_answer", "navigate_section", "fetch_webpage"]
+                )
+                self.assertIn("url", state.evidence)
+                self.assertEqual(state.active_section, expected)
+
+    # ── 菜单一致性 ────────────────────────────────────────────────────────
+
+    def test_directory_tool_count_excludes_control_tools(self):
+        """目录里的工具数是"能力数"。general_chat 有 0 个能力，不能显示成 3 个。"""
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        state = nav.initial_state(_Ctx(), ["think", "final_answer", "navigate_section"])
+        block = nav.render_system_block(state, nav.scoped_tools(state))
+        self.assertIn("general_chat (普通对话与判断起点, 0 工具)", block)
+
+    def test_every_fallback_section_id_exists(self):
+        payload = default_prompt_navigator_payload()
+        section_ids = set(payload["sections"].keys())
+        self.assertEqual(len(section_ids), 20)
+        for sid, section in payload["sections"].items():
+            for fallback in section.get("fallback_sections", []):
+                with self.subTest(section=sid, fallback=fallback):
+                    self.assertIn(fallback, section_ids)
+                    self.assertNotEqual(fallback, sid)
+
+    def test_deliberately_unexposed_tools_stay_out_of_menu(self):
+        """12 个工具是有意不进菜单的，不是漏写。防止下一轮被当成缺口补回来。"""
+        payload = default_prompt_navigator_payload()
+        menu_tools: set[str] = set()
+        for section in payload["sections"].values():
+            menu_tools |= set(section.get("tools", []))
+        for tool in (
+            "get_cookies",
+            "get_credentials",
+            "get_csrf_token",
+            "nc_get_rkey",
+            "cli_invoke",
+            "create_skill",
+            "test_in_sandbox",
+            "example_lookup",
+            "can_send_image",
+            "can_send_record",
+            "get_robot_uin_range",
+            "get_mini_app_ark",
+        ):
+            with self.subTest(tool=tool):
+                self.assertNotIn(tool, menu_tools)
+
 
 class _SequencedModelClient:
     enabled = True
@@ -352,6 +496,39 @@ class _SlowFirstThenFinalModelClient:
         self.calls += 1
         if self.calls == 1:
             await asyncio.sleep(2)
+        return json.dumps(
+            {"tool": "final_answer", "args": {"text": "解析好了。"}},
+            ensure_ascii=False,
+        )
+
+
+class _SlowFirstThenToolThenFinalModelClient:
+    """第 1 次调用很慢（用来触发 obvious-tool 超时上限），第 2 次是小 prompt 重试。
+
+    第 2 次返回模型选的工具，第 3 次收尾。用来验证「提前超时」这个预算优化仍然生效，
+    而工具名不再由本地 if-链决定。
+    """
+
+    enabled = True
+
+    def __init__(self, tool_name: str, tool_args: dict):
+        self.calls = 0
+        self.tool_name = tool_name
+        self.tool_args = dict(tool_args)
+
+    def supports_native_tool_calling(self) -> bool:
+        return False
+
+    async def chat_text_with_retry(self, messages, max_tokens=0, retries=0, backoff=0.0):
+        _ = (messages, max_tokens, retries, backoff)
+        self.calls += 1
+        if self.calls == 1:
+            await asyncio.sleep(2)
+        if self.calls == 2:
+            return json.dumps(
+                {"tool": self.tool_name, "args": self.tool_args},
+                ensure_ascii=False,
+            )
         return json.dumps(
             {"tool": "final_answer", "args": {"text": "解析好了。"}},
             ensure_ascii=False,
@@ -626,10 +803,28 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual([name for name, _ in registry.calls], ["parse_video"])
         self.assertTrue(any(step.get("tool") == "policy_guard" for step in result.steps))
 
+    # ── A7-4：LLM 首轮超时后不再由本地 if-链挑工具，改由 _navigator_timeout_tool_retry
+    # 发起第二次真实 LLM 调用（带该分区的 when_to_use / instructions / 真实 tool schema，
+    # 返回后用 tool_name not in domain_tools 硬校验）。
+    # 下面这组测试场景与断言全部保留，只把「工具是谁选的」从本地换成模型：
+    # fake client 第 1 次调用超时，第 2 次（小 prompt 重试）返回模型选的工具。
+
     def test_video_url_llm_timeout_falls_back_to_parse_tool(self):
         registry = _Registry()
         loop = AgentLoop(
-            model_client=_TimeoutModelClient(),
+            model_client=_SequencedModelClient(
+                [
+                    asyncio.TimeoutError(),
+                    json.dumps(
+                        {
+                            "tool": "parse_video",
+                            "args": {"url": "https://v.douyin.com/demo/"},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    asyncio.TimeoutError(),
+                ]
+            ),
             tool_registry=registry,
             config={
                 "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
@@ -660,7 +855,21 @@ class AgentPromptNavigatorTests(unittest.TestCase):
     def test_failed_tool_display_survives_llm_timeout_fallback(self):
         registry = _FailParseRegistry()
         loop = AgentLoop(
-            model_client=_TimeoutModelClient(),
+            model_client=_SequencedModelClient(
+                [
+                    asyncio.TimeoutError(),
+                    json.dumps(
+                        {
+                            "tool": "parse_video",
+                            "args": {
+                                "url": "https://www.bilibili.com/video/BV1xx411c7mD/"
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    asyncio.TimeoutError(),
+                ]
+            ),
             tool_registry=registry,
             config={
                 "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
@@ -690,7 +899,21 @@ class AgentPromptNavigatorTests(unittest.TestCase):
     def test_direct_image_url_llm_timeout_falls_back_to_resolve_image(self):
         registry = _Registry()
         loop = AgentLoop(
-            model_client=_TimeoutModelClient(),
+            model_client=_SequencedModelClient(
+                [
+                    asyncio.TimeoutError(),
+                    json.dumps(
+                        {
+                            "tool": "resolve_image",
+                            "args": {
+                                "url": "https://imgs.699pic.com/images/601/562/786.jpg!detail.v1"
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    asyncio.TimeoutError(),
+                ]
+            ),
             tool_registry=registry,
             config={
                 "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
@@ -721,9 +944,17 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual(result.reason, "agent_fallback_llm_timeout")
 
     def test_obvious_navigator_tool_caps_initial_llm_wait(self):
+        """分区有明确结构证据时，首轮 LLM 不等满预算，提前进小 prompt 重试。
+
+        原实现的触发条件是「本地 if-链已经挑好了工具」，现在是
+        `_has_navigator_section_evidence(ctx)`（纯结构：分区不是 general_chat、
+        有 evidence、分区里有真实工具）。省预算的效果不变，选工具的人换成了模型。
+        """
         registry = _Registry()
         loop = AgentLoop(
-            model_client=_SlowFirstThenFinalModelClient(),
+            model_client=_SlowFirstThenToolThenFinalModelClient(
+                "parse_video", {"url": "https://v.douyin.com/demo/"}
+            ),
             tool_registry=registry,
             config={
                 "agent": {
@@ -757,7 +988,19 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual([name for name, _ in registry.calls], ["parse_video"])
         self.assertEqual(result.reply_text, "解析好了。")
 
-    def test_video_url_llm_error_falls_back_to_parse_tool(self):
+    def test_video_url_llm_error_does_not_invent_local_tool(self):
+        """原名 test_video_url_llm_error_falls_back_to_parse_tool。
+
+        原断言：LLM 抛 401 之后，本地凭 URL 直接执行 parse_video，
+        `tool_calls_made == 1`。那是在**模型完全没有做出任何决定**的情况下
+        （请求根本没成功）替它执行一个带副作用的工具 —— 正是 owner 要删的本地否决权，
+        所以这条测试是在忠实记录一个 bug。
+
+        场景保持不变（视频直链 + LLM 鉴权失败），断言改为记录修复后的行为：
+        一个工具都不调，把鉴权错误如实告诉用户。
+        超时路径不同：超时时会发起第二次真实 LLM 调用（小 prompt 重试），
+        那是模型自己选的工具，所以超时仍然能落到工具，见上面几条测试。
+        """
         registry = _Registry()
         loop = AgentLoop(
             model_client=_ErrorModelClient(),
@@ -783,12 +1026,18 @@ class AgentPromptNavigatorTests(unittest.TestCase):
 
         result = asyncio.run(loop.run(ctx))
 
-        self.assertEqual([name for name, _ in registry.calls], ["parse_video"])
-        self.assertEqual(result.video_url, "/tmp/yukiko/demo.mp4")
-        self.assertEqual(result.reason, "agent_fallback_llm_error")
-        self.assertEqual(result.tool_calls_made, 1)
+        self.assertEqual([name for name, _ in registry.calls], [])
+        self.assertEqual(result.tool_calls_made, 0)
+        self.assertEqual(result.reason, "agent_llm_error")
+        self.assertIn("鉴权失败", result.reply_text)
 
     def test_timeout_after_navigator_policy_block_still_falls_back_to_tool(self):
+        """policy_guard 挡掉硬答之后再超时，仍然要落到工具。
+
+        `_has_only_navigator_retry_steps` 把「只有 policy_guard 拦截记录」的 steps
+        视为「还没真正调过工具」，所以小 prompt 重试照样允许触发；
+        工具名由重试里的模型给出。
+        """
         registry = _Registry()
         loop = AgentLoop(
             model_client=_SequencedModelClient(
@@ -801,6 +1050,13 @@ class AgentPromptNavigatorTests(unittest.TestCase):
                         ensure_ascii=False,
                     ),
                     asyncio.TimeoutError(),
+                    json.dumps(
+                        {
+                            "tool": "parse_video",
+                            "args": {"url": "https://v.douyin.com/demo/"},
+                        },
+                        ensure_ascii=False,
+                    ),
                     json.dumps(
                         {
                             "tool": "final_answer",
@@ -941,6 +1197,14 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual(result.reply_text, "查到归档了。")
 
     def test_wayback_timeline_failure_falls_back_to_lookup(self):
+        """A7-3：工具失败后的替代工具由模型选，不再由 _fallback_tool_on_failure 的 if-链选。
+
+        场景与断言都保留：wayback_timeline 失败后仍然要落到 wayback_lookup、
+        limit 仍然被收敛到 20、用户仍然拿到 "wayback ok"。
+        区别在于第二次调用现在是模型看到失败 observation 后自己发起的，
+        会如实出现在 steps 里；旧实现是在同一个 step 里静默执行第二个工具，
+        模型既看不到那次调用，也无法否决它。
+        """
         registry = _WaybackTimelineFailRegistry()
         loop = AgentLoop(
             model_client=_SequencedModelClient(
@@ -949,6 +1213,13 @@ class AgentPromptNavigatorTests(unittest.TestCase):
                         {
                             "tool": "wayback_timeline",
                             "args": {"url": "gov.cn", "limit": 500},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "tool": "wayback_lookup",
+                            "args": {"url": "gov.cn", "limit": 20},
                         },
                         ensure_ascii=False,
                     ),
@@ -1639,7 +1910,17 @@ class AgentPromptNavigatorTests(unittest.TestCase):
     def test_multimodal_llm_timeout_falls_back_to_analyze_image_tool(self):
         registry = _Registry()
         loop = AgentLoop(
-            model_client=_TimeoutModelClient(),
+            # 模型只给工具名和空 args；question 由 _normalize_tool_args 从 ctx 结构补进去，
+            # 这条「结构补参」是 KEEP 类，断言照旧。
+            model_client=_SequencedModelClient(
+                [
+                    asyncio.TimeoutError(),
+                    json.dumps(
+                        {"tool": "analyze_image", "args": {}}, ensure_ascii=False
+                    ),
+                    asyncio.TimeoutError(),
+                ]
+            ),
             tool_registry=registry,
             config={
                 "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
@@ -1671,7 +1952,16 @@ class AgentPromptNavigatorTests(unittest.TestCase):
     def test_web_url_llm_timeout_falls_back_to_fetch_tool(self):
         registry = _Registry()
         loop = AgentLoop(
-            model_client=_TimeoutModelClient(),
+            # 裸域名 skiapi.dev 补全成 https://skiapi.dev 是结构补参，仍由 agent 做。
+            model_client=_SequencedModelClient(
+                [
+                    asyncio.TimeoutError(),
+                    json.dumps(
+                        {"tool": "fetch_webpage", "args": {}}, ensure_ascii=False
+                    ),
+                    asyncio.TimeoutError(),
+                ]
+            ),
             tool_registry=registry,
             config={
                 "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},

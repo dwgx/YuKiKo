@@ -13,7 +13,11 @@ from typing import Any
 
 import yaml
 
-from core.config_templates import ensure_prompts_file, load_prompts_template
+from core.config_templates import (
+    ensure_prompts_file,
+    load_prompts_template,
+    strip_heuristic_prompt_lists,
+)
 
 _log = logging.getLogger("yukiko.prompts")
 
@@ -74,6 +78,12 @@ def reload() -> None:
             raw = {}
         defaults = _default_prompts()
         merged, changed = _merge_with_defaults(raw, defaults)
+        # C3：_merge_with_defaults 只回填缺失 key、从不覆盖已有 key，所以老装机
+        # prompts.yml 里的词表能一直活下去。合并之后再剪一次，并把剪枝结果视为
+        # changed，让它真正从磁盘上消失，而不是每次启动重新读出来。
+        merged, pruned = strip_heuristic_prompt_lists(merged, source=str(_PROMPTS_FILE))
+        if pruned:
+            changed = True
         _cache = merged
         _loaded = True
         if changed:

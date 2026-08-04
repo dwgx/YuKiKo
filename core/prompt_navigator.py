@@ -13,6 +13,10 @@ _BARE_WEB_HOST_RE = re.compile(
     r"(?<![@A-Za-z0-9_.-])"
     r"((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
     r"(?:com|net|org|dev|io|ai|app|site|xyz|me|co|cn|jp|tv|gg|cc|info|wiki|top)"
+    # TLD 后必须是非字母数字边界：少了它，`photo.jpg` 会被截成裸域名 `photo.jp`（jp 在表里），
+    # 于是"帮我发个 photo.jpg"被当成含 URL、起始分区推去 web_research。
+    # 同类碰撞还有 .aiff/.ai、.appx/.app、.cnf/.cn、.tvg/.tv。
+    r"(?![A-Za-z0-9-])"
     r"(?::\d{2,5})?(?:/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?)",
     re.IGNORECASE,
 )
@@ -54,8 +58,11 @@ class PromptSection:
 
 @dataclass(slots=True)
 class PromptNavigatorConfig:
+    # 这里没有 mode 字段：历史上的 mode="local_prefilter_llm_review" 全仓没有任何读点，
+    # 只是每回合被打进 system prompt。且"本地预筛 + LLM 复核"这个说法与当前架构相反——
+    # 本地只提供 _preselect 的结构事实提示，意图判断完全由模型读菜单完成。
+    # 配置里残留的 mode 键会被忽略（load_prompt_navigator_config 逐字段取值，不报未知键）。
     enable: bool = True
-    mode: str = "local_prefilter_llm_review"
     strict_tool_routing: bool = True
     default_section: str = "general_chat"
     max_switches: int = 3
@@ -101,10 +108,21 @@ def _as_list(value: Any) -> list[str]:
 
 
 def default_prompt_navigator_payload() -> dict[str, Any]:
-    """Default editable Prompt Navigator graph."""
+    """Default editable Prompt Navigator graph.
+
+    以下 12 个已注册工具**故意**不进任何 section.tools，不是漏写，请勿回补
+    （理由见 .migration/tool-coverage.md 第 5 节）：
+      凭证类：get_cookies / get_credentials / get_csrf_token / nc_get_rkey
+      任意代码执行类：cli_invoke / create_skill / test_in_sandbox
+      演示假数据：example_lookup
+      引擎层结构判断，不是对话能力：can_send_image / can_send_record / get_robot_uin_range
+      模型无法产出合法参数：get_mini_app_ark
+    think / final_answer / navigate_section 是 CONTROL_TOOLS，由 scoped_tools() 无条件
+    注入每个分区，各 section.tools 里也显式列了一份（冗余但无害）；目录里的工具数
+    已排除它们，见 render_system_block()。
+    """
     return {
         'enable': True,
-        'mode': 'local_prefilter_llm_review',
         'strict_tool_routing': True,
         'default_section': 'general_chat',
         'max_switches': 6,
@@ -1169,7 +1187,25 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                     '  带 dry_run=false 的那一次同样是不可逆批量删除，绝不能跳过确认直接执行。\n'
                     '  keep_latest 控制每组重复内容保留最新几条（默认 1）。\n'
                     '不可逆不等于不可用：用户确实要清理时照做，只是必须先说清楚做什么、影响哪些、删了拿不回来，\n'
-                    '并拿到明确同意。不要因为风险就假装没有这个能力，也不要因为用户催就省掉确认。'
+                    '并拿到明确同意。不要因为风险就假装没有这个能力，也不要因为用户催就省掉确认。\n'
+                    '\n'
+                    '写入知识库前，你要自己对内容做一次判断，并把结论放进 learn_knowledge 的参数里：\n'
+                    '- safety_review：这条内容是否适合作为长期知识留存。人身攻击、羞辱性称呼、\n'
+                    '  强迫他人接受的贬称，一律填 unsafe，本次写入会被拒绝。\n'
+                    '  注意判断的是"这段话在做什么"，不是"里面有没有某个词"——\n'
+                    '  解释一个贬称的来历、记录医学常识、记录用户表达的边界（例如"我不喜欢被叫某某"），\n'
+                    '  都是正常知识，填 safe。\n'
+                    '- confidence：你对这条知识的把握，0 到 1。用户亲口明确说的可以给高值；\n'
+                    '  你从上下文推测的给低值。同一标题下已有把握更高的旧值时，低把握的新值不会覆盖它，\n'
+                    '  而是记为待裁决。\n'
+                    '- is_correction：只有在用户明确纠正旧的说法时才填 true。填了它就能覆盖高把握的旧值，\n'
+                    '  所以不要用它来绕过把握判断。\n'
+                    '知识库不做物理删除。发现旧知识过时或说错了，用同一个标题配 is_correction 写新值来取代它，\n'
+                    '历史会自动留存；不要试图删除条目。\n'
+                    '\n'
+                    '用户画像里的"常聊关键词"是这个人历史消息的真实词频，不是系统给他贴的标签。\n'
+                    '要判断对方的领域熟悉度、说话习惯或当下状态，直接读这些词和最近的对话本身，\n'
+                    '自己得出结论；不要期待系统预先给出"他是技术人""他情绪低落"这类现成判断。'
                 ),
                 'fallback_sections': [
                     'chat_history',
@@ -2406,8 +2442,6 @@ def load_prompt_navigator_config(raw: Any) -> PromptNavigatorConfig:
 
     return PromptNavigatorConfig(
         enable=_as_bool(merged.get("enable", True), default=True),
-        mode=normalize_text(str(merged.get("mode", "local_prefilter_llm_review")))
-        or "local_prefilter_llm_review",
         strict_tool_routing=_as_bool(
             merged.get("strict_tool_routing", True),
             default=True,
@@ -2511,7 +2545,6 @@ class PromptNavigator:
         lines: list[str] = ["## Prompt Navigator"]
         if self.config.root_prompt:
             lines.append(self.config.root_prompt)
-        lines.append(f"模式: {self.config.mode}")
         if state.evidence:
             lines.append("本地结构信号: " + "；".join(state.evidence[:6]))
         if state.candidate_sections:
@@ -2525,7 +2558,10 @@ class PromptNavigator:
             # 完整 when_to_use、全量工具名和原生 schema 由 render_active_section_block()
             # 在进入该分区后单独给出，铺进目录属于每回合都付全款的冗余。
             summary = (item.when_to_use or "").strip().split("\n")[0].strip() or "按分区说明判断"
-            tool_count = len(item.tools)
+            # 工具数排除 CONTROL_TOOLS：think / final_answer / navigate_section 在每个分区都
+            # 无条件可见，算进去只会让 general_chat 这种「零能力」分区显示成「3 工具」，
+            # 反而暗示模型那里有活可干。
+            tool_count = sum(1 for name in item.tools if name not in CONTROL_TOOLS)
             # fallback 不进目录：render_active_section_block() 已给出当前分区的建议 fallback，
             # 模型不需要背下另外 19 个分区的退路。
             lines.append(f"- {sid} ({label}, {tool_count} 工具): {summary}")
@@ -2559,7 +2595,16 @@ class PromptNavigator:
         return block
 
     def _preselect(self, ctx: Any) -> tuple[str, list[str], list[str]]:
+        """只读结构事实排出**起始**分区，模型可以随时 navigate_section 否决。
+
+        两档强度：
+        - `add()` 强信号：信号本身就限定了能力族（视频直链、图片段、下载后缀…），
+          可以当起始分区。
+        - `add_weak()` 弱信号：只说明"消息里有这个结构"，完全不限定用户想干什么。
+          只进候选列表，排在 default_section 之后，永远不会成为起始分区。
+        """
         candidates: list[str] = []
+        weak_candidates: list[str] = []
         evidence: list[str] = []
 
         def add(section_id: str, why: str) -> None:
@@ -2567,6 +2612,14 @@ class PromptNavigator:
                 return
             if section_id not in candidates:
                 candidates.append(section_id)
+            if why and why not in evidence:
+                evidence.append(why)
+
+        def add_weak(section_id: str, why: str) -> None:
+            if section_id not in self.config.sections:
+                return
+            if section_id not in candidates and section_id not in weak_candidates:
+                weak_candidates.append(section_id)
             if why and why not in evidence:
                 evidence.append(why)
 
@@ -2600,12 +2653,20 @@ class PromptNavigator:
             add("download_resources", "download_file_extension")
         if urls:
             add("web_research", "url")
+        # @了人是弱信号：群里 @ 某人绝大多数是普通对话（"@小明 你觉得呢"），
+        # 与"想对这个人做群管理操作"没有关系。让它成为起始分区，等于每条 @ 消息
+        # 一开局就把 set_group_kick / set_group_ban / set_group_whole_ban 这类
+        # 不可逆写操作摆到模型面前，而用户根本没提管理。
+        # 真要管理时模型自己 navigate_section 过去，成本是一次跳转。
         if getattr(ctx, "at_other_user_ids", None):
-            add("qq_admin_social", "mention_target")
+            add_weak("qq_admin_social", "mention_target")
 
         default = self.config.default_section
         if default in self.config.sections and default not in candidates:
             candidates.append(default)
+        for section_id in weak_candidates:
+            if section_id not in candidates:
+                candidates.append(section_id)
         if "fallback_debug" in self.config.sections and "fallback_debug" not in candidates:
             candidates.append("fallback_debug")
         active = candidates[0] if candidates else default

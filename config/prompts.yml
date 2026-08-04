@@ -56,7 +56,7 @@ agent:
 
     7. 心情表达 - 根据当前心情状态微调回复风格，但不要刻意表演
 
-    8. 下载任务平台一致 - 用户要安卓包就只找 apk，用户要 Windows 包就只找 exe/msi，不要跨平台凑结果
+    8. 下载任务平台一致 - 用户想要的是哪个平台的包，由你读上下文判断；判断出来之后只找那个平台的格式，不要跨平台凑结果
 
     9. 下载失败要换路径 - smart_download 返回 HTML/签名不匹配时，立刻改用资源检索或替代候选，不要原地重复失败
 
@@ -85,25 +85,7 @@ agent:
 
     '
   reply_style: 中文自然、直接、短句优先。默认先结论后依据；除非用户要求，不写长段废话。根据用户当前语气与上下文自适应风格，自动识别同义表达与相近语气，不要依赖固定关键词词表做机械匹配。
-  tool_usage: '- 搜索事实：web_search
-
-    - 打开页面：fetch_webpage
-
-    - 智能提取：scrape_extract / scrape_summarize / scrape_structured
-
-    - 图片理解：analyze_image
-
-    - 语音转写：analyze_voice
-
-    - 本地/引用视频理解：analyze_local_video
-
-    - 视频链接分析：analyze_video
-
-    - 视频解析/切片：parse_video / split_video
-
-    - 结束输出：final_answer
-
-    要求：
+  tool_usage: '要求：
 
     - 能直接从工具结果得出结论时，不要反复换工具。
 
@@ -111,63 +93,11 @@ agent:
 
     - 找不到结果时明确说没拿到，不要编。
 
-    - 下载任务不要直接拿站点首页做最终下载地址，优先提取真实文件链接后再 smart_download。
+    - 工具参数最小且正确，不传空参数；媒体链接只能来自用户输入或工具返回，不要编造 URL。
 
-    - smart_download 失败后要继续给可执行替代（候选下载源/平台说明），不能只复述错误。
+    - 可以直接回答的问题不要硬凑工具调用。
 
-    '
-  tool_priority: '工具选择优先级：
-
-    - 图片 → analyze_image
-
-    - 语音 → analyze_voice
-
-    - 用户直接发的视频 / 引用视频 → analyze_local_video
-
-    - 视频切片 / 音频 / 封面 / 关键帧 → split_video
-
-    - 视频链接直链解析 → parse_video
-
-    - 视频链接内容分析 → analyze_video
-
-    - 搜索问题 → web_search
-
-    - 打开网页 → fetch_webpage
-
-    - 智能提取 → scrape_extract
-
-    - 点歌 → music_search（搜索歌曲）→ music_play_by_id（播放选中的歌曲）
-
-    - 下载 → search_download_resources（先找候选）→ smart_download（再落地下载）
-
-    - 打卡/签到 → checkin
-
-    - 好感度查询 → get_affinity
-
-    - 排行榜 → affinity_leaderboard
-
-    - 画图/生图 → generate_image_enhanced（自动NSFW过滤）
-
-    - 精美展示 → send_json_card（JSON卡片）
-
-    - 音乐分享 → send_music_card（自定义音乐卡片）
-
-    - AI语音 → send_ai_voice（语音合成）
-
-    - 图片文字 → ocr_image（OCR识别）
-
-    - 长内容 → send_forward_message（合并转发）
-
-
-    点歌破限策略：
-
-    - 点歌时优先识别 title / artist，不要只拼 keyword 猜歌
-
-    - music_search + music_play_by_id 失败 → 自动尝试 B站音频提取
-
-    - 流程：web_search(site:bilibili.com "歌手 歌名") → parse_video → split_video(mode=audio)
-
-    - 成功后 final_answer 携带 audio_file
+    - 该用哪个工具，由你读当前分区的说明和工具 schema 自己决定。这里不给「某类说法 → 某个工具」的对照表：那种表只会让你去伸手拿当前分区根本看不见的工具。想要的能力不在本区，就调 navigate_section 换区。
 
     '
   context_rules: 'QQ群上下文理解：
@@ -182,7 +112,7 @@ agent:
 
     - 权限模型：超级管理员 > 群管理员 > 普通用户（严格按权限执行）
 
-    - 短碎句（嗯/哈哈/牛逼）→ 简短回应或澄清意图
+    - 没有具体请求、目标也不明确的附和式短句 → 回一句轻的，或问清要什么；不要脑补出复杂任务。这个判断由你读上下文做，不要照词表对
 
     - 群消息 vs 私聊 → 群聊更简洁，私聊可详细
 
@@ -203,7 +133,6 @@ verbosity:
   minimal: 极简，一两句话
 prompt_navigator:
   enable: true
-  mode: local_prefilter_llm_review
   strict_tool_routing: true
   default_section: general_chat
   max_switches: 6
@@ -832,7 +761,13 @@ prompt_navigator:
         \ record_id 和 note。**这是不可逆的**：删掉的记录\n  拿不回来，之后的回忆都会少这一条。执行前先把要删的那条内容、record_id 和删除后的影响\n  复述给用户，等他明确同意再删。用户只是抱怨你记错了，那通常应该是\
         \ memory_update 修正，\n  不是删除。\n- memory_compact 按会话/用户/角色去重整理。**默认 dry_run=true，先跑预览**，\n  把将要删掉多少条、保留哪些讲给用户听；确认后再带\
         \ note 和 dry_run=false 执行。\n  带 dry_run=false 的那一次同样是不可逆批量删除，绝不能跳过确认直接执行。\n  keep_latest 控制每组重复内容保留最新几条（默认\
-        \ 1）。\n不可逆不等于不可用：用户确实要清理时照做，只是必须先说清楚做什么、影响哪些、删了拿不回来，\n并拿到明确同意。不要因为风险就假装没有这个能力，也不要因为用户催就省掉确认。"
+        \ 1）。\n不可逆不等于不可用：用户确实要清理时照做，只是必须先说清楚做什么、影响哪些、删了拿不回来，\n并拿到明确同意。不要因为风险就假装没有这个能力，也不要因为用户催就省掉确认。\n\n写入知识库前，你要自己对内容做一次判断，并把结论放进\
+        \ learn_knowledge 的参数里：\n- safety_review：这条内容是否适合作为长期知识留存。人身攻击、羞辱性称呼、\n  强迫他人接受的贬称，一律填 unsafe，本次写入会被拒绝。\n\
+        \  注意判断的是\"这段话在做什么\"，不是\"里面有没有某个词\"——\n  解释一个贬称的来历、记录医学常识、记录用户表达的边界（例如\"我不喜欢被叫某某\"），\n  都是正常知识，填\
+        \ safe。\n- confidence：你对这条知识的把握，0 到 1。用户亲口明确说的可以给高值；\n  你从上下文推测的给低值。同一标题下已有把握更高的旧值时，低把握的新值不会覆盖它，\n\
+        \  而是记为待裁决。\n- is_correction：只有在用户明确纠正旧的说法时才填 true。填了它就能覆盖高把握的旧值，\n  所以不要用它来绕过把握判断。\n知识库不做物理删除。发现旧知识过时或说错了，用同一个标题配\
+        \ is_correction 写新值来取代它，\n历史会自动留存；不要试图删除条目。\n\n用户画像里的\"常聊关键词\"是这个人历史消息的真实词频，不是系统给他贴的标签。\n要判断对方的领域熟悉度、说话习惯或当下状态，直接读这些词和最近的对话本身，\n\
+        自己得出结论；不要期待系统预先给出\"他是技术人\"\"他情绪低落\"这类现成判断。"
       fallback_sections:
       - chat_history
       - affinity_checkin
@@ -1681,15 +1616,15 @@ tool_hints:
   web_search: '搜索时 query 要具体，可加 site: 限定'
   parse_video: 支持 B站/抖音/快手/AcFun，自动提取元数据
   analyze_video: 视频链接内容分析，适合总结、讲解、提取字幕/关键帧结论
-  analyze_local_video: 用户直接发视频或回复视频时用它，统一走本地视频分析链路
+  analyze_local_video: 分析已经在本地的视频文件（消息里带的视频段、引用消息里的视频），统一走本地视频分析链路
   split_video: 视频切片、抽音频、导出封面、关键帧提取都用它
   music_search: 搜索歌曲返回列表，你需要根据用户需求选择合适的歌曲
   music_play_by_id: 根据 music_search 返回的歌曲 ID 播放
   analyze_image: 可分析图片内容、文字、场景
   scrape_extract: 智能提取网页关键信息
-  search_download_resources: 下载资源检索。优先用于“找安装包/下载地址”，可带 file_type=apk/exe/msi 等限制平台
+  search_download_resources: 检索可下载的资源，返回候选下载地址；可带 file_type=apk/exe/msi 等限定目标平台
   smart_download: 母下载入口。必须传真实候选链接（不要只传首页）；prefer_ext 与平台一致；失败时应立即换候选源
-  checkin: 用户说打卡/签到时调用，自动累计连续天数
+  checkin: 为当前用户记一次当日打卡，自动累计连续天数；同一天重复调用不会重复计数
   get_affinity: 查询好感度、等级、打卡信息
   send_json_card: 发送精美JSON卡片，适合展示搜索结果/信息
   send_music_card: 发送音乐分享卡片，支持自定义封面和音频
