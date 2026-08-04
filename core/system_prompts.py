@@ -14,6 +14,20 @@ class SystemPromptRelay:
     """Centralized prompt registry and relay helpers."""
 
     @staticmethod
+    def _strict_navigator_enabled() -> bool:
+        """Prompt Navigator 是否在严格模式（工具族选择归 Agent + 分区目录）。
+
+        直接读 prompt_loader 而不是从 router 穿参：这个开关本来就存在 prompts.yml 里，
+        且 /yukibot 热重载后立即生效。判定逻辑与 YukikoEngine._strict_prompt_navigator_enabled 一致。
+        """
+        raw = _pl.get_section("prompt_navigator")
+        if not isinstance(raw, dict):
+            return False
+        if not bool(raw.get("enable", True)):
+            return False
+        return bool(raw.get("strict_tool_routing", True))
+
+    @staticmethod
     def personality_system_prompt(
         *,
         display_name: str,
@@ -136,6 +150,33 @@ class SystemPromptRelay:
             scope = str(item.get("scope", "")).strip()
             method_text_lines.append(f"- {name} ({scope}): {desc}")
         method_block = "\n".join(method_text_lines) if method_text_lines else "- 无额外方法"
+
+        if SystemPromptRelay._strict_navigator_enabled():
+            # Prompt Navigator 严格模式：工具族的选择归 Agent + 分区目录，
+            # router 只回答「这条要不要接」和置信度。原先这里还枚举整个 action 家族
+            # 并写明「点歌→music_play」「画图→generate_image」，是第二套意图分类器，
+            # 与分区目录抢同一个决策权，且它看不到分区里的工具说明。
+            return (
+                "你是 YukikoBot 的注意力判定器 只输出 JSON 不要输出解释\n"
+                "输出格式\n"
+                '{"should_handle":true|false,"action":"ignore|reply","reason":"...",'
+                '"reason_code":"...","confidence":0.0,'
+                '"reply_style":"short|casual|serious|long","target_user_id":"optional"}\n\n'
+                "你只判断三件事\n"
+                "1 这条消息是否需要机器人回应 should_handle\n"
+                "2 不需要时 action=ignore；需要时 action=reply\n"
+                "3 你对这个判断的确信程度 confidence 必须在 0 到 1\n\n"
+                "判定原则\n"
+                "1 明确对机器人发话 或私聊 或对机器人的追问 should_handle=true\n"
+                "2 群聊闲聊且与机器人无关 should_handle=false action=ignore\n"
+                "3 群聊未@且无明确指向时倾向 ignore；只有高置信且确实在请求时才 reply\n"
+                "4 涉及违法实施 自伤实施 露骨内容时仍然 should_handle=true action=reply，"
+                "由后续环节按安全策略处理，不要在这里替它决定怎么做\n\n"
+                "重要\n"
+                "action 只能是 ignore 或 reply。具体要用哪个工具、要不要联网、要不要点歌画图，"
+                "全部由后面的 Agent 读能力菜单自己决定，不是你的职责。"
+                "不要输出 tool_name 或 tool_args，输出了也会被丢弃。"
+            )
 
         return (
             "你是 YukikoBot 的路由决策器 只输出 JSON 不要输出解释\n"
