@@ -3564,10 +3564,15 @@ class YukikoEngine:
             self._recent_search_cache.clear()
         # 清理群成员名称缓存（淘汰过期条目）
         if len(self._group_member_name_cache) > self._group_member_name_cache_max:
-            now_ts = time.time()
+            # 缓存写入侧存的是 datetime（见 _group_member_name_cache 的两处赋值），
+            # 这里必须同类型比较。
+            now_ts = datetime.now(timezone.utc)
             expired = [
-                gid for gid, info in self._group_member_name_cache.items()
-                if isinstance(info, dict) and now_ts > info.get("expires_at", 0)
+                gid
+                for gid, info in self._group_member_name_cache.items()
+                if isinstance(info, dict)
+                and isinstance(info.get("expires_at"), datetime)
+                and now_ts > info["expires_at"]
             ]
             for gid in expired:
                 self._group_member_name_cache.pop(gid, None)
@@ -5721,6 +5726,12 @@ class YukikoEngine:
         updater = getattr(self, "knowledge_updater", None)
         if updater is not None and reply_text:
             try:
+                # 与 handle_message 同源的判定，就地重算：_after_reply 拿不到那边的局部变量。
+                explicit_bot_addressed = bool(
+                    message.is_private
+                    or message.mentioned
+                    or self._looks_like_bot_call(message.text)
+                )
                 source_text = normalize_text(user_text) or normalize_text(message.text)
                 if hasattr(updater, "update_from_turn_async"):
 
