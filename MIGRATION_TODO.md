@@ -39,9 +39,14 @@ YuKiKo 要成为一个**由模型判断驱动的 QQ 群聊/私聊机器人**，�
       **配套主战场：`core/system_prompts.py:115` `router_system_prompt` 里硬编码了第二套意图分类器
       （枚举整个 action 家族），它在和 PromptNavigator 抢同一个决策权，必须削成
       只判断 should_handle + confidence。**
-- [ ] **A5. `core/trigger.py`（4 个符号）** — `_looks_like_explicit_bot_request`、
-      `_looks_like_explicit_memory_declare`、`_explicit_request_signal_from_cues`、
-      `_explicit_request_signal`。trigger 只保留注意力/防噪门控（@、私聊、回复、活跃会话、白名单、限流）。
+- [x] **A5. `core/trigger.py` 已改为只做注意力门控** — 已修（`3f9fb32`）。
+      删除 `_looks_like_explicit_bot_request`、`_looks_like_explicit_memory_declare`、
+      `_explicit_request_signal_from_cues`、`_explicit_request_signal`，以及死包装 `_should_open_ai_probe`。
+      新增 `_structural_request_signal`：只给四类客观定位符打分（显式命令令牌 / URL / 视频号 / 文件扩展名）。
+      昵称别名匹配**保留** —— 那是身份识别不是意图猜测。
+      *实测：「点歌 热水澡」「帮我看看这个」「你能不能搜一下」「记住我叫小明」全部 0.00；
+      `https://b23.tv/...` 与 `BV1xx411c7mD` 得 0.70，`/music` 得 1.30。*
+
 - [ ] **A6. `core/agent.py` 强制工具子树** — 已删 4 处死分支共 **98 行**（`e89086e`）：
       pre-LLM 合成工具调用、direct-text 拦截、改写模型选中的工具、final_answer 强制路径，
       以及孤立的 `forced_media_tool_consumed`。*验证：零残留引用；全量 680 passed 与删前逐字一致。*
@@ -63,14 +68,36 @@ YuKiKo 要成为一个**由模型判断驱动的 QQ 群聊/私聊机器人**，�
       **`_navigator_timeout_tool_retry:2345` 要保留** —— 它发起第二次真实 LLM 调用并硬校验
       `tool_name not in domain_tools`，符合目标架构；只需把 `:2408-2416` 硬编码的两条分区策略
       文案搬进对应 section 的 `instructions`。
-- [ ] **A8. `core/tools.py`（11 个符号）** — `_detect_query_type`、`_should_auto_web_analysis`、
-      `_looks_like_media_request` 等。注意：`ToolExecutor.execute()` 按 action **字符串**分派
-      不是关键词启发式，别误删。其中一批是「双重死亡」（读的配置 key 如 `image_request_cues`
-      在 `config/` 里不存在 → 恒 False），属于白送的删除。
-- [ ] **A9. 工具内语义猜测（13 个符号）** — `core/tools_video.py` 6 个、`core/tools_vision.py` 5 个、
-      `core/agent_tools_utility.py` 2 个（`_STICKER_SEND_CUES`、`_STICKER_MANAGEMENT_CUES`）、
-      以及 `core/agent_tools_media.py` 的 `analyze_image` 从词表猜 analyze-all / 当前vs引用目标。
-      做法：改成**显式工具参数**，工具返回 `missing_arg` / `ambiguous_target` 而不是猜。
+- [x] **A8. `core/tools.py` 自由文本意图猜测已清除** — 已修（`d63e624` + `8fc9398`）。
+      删除 `_looks_like_image_request`、`_looks_like_image_send_request`、`_looks_like_media_request`、
+      `_looks_like_local_file_request`、`_looks_like_local_media_request`、
+      `_looks_like_deep_web_analysis_request`、`_should_auto_web_analysis`。
+      `_contains_self_avatar_cue` 收缩为只认 `/avatar target=self|me` 令牌
+      （*实测：「我的头像」「看看我的头像」False，令牌 True*）—— 顺带修掉一个真 bug：
+      词表恒空导致带令牌时解析不出调用者 QQ、掉进「给我一个 QQ 号」兜底。
+      **`_detect_query_type` 刻意保留** —— 它在 `core/tools_search.py:42`、模型选定搜索工具**之后**才跑，
+      只喂 `_apply_query_type_hints` 改写查询串，属治理文档保留清单里的「工具内排序」。
+      `execute()` 的 action 字符串分派同样未动（那不是关键词启发式）。
+      *注：`core/engine.py` 里有同名独立副本，属 A2，未受影响。*
+
+- [x] **A9. 工具内语义猜测已转为显式参数** — 已修（`dfc4460` + `d154d30`）。
+      `core/agent_tools_utility.py`：`_STICKER_SEND_CUES`(15 词) + `_STICKER_MANAGEMENT_CUES`(17 词)
+      换成模型必填的 `turn_goal=send|manage`，工具只校验声明。
+      *实测三条契约：管理类原文 + `send` 不再被否决；发送类原文 + `manage` 被拒；
+      不声明则返回 `missing_arg:turn_goal` 而不猜。模型声明双向压过原文。*
+      `core/tools_video.py`：`_pick_video_duration_limit` 签名由 `query` 改为 `duration_scene`，
+      删 `_looks_like_video_send_request`、`_looks_like_douyin_search_request`，
+      新增 `analyze_content` / `depth` / `output_mode`。
+      *原实现猜反了方向：「发我/下载」放宽到 send 档，而真正的分析问句只拿 default 档。*
+      `core/tools_vision.py`：删 `_looks_like_vision_web_lookup_request`、
+      `_looks_like_analyze_all_images_request` 及其零引用的唯一调用者 `_analyze_image_from_message`；
+      `_has_animated_image_hint` 保留结构半边（`sub_type` / `.gif` / `data.summary`）。
+      `core/agent_tools_media.py`（本波无人认领，核实 vision 跨文件笔记时发现）：
+      删掉 17×11 叉乘的 `inferred_analyze_all`，删掉猜「当前图 vs 引用图」的三张词表 —— 两处都有图时
+      改返回 `ambiguous_target` 要求填 `target_message_id`；并补上 vision 侧已开始读却不存在的
+      `web_lookup_on_uncertain` / `is_animated` schema 属性（**不补则新行为是死的**）。
+      *tests/test_tools_video_explicit_args.py 22 passed。*
+
 - [ ] **A10. YAML 里的关键词表** — `config/templates/master.template.yml` 的 trigger / routing /
       self_check / tool_hints 等段里的词表与阈值。`_strip_heuristic_prompt_lists`
       （`core/config_templates.py:24`）只作用于 `_built_in_prompts_defaults()` 的返回值，
@@ -208,6 +235,18 @@ fallback 不进目录（`render_active_section_block` 已单独打印当前区�
       快照时机驱动，即**正常聊天就会触发**。与愿景 2「永久知识库」直接冲突。
       *已实测确认调用链。*
 
+### E0 续：埋点过程中暴露的既有缺陷
+
+- [ ] **E0-4. 写盘失败仍回报成功** — `_save_white` / `_save_ignore` / `_save_runtime_policy`
+      原先返回 `None` 且把写盘异常吞在 `_log.debug` 里。现已改为返回 `bool` 并记
+      `persisted: false`（`409f1a2`），**但用户侧回复文案仍说成功**。
+      *实测：把 `whitelist_groups.json` 换成目录后，用户看到「已加白本群 777」而审计记 `persisted=False`。*
+      需要让回复文案跟随 `persisted` 结果。
+- [ ] **E0-5. 群管理员可清除全局忽略且无法自行恢复** — `remove_ignored_user` 的 group scope
+      回落会把 **global** 忽略一并清掉，而恢复 global 需要超管权限。
+      *实测：群管（非超管）清除后审计记 `irreversible=true` + `escalated_to_global=true`；
+      同一调用由超管执行记 `false`。* 审计已能看见，但权限判定本身要修。
+
 ### E1. 自我净化 + 永久知识库
 
 - [ ] **E1-1. 把已写好但没接线的三套衰减公式接上** — 侦察发现置信度衰减/新鲜度公式已存在但未被调用。
@@ -229,7 +268,13 @@ fallback 不进目录（`render_active_section_block` 已单独打印当前区�
       缺的是结构化存储 + 用模型自省替代模板串 + 回流（约 10 行）。
 - [ ] **E3-2. tool-call 审计流埋点** — 基础设施已就位（`core/audit.py`，`8530e1c`），
       `engine.audit` 已暴露。**剩余**：在工具执行处调 `audit.write(STREAM_TOOL_CALLS, ...)`。
-- [ ] **E3-3. group-op 审计流埋点** — 同上。落点 `core/admin.py:1459/1501/1541` + `app_helpers.py:89`。
+- [x] **E3-3. group-op 审计流已埋点** — 已修（`409f1a2`）。
+      `_audit_group_op` 写 `STREAM_GROUP_OPS`，覆盖加白/拉黑、忽略/恢复用户、高危确认策略、行为模式。
+      每条带 `actor_id` / `group_id` / `target_user_id` / `scope` / `change{before,after}` /
+      `persisted` / `irreversible`，可按字段查。被拒/无变化/非法命令刻意不写 —— 该流必须读起来是变更史。
+      engine 两处构造已接线（`:102` 启动、`:849` 热重载传同一个 trail 使流跨重载连续）。
+      *实测：4 次操作产出 4 条记录，before/after 正确，落在单个
+      `storage/audit/group_ops/<date>.jsonl`；21 个新测试通过。*
 - [x] **E3-0. 审计基础设施** — `core/audit.py`（`8530e1c`）：五条独立流
       （tool_calls / memory_writes / group_ops / prompt_edits / knowledge），
       按天分文件 `storage/audit/<stream>/YYYY-MM-DD.jsonl`，写失败不影响主流程但必告警，
