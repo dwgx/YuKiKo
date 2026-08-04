@@ -25,6 +25,7 @@ from core.agent_tools import (
     register_sticker_tools,
 )
 
+from core.audit import AuditTrail
 from core.affinity import AffinityEngine
 from core.context_compat import (
     CompatContextInput,
@@ -86,6 +87,16 @@ class YukikoEngine:
         bot_config = self.config.get("bot", {})
         debug = bool(bot_config.get("debug", False))
         self.logger = get_logger("yukiko", self.storage_dir / "logs", debug=debug)
+
+        # ── 分离式审计流（工具调用 / 记忆写入 / 群操作 / prompt 自改 / 知识库）──
+        # 文本日志是滚动的，长期痕迹靠这里按天分文件持久化。
+        audit_cfg = self.config.get("audit", {})
+        if not isinstance(audit_cfg, dict):
+            audit_cfg = {}
+        self.audit = AuditTrail(
+            self.storage_dir / "audit",
+            enable=bool(audit_cfg.get("enable", True)),
+        )
 
         # ── 管理员系统 ──
         self.admin = AdminEngine(self.config, self.storage_dir)

@@ -15,10 +15,13 @@ def get_logger(name: str, log_dir: Path, debug: bool = False) -> logging.Logger:
     logger.propagate = False
 
     log_dir.mkdir(parents=True, exist_ok=True)
+    # 原为 2MB×3 = 8MB 硬上限。单条 qq_recv 可带 ≤900 字符 JSON，正常聊天几小时
+    # 就能把上限冲满、挤掉早前的痕迹。提到 16MB×5 = 80MB。
+    # 需要长期留存的结构化痕迹一律走 core/audit.py 的按天 JSONL 流，不依赖本文件。
     file_handler = RotatingFileHandler(
         log_dir / "yukiko.log",
-        maxBytes=2 * 1024 * 1024,
-        backupCount=3,
+        maxBytes=16 * 1024 * 1024,
+        backupCount=4,
         encoding="utf-8",
     )
     stream_handler = logging.StreamHandler()
