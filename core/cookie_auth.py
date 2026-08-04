@@ -2324,10 +2324,17 @@ async def check_all_cookies(cfg: dict) -> dict[str, bool]:
         _log.info("cookie_check | douyin | %s", status)
 
     # 快手
+    # 与其他三个平台保持一致：未配置就不进 results。
+    # 原先无条件写 results["kuaishou"] = bool(ks_cookie)，未配置时落成 False，
+    # 调用方（app.py:1325）把 False 一律当"已失效"，于是启动日志会让用户
+    # 「重新登录」一个他从没登录过的平台。快手没有真正的校验接口，
+    # 已配置就按存在即有效处理。
     ks_cfg = va.get("kuaishou", {}) or {}
     ks_cookie = str(ks_cfg.get("cookie", "")).strip()
-    results["kuaishou"] = bool(ks_cookie)
-    if not ks_cookie:
+    if ks_cookie:
+        results["kuaishou"] = True
+        _log.info("cookie_check | kuaishou | 已配置（无校验接口，按存在即有效）")
+    else:
         _log.info("cookie_check | kuaishou | 未配置")
 
     # QQ空间
