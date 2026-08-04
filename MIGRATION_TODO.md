@@ -188,17 +188,21 @@ fallback 不进目录（`render_active_section_block` 已单独打印当前区�
 
 ### E0. 正在发生的数据丢失（优先于任何新功能）
 
-- [ ] **E0-1. 日志滚动正在冲掉群操作痕迹** — `services/logger.py:18-23`
-      `RotatingFileHandler(maxBytes=2MB, backupCount=3)` = 硬上限 8MB。
-      而 `qq_recv` 单条可带 ≤900 字符 JSON，群操作记录会被正常聊天挤掉。
-      *已实测确认。* 修法与 E3 的持久化审计流合并做。
+- [x] **E0-1. 日志滚动冲掉群操作痕迹** — 已修（`8530e1c`）。
+      `services/logger.py` 从 2MB×3（8MB 硬上限）提到 16MB×4，且**文本日志降级为调试尾巴**：
+      需要长期留存的结构化痕迹改走 `core/audit.py` 的按天 JSONL 流，不再依赖滚动文件。
 - [x] **E0-2. `admin_command` 教模型写一个解析不出的命令** — `core/agent_tools_admin.py:43-45`
       的 schema 写明支持 `white_add` / `white_rm`，但这两个字符串以前只是 `_SUB` 的**值**、不是**键**，
       `_fuzzy_match_command` 对它们 difflib 相似度≈0 → 返回「未知命令」。
       **模型照着自己的工具 schema 写反而失败**，加白/拉黑经 agent 通路根本不可达。
       已修（`998f4d6`）：三个 canonical 名补进 `_SUB`。这一步在 A1 删 `_FUZZY_COMMAND_MAP` 之前是必须的，
       否则中文别名消失后该能力彻底断链。*验证：6 种写法全部解析；680 passed。*
-- [ ] **E0-3. 无审计的 7 天硬删除** — `core/memory.py:2657-2667`
+- [x] **E0-3. 无审计的 7 天硬删除** — 已修（`dc7aebd`）。
+      新增 `memory.embedding_retention_days`，**默认 0 = 永不删除**（两处真相都加了）。
+      启用保留期时删除会报 `embeddings_pruned | removed=%d | cutoff=%s | retention_days=%d`
+      （沿用 `core/memory.py:275` 既有约定），失败改为 `warning` + `exc_info` 不再静默。
+      *行为验证：400 天前的 5 条，默认 0 时全留；设 7 时全删并打审计行。*
+- [ ] ~~**E0-3-old. 无审计的 7 天硬删除**~~ — `core/memory.py:2657-2667`
       `DELETE FROM embeddings WHERE created_at < ?`（7 天），包在 `except Exception: pass` 里，
       **不记录删了多少条、失败也完全静默**。由 `_cleanup_daily_data`（`:2637`）经 `:2634` 的
       快照时机驱动，即**正常聊天就会触发**。与愿景 2「永久知识库」直接冲突。
@@ -223,8 +227,14 @@ fallback 不进目录（`render_active_section_block` 已单独打印当前区�
 
 - [ ] **E3-1. journal 表作为结构化真相源** — 侦察确认素材采集、快照渲染、注入范式全就位，
       缺的是结构化存储 + 用模型自省替代模板串 + 回流（约 10 行）。
-- [ ] **E3-2. tool-call 审计流持久化** — 埋点语义已齐，只缺落库。
-- [ ] **E3-3. group-op 审计流持久化** — 同上。落点 `core/admin.py:1459/1501/1541` + `app_helpers.py:89`。
+- [ ] **E3-2. tool-call 审计流埋点** — 基础设施已就位（`core/audit.py`，`8530e1c`），
+      `engine.audit` 已暴露。**剩余**：在工具执行处调 `audit.write(STREAM_TOOL_CALLS, ...)`。
+- [ ] **E3-3. group-op 审计流埋点** — 同上。落点 `core/admin.py:1459/1501/1541` + `app_helpers.py:89`。
+- [x] **E3-0. 审计基础设施** — `core/audit.py`（`8530e1c`）：五条独立流
+      （tool_calls / memory_writes / group_ops / prompt_edits / knowledge），
+      按天分文件 `storage/audit/<stream>/YYYY-MM-DD.jsonl`，写失败不影响主流程但必告警，
+      未知流名拒绝并告警一次，超长字段截断保留原长。config `audit.enable` 默认 true。
+      *验证：分流建档、字段级读回、5000 字符截断、未知流拒绝、不可写目录返回 False 不抛。*
 - [ ] **E3-4. 三条流里 memory 那条已经做对了，当模板复用** —— 不要重造。
 
 ### E4. 自改 prompt
