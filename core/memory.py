@@ -22,6 +22,11 @@ from utils.filter import STOP_WORDS
 from utils.learning_guard import assess_preferred_name_learning
 from utils.text import normalize_text, tokenize
 
+# ruff 的 isort 把 core.* 判成 first-party、utils.* 判成 third-party，所以这两行
+# 必须分组且 utils 在前，否则本文件的 I001 会从 1 条涨到 2 条。
+# 同 core/admin.py:14-16 的处置。
+from core.audit import STREAM_MEMORY_WRITES, AuditTrail
+
 SYSTEM_NOISE_KEYWORDS = frozenset(
     {
         "multimodal_event",
@@ -65,7 +70,18 @@ class MemoryMessage:
 
 
 class MemoryEngine:
-    def __init__(self, config: dict[str, Any], memory_dir: Path, global_config: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        memory_dir: Path,
+        global_config: dict[str, Any] | None = None,
+        audit: AuditTrail | None = None,
+    ):
+        # 审计流由 engine 注入而不是在这里自建，与 AdminEngine 同范式
+        # （core/admin.py:175）：engine 那一个 AuditTrail 每条流各持一把锁，
+        # 自建第二个实例会让两个进程内对象同时 append 同一个文件。
+        # 为 None 时（测试、脚本直接构造）只写 SQLite，不写 JSONL。
+        self.audit = audit
         control_cfg = {}
         if isinstance(global_config, dict):
             control_cfg = global_config.get("control", {})
@@ -93,7 +109,13 @@ class MemoryEngine:
             int(config.get("media_memory_max_data_uri_chars", 2_000_000)),
         )
         self.media_memory_store_non_image = bool(config.get("media_memory_store_non_image", True))
-        self.media_memory_max_rows = max(200, min(50_000, int(config.get("media_memory_max_rows", 4_000))))
+        # <= 0 表示不设行数上限（永不删除），与 embedding_retention_days=0 同语义。
+        # 原先钳在 max(200, ...)，所以「关掉淘汰」根本没法表达。
+        try:
+            raw_media_rows = int(config.get("media_memory_max_rows", 4_000))
+        except (TypeError, ValueError):
+            raw_media_rows = 4_000
+        self.media_memory_max_rows = 0 if raw_media_rows <= 0 else max(200, min(50_000, raw_media_rows))
         if self.heuristic_rules_enable:
             self.preferred_name_patterns = self._compile_regex_list(config.get("preferred_name_patterns", []))
             self.preferred_name_invalid_parts = tuple(self._normalize_text_list(config.get("preferred_name_invalid_parts", [])))
@@ -152,6 +174,11 @@ class MemoryEngine:
         self._message_counter = 0
 
         self.user_profiles_path = self.user_dir / "profiles.json"
+        # dirty 标志必须在 _sanitize_loaded_profiles() 之前初始化：它内部会调
+        # _save_user_profiles() 置位，原先在它之后无条件写 False 会把这次置位丢掉，
+        # 导致启动清理永远不自己落盘（只能等下一次真实写入顺带带上）。
+        self._user_profiles_dirty = False
+        self._thread_state_dirty = False
         self._user_profiles: dict[str, dict[str, Any]] = self._load_user_profiles()
         self._sanitize_loaded_profiles()
         for user_id, profile in self._user_profiles.items():
@@ -160,8 +187,6 @@ class MemoryEngine:
                 self._user_display_names[user_id] = name
         self.thread_state_path = self.user_dir / "thread_state.json"
         self._thread_state: dict[str, dict[str, Any]] = self._load_thread_state()
-        self._user_profiles_dirty = False
-        self._thread_state_dirty = False
 
         self.db_path = self.vector_dir / "memory.db"
         self._vector_buffer: list[tuple[str, str, str, str, str, str]] = []
@@ -250,6 +275,13 @@ class MemoryEngine:
                     profile["agent_policies"] = policies
                     self._user_profiles[user_id] = profile
                     dirty = True
+            # 词表判定留下的历史字段：`topic_counts` 由已删除的 `_detect_topic_category`
+            # 写入。留着它旧画像会继续把词表结论带进 prompt，所以启动时一并清掉，
+            # 沿用上面 agent_policies 的既有清理范式。
+            if "topic_counts" in profile:
+                profile.pop("topic_counts", None)
+                self._user_profiles[user_id] = profile
+                dirty = True
         if dirty:
             self._save_user_profiles()
 
@@ -864,17 +896,46 @@ class MemoryEngine:
                     """,
                     rows,
                 )
-                conn.execute(
-                    """
-                    DELETE FROM media_memory
-                    WHERE id NOT IN (
-                        SELECT id FROM media_memory ORDER BY id DESC LIMIT ?
-                    );
-                    """,
-                    (self.media_memory_max_rows,),
-                )
+                pruned = 0
+                # media_memory_max_rows <= 0 表示不做行数上限（永不删除），
+                # 与 embedding_retention_days=0 的语义保持一致。
+                if self.media_memory_max_rows > 0:
+                    cur = conn.execute(
+                        """
+                        DELETE FROM media_memory
+                        WHERE id NOT IN (
+                            SELECT id FROM media_memory ORDER BY id DESC LIMIT ?
+                        );
+                        """,
+                        (self.media_memory_max_rows,),
+                    )
+                    pruned = int(cur.rowcount or 0)
         except Exception:
+            # 原先是 `except Exception: return` —— 插入和删除一起静默失败，
+            # 媒体记忆凭空少了也没有任何痕迹。审计是旁路，主流程仍然不抛。
+            _log.warning(
+                "media_memory_write_failed | conversation=%s | message=%s | rows=%d",
+                conv,
+                mid,
+                len(rows),
+                exc_info=True,
+            )
             return
+        if pruned:
+            _log.info(
+                "media_memory_pruned | removed=%d | max_rows=%d",
+                pruned,
+                self.media_memory_max_rows,
+            )
+            self._audit_memory_write(
+                record_id=None,
+                action="retention_prune",
+                actor="system:retention",
+                note=f"media_memory 行数上限 {self.media_memory_max_rows}，淘汰最旧记录",
+                reason="media_memory_max_rows",
+                before_content=f"rows={pruned}",
+                role="media_memory",
+            )
 
     def get_message_media_artifacts(
         self,
@@ -1048,27 +1109,12 @@ class MemoryEngine:
             return "formal"
         return "casual"
 
-    @staticmethod
-    def _detect_topic_category(text: str) -> str:
-        """粗粒度话题分类。"""
-        lower = text.lower()
-        tech_kw = ("代码", "bug", "api", "python", "java", "linux", "git", "docker",
-                    "数据库", "服务器", "编程", "开发", "框架", "npm", "pip", "debug")
-        game_kw = ("游戏", "原神", "lol", "mc", "steam", "ps5", "xbox", "switch",
-                    "副本", "抽卡", "氪金", "段位", "rank", "fps", "moba")
-        anime_kw = ("动漫", "番剧", "漫画", "二次元", "cos", "声优", "新番",
-                    "轻小说", "bilibili", "b站", "mad", "amv")
-        life_kw = ("吃饭", "睡觉", "上班", "下班", "周末", "天气", "外卖",
-                    "快递", "出门", "回家", "累了", "休息")
-        music_kw = ("歌", "音乐", "专辑", "歌手", "演唱会", "网易云", "qq音乐")
-
-        for kw_set, label in [
-            (tech_kw, "tech"), (game_kw, "game"), (anime_kw, "anime"),
-            (life_kw, "life"), (music_kw, "music"),
-        ]:
-            if any(kw in lower for kw in kw_set):
-                return label
-        return "general"
+    # 已删除 `_detect_topic_category`：它用 5 张硬编码词表（tech/game/anime/life/music，
+    # 共 62 词）从自由文本猜「这个人是什么人」，结果经 profiles.json 的 topic_counts
+    # → get_user_profile_summary 的「常聊X」→ prompt → ThinkingEngine._adaptive_style_hint
+    # 变成「可以用专业术语」这类行为指令。这是词表决定行为，不是模型读证据决定。
+    # 替代物已经在同一句 summary 里：`常聊关键词：...` 是真实词频（结构事实），
+    # 模型自己看见 python / bug 就能判断对方懂技术，无需代码替它下结论。
 
     def _update_user_profile(
         self,
@@ -1112,14 +1158,6 @@ class MemoryEngine:
         if profile_text:
             style = self._detect_language_style(profile_text)
             style_counts[style] = int(style_counts.get(style, 0)) + 1
-
-        # 话题分类统计
-        topic_counts = profile.get("topic_counts", {})
-        if not isinstance(topic_counts, dict):
-            topic_counts = {}
-        if profile_text:
-            topic = self._detect_topic_category(profile_text)
-            topic_counts[topic] = int(topic_counts.get(topic, 0)) + 1
 
         # 回复长度偏好追踪（最近 20 条的平均长度）
         recent_lengths = profile.get("recent_lengths", [])
@@ -1220,7 +1258,6 @@ class MemoryEngine:
             "active_hours": hours,
             "keywords": keywords,
             "style_counts": style_counts,
-            "topic_counts": topic_counts,
             "recent_lengths": recent_lengths,
             "emotion_counts": emotion_counts,
             "preferred_name": preferred_name,
@@ -1421,17 +1458,9 @@ class MemoryEngine:
         if question_ratio >= 0.35:
             style_hints.append("常追问细节")
 
-        # 话题偏好
-        topic_counts = profile.get("topic_counts", {})
-        if isinstance(topic_counts, dict) and topic_counts:
-            top_topics = sorted(topic_counts.items(), key=lambda x: int(x[1]), reverse=True)[:2]
-            topic_map = {
-                "tech": "技术", "game": "游戏", "anime": "动漫/二次元",
-                "life": "日常生活", "music": "音乐", "general": "综合",
-            }
-            topic_labels = [topic_map.get(t, t) for t, _ in top_topics if t != "general"]
-            if topic_labels:
-                style_hints.append(f"常聊{'、'.join(topic_labels)}")
+        # 话题偏好一节已删除：原先由 `_detect_topic_category` 的词表判定，
+        # 把「常聊技术/游戏/动漫」写进画像再经 prompt 变成行为指令。
+        # 上面的 `常聊关键词：{keyword_text}` 已经把原始词频交给模型自行判断。
 
         # 情绪倾向
         emotion_counts = profile.get("emotion_counts", {})
@@ -1873,6 +1902,43 @@ class MemoryEngine:
             del rows[idx]
             break
 
+    def _audit_memory_write(
+        self,
+        *,
+        record_id: int | None,
+        action: str,
+        actor: str,
+        note: str = "",
+        reason: str = "",
+        before_content: str = "",
+        after_content: str = "",
+        conversation_id: str = "",
+        user_id: str = "",
+        role: str = "",
+    ) -> None:
+        """把一次记忆写入/变更落到 memory_writes 审计流。
+
+        字段与 memory_audit_log 表一一对应，便于两份记录对账。
+        `AuditTrail.write` 自身不抛异常也不影响主流程，所以这里不需要 try。
+        """
+        if self.audit is None:
+            return
+        self.audit.write(
+            STREAM_MEMORY_WRITES,
+            action,
+            record_id=record_id,
+            actor=normalize_text(actor) or "system",
+            note=normalize_text(note),
+            reason=normalize_text(reason),
+            conversation_id=normalize_text(conversation_id),
+            user_id=normalize_text(user_id),
+            role=normalize_text(role),
+            change={
+                "before": normalize_text(before_content),
+                "after": normalize_text(after_content),
+            },
+        )
+
     def _write_memory_audit(
         self,
         *,
@@ -1887,6 +1953,23 @@ class MemoryEngine:
         user_id: str = "",
         role: str = "",
     ) -> None:
+        # JSONL 审计流写在 enable_vector_memory 短路之前，这是本次接线的全部意义：
+        # SQLite 那份审计跟着向量记忆开关一起哑掉（下面那个 return），
+        # 而且和 embeddings 同库、同一个保留策略，删记忆时审计的 record_id 会悬空。
+        # storage/audit/memory_writes/<date>.jsonl 与向量开关、与 memory.db 都无关，
+        # 且按天独立成文件、逐行 JSON，可以按字段查、与 tool_calls / group_ops 分开。
+        self._audit_memory_write(
+            record_id=record_id,
+            action=action,
+            actor=actor,
+            note=note,
+            reason=reason,
+            before_content=before_content,
+            after_content=after_content,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            role=role,
+        )
         if not self.enable_vector_memory:
             return
         ts = datetime.now(timezone.utc).isoformat()
@@ -2195,18 +2278,59 @@ class MemoryEngine:
         self,
         *,
         record_id: int | None = None,
+        action: str = "",
+        actor: str = "",
+        user_id: str = "",
+        role: str = "",
+        since: str = "",
+        until: str = "",
         limit: int = 100,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
+        """按字段查记忆写入/变更审计。
+
+        原先只能按 record_id 过滤，「今天我改了哪些记忆」「谁删的」只能整表拉出来
+        在外面筛。子句拼装沿用 `list_memory_records` 的现成写法；
+        `created_at` 已有 idx_memory_audit_created_at 索引，时间范围可直接走。
+        """
         if not self.enable_vector_memory:
             return [], 0
         limit = max(1, min(500, int(limit or 100)))
         offset = max(0, int(offset or 0))
+        clauses: list[str] = []
         params: list[Any] = []
-        where_sql = ""
+
         if record_id is not None:
-            where_sql = "WHERE record_id = ?"
+            clauses.append("record_id = ?")
             params.append(int(record_id))
+
+        action_value = normalize_text(action)
+        actor_value = normalize_text(actor)
+        uid = normalize_text(user_id)
+        role_value = normalize_text(role)
+        since_value = normalize_text(since)
+        until_value = normalize_text(until)
+
+        if action_value:
+            clauses.append("action = ?")
+            params.append(action_value)
+        if actor_value:
+            clauses.append("actor = ?")
+            params.append(actor_value)
+        if uid:
+            clauses.append("user_id = ?")
+            params.append(uid)
+        if role_value:
+            clauses.append("role = ?")
+            params.append(role_value)
+        if since_value:
+            clauses.append("created_at >= ?")
+            params.append(since_value)
+        if until_value:
+            clauses.append("created_at <= ?")
+            params.append(until_value)
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
         with self._connect() as conn:
             total_row = conn.execute(
@@ -2682,6 +2806,18 @@ class MemoryEngine:
                         embedding_cutoff,
                         retention,
                     )
+                    # 这条删除不走 delete_memory_record，所以不经过 memory_audit_log。
+                    # 它是本文件唯一的批量删除，必须在审计流里留痕，否则「记忆少了」
+                    # 事后无从追溯。滚动文本日志会被正常聊天挤掉，指望不上。
+                    self._audit_memory_write(
+                        record_id=None,
+                        action="retention_prune",
+                        actor="system:retention",
+                        note=f"保留期 {retention} 天，删除 created_at < {embedding_cutoff} 的 embeddings",
+                        reason="embedding_retention_days",
+                        before_content=f"rows={deleted}",
+                        role="embeddings",
+                    )
             except Exception:
                 # 不再静默：清理失败必须可见，否则数据库会无声膨胀。
                 _log.warning(
@@ -2743,17 +2879,15 @@ class MemoryEngine:
         msg_count = int(profile.get("message_count", 0))
         keywords = profile.get("keywords", [])
         top_kw = keywords[:5] if isinstance(keywords, list) else []
-        style = normalize_text(str(profile.get("language_style", "")))
-        topics = profile.get("topic_preferences", {})
+        # 原先这里还读 `language_style` 与 `topic_preferences` 两个 key 并据此拼
+        # 「风格: X | 兴趣: Y」。全仓历史上从未有任何代码写过这两个 key
+        # （`git log --all -S` 零命中），画像里实际落的是 `style_counts`，
+        # 且 `topic_preferences` 对应的词表判定已随 `_detect_topic_category` 删除。
+        # 两段分支恒为假，属于死读，一并移除。
 
         parts = [f"用户: {name}"]
         if msg_count:
             parts.append(f"消息数: {msg_count}")
         if top_kw:
             parts.append(f"关键词: {'、'.join(str(k) for k in top_kw)}")
-        if style:
-            parts.append(f"风格: {style}")
-        if isinstance(topics, dict) and topics:
-            top_topics = sorted(topics.items(), key=lambda x: x[1], reverse=True)[:3]
-            parts.append(f"兴趣: {'、'.join(t for t, _ in top_topics)}")
         return " | ".join(parts)
