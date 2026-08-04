@@ -83,9 +83,6 @@ config:
     short_ping_phrases: []
     short_ping_require_directed: true
     kaomoji_enable: true
-    kaomoji_allowlist:
-    - QWQ
-    - AWA
     relationship_progressive_enable: true
     relationship_hard_boundary_enabled: true
     relationship_commitment_min_level: 8

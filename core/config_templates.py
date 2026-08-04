@@ -158,7 +158,8 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "short_ping_phrases": [],
             "short_ping_require_directed": True,
             "kaomoji_enable": True,
-            "kaomoji_allowlist": ["QWQ", "AWA"],
+            # kaomoji_allowlist 已删除：它只被 _apply_tone_guard 那三个改写函数使用，
+            # 而那些函数在替模型决定情绪表达。kaomoji_enable 保留。
             "relationship_progressive_enable": True,
             "relationship_hard_boundary_enabled": True,
             "relationship_commitment_min_level": 8,

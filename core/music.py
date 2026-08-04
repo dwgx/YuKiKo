@@ -1308,7 +1308,7 @@ class MusicEngine:
         result = MusicPlayResult(
             ok=True, song=song,
             audio_path=str(mp3_path),
-            message=f"{song.name} - {song.artist} QWQ",
+            message=f"{song.name} - {song.artist}",
         )
 
         if as_voice and self._ffmpeg and self._pilk_available:
@@ -1382,7 +1382,7 @@ class MusicEngine:
             ok=True,
             song=song,
             audio_path=str(mp3_path),
-            message=f"{song.name} - {song.artist} QWQ",
+            message=f"{song.name} - {song.artist}",
         )
 
         if as_voice and self._ffmpeg and self._pilk_available:

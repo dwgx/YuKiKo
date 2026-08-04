@@ -54,10 +54,8 @@ from services.logger import get_logger
 from services.model_client import ModelClient
 from utils.text import (
     clip_text,
-    normalize_kaomoji_style,
     normalize_text,
     remove_markdown,
-    replace_emoji_with_kaomoji,
     strip_invisible_format_chars,
     tokenize,
 )
@@ -474,18 +472,9 @@ class YukikoEngine:
         self._multi_reply_total_budget = _mr_max_chars * _mr_max_chunks if bool(
             bot_config.get("multi_reply_enable", True)
         ) else 0
-        kaomoji_raw = bot_config.get("kaomoji_allowlist", ["QWQ", "AWA"])
-        if not isinstance(kaomoji_raw, list):
-            kaomoji_raw = ["QWQ", "AWA"]
-        kaomoji_allowlist = [
-            normalize_text(str(item))
-            for item in kaomoji_raw
-            if normalize_text(str(item))
-        ]
-        if not kaomoji_allowlist:
-            kaomoji_allowlist = ["QWQ", "AWA"]
-        self.kaomoji_allowlist = kaomoji_allowlist
-        self.default_kaomoji = self.kaomoji_allowlist[0]
+        # kaomoji_allowlist / default_kaomoji 已随 _apply_tone_guard 的重写删除：
+        # 白名单只被那三个改写函数使用，而它们在替模型决定情绪表达。
+        # kaomoji_enable 保留 —— 管理员显式关闭时仍然剥除颜文字。
         self.kaomoji_enable = bool(bot_config.get("kaomoji_enable", True))
         self.relationship_progressive_enable = bool(
             bot_config.get("relationship_progressive_enable", True)
@@ -5160,18 +5149,12 @@ class YukikoEngine:
         return " / ".join(rows)
 
     def _build_kaomoji_prompt_hint(self) -> str:
+        """开启时不再报白名单 —— 没有白名单了，用什么由模型自己定。"""
+
         if not self.kaomoji_enable:
-            return "颜文字开关: 关闭（禁止输出 QWQ/AWA 等颜文字）"
+            return "颜文字开关: 关闭（管理员已禁止输出颜文字）"
 
-        allowlist = [
-            normalize_text(str(item))
-            for item in self.kaomoji_allowlist
-            if normalize_text(str(item))
-        ]
-        if not allowlist:
-            return "颜文字开关: 开启（当前白名单为空）"
-
-        return f"颜文字开关: 开启（允许: {','.join(allowlist)}）"
+        return "颜文字开关: 开启（用不用、用哪个由你自己判断，没有白名单）"
 
     def _is_relationship_commitment_request(self, text: str) -> bool:
         content = normalize_text(text).lower()
@@ -5392,55 +5375,22 @@ class YukikoEngine:
         return f"{name}，{reply_text}"
 
     def _apply_tone_guard(self, text: str) -> str:
+        """只做排版归一。情绪表达本身归模型。
+
+        这里以前在 kaomoji_enable=true 时做三件事，全是代码替模型决定怎么表达情绪：
+        `replace_emoji_with_kaomoji` 把模型写的 emoji 删掉换成 default_kaomoji、
+        `normalize_kaomoji_style` 把所有颜文字删到只剩一个、
+        `_enforce_kaomoji_allowlist` 再按白名单筛一遍并挪到句尾。
+        合起来的效果就是每句话都被改写成以 QWQ 结尾 —— 模型写什么都一样。
+
+        kaomoji_enable=false 仍然剥除：那是管理员显式关闭，属于该保留的配置门。
+        """
+
         content = str(text or "")
-        if self.kaomoji_enable:
-            content = replace_emoji_with_kaomoji(content, kaomoji=self.default_kaomoji)
-            content = normalize_kaomoji_style(content, default=self.default_kaomoji)
-            content = self._enforce_kaomoji_allowlist(content)
-        else:
+        if not self.kaomoji_enable:
             content = self._strip_known_kaomoji_tokens(content)
         content = re.sub(r"\n{3,}", "\n\n", content)
         return content.strip()
-
-    def _enforce_kaomoji_allowlist(self, text: str) -> str:
-        content = str(text or "")
-        if not content:
-            return ""
-
-        allowed = {
-            normalize_text(item).lower()
-            for item in self.kaomoji_allowlist
-            if normalize_text(item)
-        }
-        if not allowed:
-            return content
-
-        known = ("QWQ", "AWA", "OwO", "UwU", "QAQ", ">_<", "TAT", "XD")
-        for token in known:
-            token_key = token.lower()
-            if token_key in allowed:
-                continue
-
-            if re.fullmatch(r"[A-Za-z0-9_]+", token):
-                pattern = rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])"
-            else:
-                pattern = re.escape(token)
-            content = re.sub(pattern, " ", content, flags=re.IGNORECASE)
-        # 至多保留一个允许的颜文字
-        kept = ""
-        for token in self.kaomoji_allowlist:
-            pattern = rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])"
-            found = re.search(pattern, content, flags=re.IGNORECASE)
-            if found:
-                kept = token
-                content = re.sub(pattern, " ", content, flags=re.IGNORECASE)
-                break
-
-        content = re.sub(r"[ \t]{2,}", " ", content).strip()
-        if kept:
-            return f"{content} {kept}".strip()
-
-        return content
 
     def _build_mention_only_reply(self, user_name: str) -> str:
         name = normalize_text(user_name)

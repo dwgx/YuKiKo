@@ -22,8 +22,6 @@ class RelationshipHumanizationRegressionTests(unittest.TestCase):
     def _build_engine(*, level: int, interactions: int) -> YukikoEngine:
         engine = YukikoEngine.__new__(YukikoEngine)
         engine.kaomoji_enable = True
-        engine.kaomoji_allowlist = ["QWQ", "AWA"]
-        engine.default_kaomoji = "QWQ"
         engine.relationship_progressive_enable = True
         engine.relationship_hard_boundary_enabled = True
         engine.relationship_commitment_min_level = 8
