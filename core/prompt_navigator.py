@@ -412,14 +412,16 @@ def load_prompt_navigator_config(raw: Any) -> PromptNavigatorConfig:
         sid = normalize_text(str(section_id))
         if not sid or not isinstance(value, dict):
             continue
+        # 自由文本字段只做 strip：normalize_text 会把 \s+ 压成单空格，
+        # 多行 prompt 正文（instructions / when_to_use 等）必须保留换行。
         sections[sid] = PromptSection(
             id=sid,
             name=normalize_text(str(value.get("name", ""))),
-            when_to_use=normalize_text(str(value.get("when_to_use", ""))),
+            when_to_use=str(value.get("when_to_use", "") or "").strip(),
             tools=_as_list(value.get("tools")),
-            instructions=normalize_text(str(value.get("instructions", ""))),
+            instructions=str(value.get("instructions", "") or "").strip(),
             fallback_sections=_as_list(value.get("fallback_sections")),
-            failure_policy=normalize_text(str(value.get("failure_policy", ""))),
+            failure_policy=str(value.get("failure_policy", "") or "").strip(),
         )
 
     default_section = normalize_text(str(merged.get("default_section", "general_chat"))) or "general_chat"
@@ -442,7 +444,7 @@ def load_prompt_navigator_config(raw: Any) -> PromptNavigatorConfig:
         ),
         default_section=default_section,
         max_switches=max_switches,
-        root_prompt=normalize_text(str(merged.get("root_prompt", ""))),
+        root_prompt=str(merged.get("root_prompt", "") or "").strip(),
         sections=sections,
     )
 
@@ -536,7 +538,6 @@ class PromptNavigator:
         return True, "switched"
 
     def render_system_block(self, state: NavigatorState, scoped_tools: list[str]) -> str:
-        section = self.config.sections.get(state.active_section)
         lines: list[str] = ["## Prompt Navigator"]
         if self.config.root_prompt:
             lines.append(self.config.root_prompt)
@@ -552,7 +553,8 @@ class PromptNavigator:
             label = item.name or sid
             when = item.when_to_use or "按分区说明判断"
             fallbacks = ", ".join(item.fallback_sections) if item.fallback_sections else "-"
-            tools = ", ".join(item.tools[:12]) if item.tools else "-"
+            # 不截断：分区目录是模型选区的唯一依据，截断等于让工具永远不可见。
+            tools = ", ".join(item.tools) if item.tools else "-"
             lines.append(f"- {sid} ({label}): {when} | tools: {tools} | fallback: {fallbacks}")
         lines.append("")
         lines.append(self.render_active_section_block(state, scoped_tools))
@@ -661,7 +663,11 @@ class PromptNavigator:
                 elif seg_type in {"video", "shortvideo"}:
                     kinds.add("video")
                 if isinstance(data, dict):
-                    if data.get("image") or data.get("url") and seg_type == "image":
+                    # 必须由 seg_type 把关：视频段的 data.image 是封面缩略图，
+                    # 少了括号会让它被当成图片，把该走视频的回合推去 multimodal_media。
+                    if seg_type in {"image", "pic", "picture"} and (
+                        data.get("image") or data.get("url")
+                    ):
                         kinds.add("image")
                     if data.get("file") and seg_type in {"record", "voice"}:
                         kinds.add("voice")
