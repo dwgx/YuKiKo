@@ -933,6 +933,18 @@ class AdminEngine:
         passthrough = [t for t in passthrough if t in _ALLOWED_PASSTHROUGH]
         cmd_args.extend(passthrough)
 
+        # 把解析出的别名真正翻译成脚本 flag。原先 check_only / restart_mode /
+        # allow_dirty 只用来决定超时和标题文案，从不进 cmd_args——于是
+        # 「/yuki update check」会跑完整的 git pull + 装依赖 + 建 webui + 热重载，
+        # 而只有直接写「--check-only」才是真检查。这是最危险的一处：
+        # 用户以为在查看，实际在生产环境执行更新。
+        if check_only and "--check-only" not in cmd_args:
+            cmd_args.append("--check-only")
+        if restart_mode and "--restart" not in cmd_args:
+            cmd_args.append("--restart")
+        if allow_dirty and "--allow-dirty" not in cmd_args:
+            cmd_args.append("--allow-dirty")
+
         if self._update_lock.locked():
             return "已有远程更新任务在执行中，请稍后再试。"
 
