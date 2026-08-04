@@ -54,12 +54,14 @@ YuKiKo 要成为一个**由模型判断驱动的 QQ 群聊/私聊机器人**，�
       **契约要保留，但实现须改由 navigator 承担**（断言改成 `_preselect` 命中
       `multimodal_media` 且该区 tools 含分析工具），改完才能删函数。
 
-- [ ] **A7. `core/agent.py` 仍活着的 4 条关键词路径** — 这几条是真迁移，不是清理：
-      `_rewrite_download_tool_if_needed:4658`（模型选完工具后本地改工具名）、
-      `_normalize_tool_args:3726`（语义猜参数默认值）、`_fallback_tool_on_failure:4415`、
-      `_navigator_timeout_fallback_tool:2275`（本地 if-chain 直接决定工具）。
-      **`_navigator_timeout_tool_retry:2443` 要保留** —— 它发起第二次真实 LLM 调用并硬校验
-      `tool_name not in domain_tools`，符合目标架构；只需把 `:2507-2515` 硬编码的两条分区策略
+- [ ] **A7. `core/agent.py` 仍活着的 4 条关键词路径** — 这几条是真迁移，不是清理。
+      **行号已因 `e89086e` 删除 98 行而全部漂移 −98，以下为 HEAD 实测值：**
+      `_rewrite_download_tool_if_needed:4560`（模型选完工具后本地改工具名）、
+      `_normalize_tool_args:3628`（语义猜参数默认值）、`_fallback_tool_on_failure:4317`、
+      `_navigator_timeout_fallback_tool:2177`（本地 if-chain 直接决定工具）。
+      **危险**：这一带全是相邻的 `def`，按旧行号做切片编辑不会语法报错，只会**静默改错函数**。
+      **`_navigator_timeout_tool_retry:2345` 要保留** —— 它发起第二次真实 LLM 调用并硬校验
+      `tool_name not in domain_tools`，符合目标架构；只需把 `:2408-2416` 硬编码的两条分区策略
       文案搬进对应 section 的 `instructions`。
 - [ ] **A8. `core/tools.py`（11 个符号）** — `_detect_query_type`、`_should_auto_web_analysis`、
       `_looks_like_media_request` 等。注意：`ToolExecutor.execute()` 按 action **字符串**分派
@@ -73,6 +75,16 @@ YuKiKo 要成为一个**由模型判断驱动的 QQ 群聊/私聊机器人**，�
       self_check / tool_hints 等段里的词表与阈值。`_strip_heuristic_prompt_lists`
       （`core/config_templates.py:24`）只作用于 `_built_in_prompts_defaults()` 的返回值，
       没有作用于 `load_prompts_template()` 和 `prompt_loader.reload()` —— 存在绕过路径。
+
+- [ ] **A11. 侦察新发现、A1–A10 均未收录的关键词符号** —
+      `core/memory.py:995 _detect_language_style`、`core/memory.py:1044 _detect_topic_category`
+      （内嵌 16 词 `tech_kw` / 15 词 `game_kw` 硬编码表）、
+      `core/knowledge_updater.py:118 _looks_like_tool_echo`（读类级 `_TOOL_ECHO_CUES:26`，
+      **未受 `heuristic_rules_enable` 门控**，是活代码；但其 cue 是 `[cq:` / `"tool"` / `http://`
+      这类**结构标记**而非语义意图词，归类偏结构信号，迁移时按结构信号处理）、
+      `core/agent_tools_knowledge.py:774 _looks_like_harmful_knowledge_payload`
+      （8 词脏词表 + 「以后你叫」/「叫他」组合）。
+      *全部经我实测确认存在于 HEAD。*
 
 ## B. 交付缺口（阻塞 A 组开工）
 
@@ -88,7 +100,7 @@ YuKiKo 要成为一个**由模型判断驱动的 QQ 群聊/私聊机器人**，�
 ## C. 已知 bug（与关键词迁移无关，但已确认存在）
 
 - [ ] **C1. `get_cookies` 凭证外泄** — `core/agent_tools_napcat.py:2204` 把 QQ Cookie 经
-      `_compact_data()`（`core/agent.py:2098`）放进 `tool_result.data` 喂回 LLM
+      `_compact_data()`（`core/agent.py:5341`，调用点 `:2001`，喂回 LLM `:2023-2034`）放进 `tool_result.data` 喂回 LLM
       （`:2126`），再可能被 `final_answer` 复述到群里。已排除在菜单外，但工具本身仍注册可调。
 - [ ] **C2. `mode` 是死配置** — `PromptNavigatorConfig.mode` 被解析并打印给模型
       （`模式: local_prefilter_llm_review`），但全仓无任何代码分支读它。要么删，要么给它真实含义。
@@ -165,3 +177,71 @@ fallback 不进目录（`render_active_section_block` 已单独打印当前区�
 
 按单位能力算效率更高（5813 换 20 区/178 工具/丰满说明 vs 4515 换 12 区/79 工具/单薄说明），
 但绝对值确实涨了。**若要求绝对值不超基线，需要你明确取舍。**
+
+---
+
+## E. 自我进化能力（愿景实现）
+
+> 侦察结论：**五项愿景没有一项需要从零重建**，地基比预期好。详见 `.migration/vision-plan.md`
+> 与 `.migration/vision-*.md`（7 份子系统侦察，约 320KB）。
+> 成熟度：自改 prompt 70% · 知识库净化 40% · 自建 skill 55% · 每日日记 35% · 分离审计 33%。
+
+### E0. 正在发生的数据丢失（优先于任何新功能）
+
+- [ ] **E0-1. 日志滚动正在冲掉群操作痕迹** — `services/logger.py:18-23`
+      `RotatingFileHandler(maxBytes=2MB, backupCount=3)` = 硬上限 8MB。
+      而 `qq_recv` 单条可带 ≤900 字符 JSON，群操作记录会被正常聊天挤掉。
+      *已实测确认。* 修法与 E3 的持久化审计流合并做。
+- [x] **E0-2. `admin_command` 教模型写一个解析不出的命令** — `core/agent_tools_admin.py:43-45`
+      的 schema 写明支持 `white_add` / `white_rm`，但这两个字符串以前只是 `_SUB` 的**值**、不是**键**，
+      `_fuzzy_match_command` 对它们 difflib 相似度≈0 → 返回「未知命令」。
+      **模型照着自己的工具 schema 写反而失败**，加白/拉黑经 agent 通路根本不可达。
+      已修（`998f4d6`）：三个 canonical 名补进 `_SUB`。这一步在 A1 删 `_FUZZY_COMMAND_MAP` 之前是必须的，
+      否则中文别名消失后该能力彻底断链。*验证：6 种写法全部解析；680 passed。*
+- [ ] **E0-3. 无审计的 7 天硬删除** — `core/memory.py:2657-2667`
+      `DELETE FROM embeddings WHERE created_at < ?`（7 天），包在 `except Exception: pass` 里，
+      **不记录删了多少条、失败也完全静默**。由 `_cleanup_daily_data`（`:2637`）经 `:2634` 的
+      快照时机驱动，即**正常聊天就会触发**。与愿景 2「永久知识库」直接冲突。
+      *已实测确认调用链。*
+
+### E1. 自我净化 + 永久知识库
+
+- [ ] **E1-1. 把已写好但没接线的三套衰减公式接上** — 侦察发现置信度衰减/新鲜度公式已存在但未被调用。
+- [ ] **E1-2. 写入质量门** — 去重、矛盾比对决策、`access_count` 字段、陈旧判定。
+      落点在 `core/knowledge.py` 写入路径 + `core/knowledge_updater.py`。
+      **须与该文件的关键词清理（`_looks_like_tool_echo`、A11）合并为一个提交**，否则互相踩。
+- [ ] **E1-3. schema 迁移框架** — 保证升级不静默丢数据；与 `yukiko backup` 的交互要明确。
+
+### E2. 自建 skill / 工具叠加
+
+- [ ] **E2-1. 声明式 skill 定义 + boot loader + 分区可见性绑定** —
+      侦察确认 registry 运行时**完全可变**，工具叠加**零机制成本**（已实跑验证）。
+      **安全边界（必须守住）**：skill 只能是「按顺序调用已注册工具 + 传参」的声明式编排，
+      **不含新代码**。允许模型生成可执行代码 = 任意代码执行，一个被越狱的模型就能拿到 shell。
+
+### E3. 每日日记 + 分离审计流
+
+- [ ] **E3-1. journal 表作为结构化真相源** — 侦察确认素材采集、快照渲染、注入范式全就位，
+      缺的是结构化存储 + 用模型自省替代模板串 + 回流（约 10 行）。
+- [ ] **E3-2. tool-call 审计流持久化** — 埋点语义已齐，只缺落库。
+- [ ] **E3-3. group-op 审计流持久化** — 同上。落点 `core/admin.py:1459/1501/1541` + `app_helpers.py:89`。
+- [ ] **E3-4. 三条流里 memory 那条已经做对了，当模板复用** —— 不要重造。
+
+### E4. 自改 prompt
+
+- [ ] **E4-1. bot 可调的编辑工具 + 不污染 git 的 overlay 层 + 独立审计** —
+      热重载、超管门、`dry_run`、高危确认、`bot_selfconfig` 分区全就位（70%）。
+      **三个已踩过的坑必须绕开**：`_merge_with_defaults` 只回填不修剪、
+      `config/prompts.yml` 被 git 跟踪、模板在 `config_templates.py:593-596` 压过 Python payload。
+      每次自编辑必须可回滚、可审计，且明确哪些段不许模型碰。
+
+### E5. 施工顺序约束（同一文件不允许两波并发）
+
+- [ ] **E5-1. 干净可立即并行的文件** — `core/knowledge.py`、`core/agent_tools_registry.py`、
+      `core/prompt_loader.py` 不在关键词清除范围内，E 组可与 A 组全程并行。
+- [ ] **E5-2. 必须串行的文件** — `core/engine.py`（A2/A3）、`core/agent.py`（A6/A7）、
+      `core/admin.py`（A1）。行区间虽不重叠，但按同文件规则串行。
+- [ ] **E5-3. `prompts.yml` 追加必须串行** — E1/E3/E4 只做「已存在分区的 tools 列表追加」，
+      指定 E2 独占结构性变更（新增分区）。
+- [ ] **E5-4. `.migration/vision-plan.md` 第 3 节未写完**（卡在 `SECTION_3_PLACEHOLDER`）—
+      五项愿景的逐条数据模型与文件落点细节缺失，开工前需补。
