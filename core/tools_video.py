@@ -22,13 +22,11 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse
 import httpx
 
 from utils.text import clip_text, normalize_text
-from utils.intent import looks_like_video_request as _shared_video_request
-from core import prompt_loader as _pl
 from core.tools_types import ToolResult
 from core.tools_types import _unwrap_redirect_url, _normalize_multimodal_query, _is_known_image_signature
 from utils.process_compat import macos_subprocess_kwargs, resolve_executable_for_spawn
 import logging as _logging
-from core.tools_types import _SilentYTDLPLogger, _prompt_cues, _tool_trace_tag, _write_netscape_cookie_file
+from core.tools_types import _SilentYTDLPLogger, _tool_trace_tag, _write_netscape_cookie_file
 from core.video_analyzer import VideoAnalysisResult, VideoAnalyzer
 from core.search import SearchResult
 
@@ -39,6 +37,26 @@ except Exception:  # pragma: no cover
 
 _tool_log = _logging.getLogger("yukiko.tools")
 _ytdlp_log = _logging.getLogger("yukiko.ytdlp")
+
+
+def _optional_flag_arg(value: Any) -> bool | None:
+    """读三态布尔工具参数：None 表示模型这一轮没给，不要替它猜。
+
+    模型可能把布尔写成 JSON 里的 true/false，也可能写成 "true"/"1"/"no" 这类字符串，
+    这里只做类型归一，不做语义推断；认不出来的值同样返回 None 交给调用方走保守分支。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = normalize_text(str(value)).lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return None
 
 
 class ToolVideoMixin:
@@ -318,8 +336,14 @@ class ToolVideoMixin:
 
         meta = await self._inspect_platform_video_metadata_safe(url)
 
-        # 如果是分析请求，使用深度分析
-        if self._looks_like_video_analysis_request(query):
+        # 要不要顺手做深度分析，由显式工具参数 analyze_content 决定；没给就回落到
+        # /analyze 这类用户真的打进来的控制令牌，不再从自然语言猜「他其实想要总结」。
+        analyze_content = _optional_flag_arg(method_args.get("analyze_content"))
+        if (
+            bool(analyze_content)
+            if analyze_content is not None
+            else self._looks_like_video_analysis_request(query)
+        ):
             local_path = (
                 resolved
                 if resolved
@@ -400,6 +424,9 @@ class ToolVideoMixin:
         except Exception:
             limit = 5
 
+        analyze_content = _optional_flag_arg(method_args.get("analyze_content"))
+        output_mode = normalize_text(str(method_args.get("output_mode", ""))).lower()
+
         results = await self._search_douyin_video_candidates(keyword, limit=limit)
         if not results:
             return ToolResult(
@@ -434,6 +461,8 @@ class ToolVideoMixin:
                     query=f"{keyword} 抖音 视频",
                     meta=meta,
                     tool_name=method_name,
+                    analyze_content=analyze_content,
+                    output_mode=output_mode,
                     extra_payload={
                         "platform": "douyin",
                         "query": keyword,
@@ -1060,8 +1089,10 @@ class ToolVideoMixin:
                 )
 
         depth = normalize_text(str(method_args.get("depth", "auto"))) or "auto"
-        text_only_requested = self._looks_like_analysis_text_only_request(
-            f"{query}\n{message_text}"
+        # 只回文字还是连视频一起发，由显式工具参数 output_mode 决定（text / video / auto）。
+        text_only_requested = self._wants_text_only_output(
+            output_mode=str(method_args.get("output_mode", "")),
+            fallback_text=f"{query}\n{message_text}",
         )
 
         resolved = ""
@@ -1171,36 +1202,26 @@ class ToolVideoMixin:
         except Exception:
             return {}
 
-    def _pick_video_duration_limit(self, query: str) -> tuple[int, str]:
-        content = normalize_text(query).lower()
-        if self._looks_like_video_analysis_request(content):
+    def _pick_video_duration_limit(self, duration_scene: str = "") -> tuple[int, str]:
+        """按**显式传入**的场景取时长上限，不再从 query 文本猜用户想干什么。
+
+        原实现读 `local_media_request_cues`（配置里不存在该 key，恒空）后回落到内置中文词表，
+        于是「发我 / 下载 / 转发 / 解析」会把上限悄悄放宽到 send 档，而真正的分析类问句
+        「总结一下这个视频」只拿到 default 档 —— 猜的方向本身就是错的。
+        场景现在由调用方显式给出（工具参数 `duration_scene`），猜不出来就走最保守的 default。
+        """
+        scene = normalize_text(duration_scene).lower()
+        if scene == "analysis":
             return self._video_search_analysis_max_duration_seconds, "analysis"
-        send_cues = [
-            normalize_text(cue).lower()
-            for cue in _pl.get_list("local_media_request_cues")
-            if normalize_text(cue)
-        ]
-        if not send_cues:
-            send_cues = [
-                "发送",
-                "发我",
-                "发到群",
-                "转发",
-                "下载",
-                "解析",
-                "直发",
-                "发视频",
-                "把视频发",
-            ]
-        if any(cue in content for cue in send_cues):
+        if scene == "send":
             return self._video_search_send_max_duration_seconds, "send"
         return self._video_search_max_duration_seconds, "default"
 
     def _is_video_duration_acceptable_for_search(
-        self, meta: dict[str, Any], query: str
+        self, meta: dict[str, Any], duration_scene: str = ""
     ) -> tuple[bool, int, int, str]:
         duration = int(meta.get("duration", 0) or 0)
-        limit, scene = self._pick_video_duration_limit(query)
+        limit, scene = self._pick_video_duration_limit(duration_scene)
         if duration <= 0:
             return True, limit, duration, scene
         return duration <= limit, limit, duration, scene
@@ -1457,9 +1478,23 @@ class ToolVideoMixin:
         message_text: str = "",
         tool_name: str = "search_video",
         extra_payload: dict[str, Any] | None = None,
+        analyze_content: bool | None = None,
+        output_mode: str = "",
     ) -> ToolResult:
-        """视频搜索结果处理，优先使用 VideoAnalyzer 进行深度分析"""
-        is_analysis = self._looks_like_video_analysis_request(query)
+        """视频搜索结果处理，`analyze_content=True` 时走 VideoAnalyzer 深度分析。
+
+        是否做深度分析、以及分析结果要不要连视频一起发，都由**显式参数**决定：
+        - `analyze_content`：模型在工具参数里给的布尔值。None 表示这一轮没给。
+        - `output_mode`：`text` / `video` / `auto`。`text` 表示只回文字、不发视频。
+        `analyze_content` 为 None 时回落到 `_looks_like_video_analysis_request`，
+        那个函数现在只认 `/analyze`、`output=text` 这类**用户真的打进来的控制令牌**，
+        属于显式 typed-command 契约，不是自然语言猜测。
+        """
+        is_analysis = (
+            bool(analyze_content)
+            if analyze_content is not None
+            else self._looks_like_video_analysis_request(query)
+        )
 
         if is_analysis:
             local_path = (
@@ -1488,7 +1523,10 @@ class ToolVideoMixin:
                 "analysis_depth": analysis.analysis_depth,
                 "evidence": evidence,
             }
-            if self._looks_like_analysis_text_only_request(f"{query}\n{message_text}"):
+            if self._wants_text_only_output(
+                output_mode=output_mode,
+                fallback_text=f"{query}\n{message_text}",
+            ):
                 payload["mode"] = "text"
                 payload["video_url"] = ""
             image_urls = [
@@ -1658,6 +1696,20 @@ class ToolVideoMixin:
         )
         return any(re.search(pattern, content) for pattern in explicit_patterns)
 
+    def _wants_text_only_output(self, output_mode: str, fallback_text: str = "") -> bool:
+        """只回文字、不发视频 —— 由显式工具参数 `output_mode` 决定。
+
+        `text` → 只回文字；`video` → 必须带视频，即使用户打了 output=text 也不降级；
+        `auto` 或没传 → 回落到 `_looks_like_analysis_text_only_request`，
+        它只认 output=text / /summary / --text-only 这类用户显式打进来的控制令牌。
+        """
+        mode = normalize_text(output_mode).lower()
+        if mode == "text":
+            return True
+        if mode == "video":
+            return False
+        return self._looks_like_analysis_text_only_request(fallback_text)
+
     def _compose_video_result_text(
         self,
         source_url: str,
@@ -1738,7 +1790,25 @@ class ToolVideoMixin:
             f"最长约 {longest_text}），我先跳过了这些结果。"
         )
 
-    async def _search_video(self, query: str) -> ToolResult:
+    async def _search_video(
+        self,
+        query: str,
+        *,
+        duration_scene: str = "",
+        analyze_content: Any = None,
+        output_mode: str = "",
+        message_text: str = "",
+    ) -> ToolResult:
+        """检索视频。
+
+        `duration_scene` / `analyze_content` / `output_mode` 都由调用方（模型选完工具后的
+        工具参数）显式给出，本函数不再从 query 文本猜「用户是要发视频还是要内容总结」。
+        三个参数缺省时走最保守分支：default 时长档 + 不做深度分析。
+        `analyze_content` 收原始工具参数值，三态归一在本函数内做，调用方不必自己转。
+        """
+        duration_scene = normalize_text(duration_scene).lower()
+        output_mode = normalize_text(output_mode).lower()
+        analyze_content = _optional_flag_arg(analyze_content)
         if self._is_blocked_video_text(query):
             return ToolResult(
                 ok=False,
@@ -1792,6 +1862,9 @@ class ToolVideoMixin:
                     resolved=resolved,
                     query=query,
                     meta=meta,
+                    message_text=message_text,
+                    analyze_content=analyze_content,
+                    output_mode=output_mode,
                 )
             if (
                 "douyin.com" in normalize_text(urlparse(url).netloc).lower()
@@ -1815,8 +1888,10 @@ class ToolVideoMixin:
             if not candidate or self._is_blocked_video_url(candidate):
                 continue
             meta = await self._inspect_platform_video_metadata_safe(candidate)
-            duration_ok, duration_limit, duration_value, duration_scene = (
-                self._is_video_duration_acceptable_for_search(meta, query=query)
+            duration_ok, duration_limit, duration_value, resolved_scene = (
+                self._is_video_duration_acceptable_for_search(
+                    meta, duration_scene=duration_scene
+                )
             )
             if not duration_ok:
                 _ytdlp_log.info(
@@ -1825,14 +1900,14 @@ class ToolVideoMixin:
                     candidate[:80],
                     duration_value,
                     duration_limit,
-                    duration_scene,
+                    resolved_scene,
                 )
                 duration_filtered_candidates.append(
                     {
                         "url": candidate,
                         "duration": duration_value,
                         "limit": duration_limit,
-                        "scene": duration_scene,
+                        "scene": resolved_scene,
                     }
                 )
                 continue
@@ -1847,6 +1922,9 @@ class ToolVideoMixin:
                 resolved=resolved,
                 query=query,
                 meta=meta,
+                message_text=message_text,
+                analyze_content=analyze_content,
+                output_mode=output_mode,
                 extra_payload={
                     "results": [
                         {"title": r.title, "snippet": r.snippet, "url": r.url}
@@ -1897,8 +1975,10 @@ class ToolVideoMixin:
                     platform_page_hint = candidate
                 continue
             meta = await self._inspect_platform_video_metadata_safe(candidate)
-            duration_ok, duration_limit, duration_value, duration_scene = (
-                self._is_video_duration_acceptable_for_search(meta, query=query)
+            duration_ok, duration_limit, duration_value, resolved_scene = (
+                self._is_video_duration_acceptable_for_search(
+                    meta, duration_scene=duration_scene
+                )
             )
             if not duration_ok:
                 _ytdlp_log.info(
@@ -1907,14 +1987,14 @@ class ToolVideoMixin:
                     candidate[:80],
                     duration_value,
                     duration_limit,
-                    duration_scene,
+                    resolved_scene,
                 )
                 duration_filtered_candidates.append(
                     {
                         "url": candidate,
                         "duration": duration_value,
                         "limit": duration_limit,
-                        "scene": duration_scene,
+                        "scene": resolved_scene,
                     }
                 )
                 continue
@@ -1937,6 +2017,9 @@ class ToolVideoMixin:
                 resolved=resolved,
                 query=query,
                 meta=meta,
+                message_text=message_text,
+                analyze_content=analyze_content,
+                output_mode=output_mode,
                 extra_payload={
                     "results": [
                         {"title": r.title, "snippet": r.snippet, "url": r.url}
@@ -1958,8 +2041,10 @@ class ToolVideoMixin:
                 if not self._is_platform_video_detail_url(candidate):
                     continue
                 meta = await self._inspect_platform_video_metadata_safe(candidate)
-                duration_ok, duration_limit, duration_value, duration_scene = (
-                    self._is_video_duration_acceptable_for_search(meta, query=query)
+                duration_ok, duration_limit, duration_value, resolved_scene = (
+                    self._is_video_duration_acceptable_for_search(
+                        meta, duration_scene=duration_scene
+                    )
                 )
                 if not duration_ok:
                     _ytdlp_log.info(
@@ -1968,14 +2053,14 @@ class ToolVideoMixin:
                         candidate[:80],
                         duration_value,
                         duration_limit,
-                        duration_scene,
+                        resolved_scene,
                     )
                     duration_filtered_candidates.append(
                         {
                             "url": candidate,
                             "duration": duration_value,
                             "limit": duration_limit,
-                            "scene": duration_scene,
+                            "scene": resolved_scene,
                         }
                     )
                     continue
@@ -1996,6 +2081,9 @@ class ToolVideoMixin:
                     resolved=resolved,
                     query=query,
                     meta=meta,
+                    message_text=message_text,
+                    analyze_content=analyze_content,
+                    output_mode=output_mode,
                     extra_payload={
                         "results": [
                             {"title": r.title, "snippet": r.snippet, "url": r.url}
@@ -4200,33 +4288,15 @@ class ToolVideoMixin:
         for item in files[: max(0, len(files) - self._video_cache_keep_files)]:
             self._safe_unlink(item)
 
-    def _looks_like_video_send_request(self, text: str) -> bool:
-        content = _normalize_multimodal_query(text).lower()
-        if not content:
-            return False
-        send_cues = [
-            normalize_text(cue).lower()
-            for cue in _pl.get_list("local_media_request_cues")
-            if normalize_text(cue)
-        ]
-        if not send_cues:
-            send_cues = [
-                "发送",
-                "发给我",
-                "发视频",
-                "把视频发我",
-                "转发这个视频",
-                "给我这个视频",
-            ]
-        return self._looks_like_video_request(content) and any(
-            cue in content for cue in send_cues
-        )
-
     def _looks_like_video_request(self, text: str) -> bool:
-        content = _normalize_multimodal_query(text)
-        if _shared_video_request(content, config=self._raw_config):
-            return True
-        lower = normalize_text(content).lower()
+        """只认结构信号：视频扩展名直链 URL，或 /video、/vid 显式控制令牌。
+
+        原本还会先问 utils.intent.looks_like_video_request（自然语言词表），
+        那个函数已被改成恒 `return False` 的桩，调用它只是死分支，这里删掉。
+        「用户想要视频」这件事由模型读 Prompt Navigator 的 video_url / media_search
+        分区说明后直接选工具，不再由本地词表猜。
+        """
+        lower = normalize_text(_normalize_multimodal_query(text)).lower()
         if not lower:
             return False
         if re.search(
@@ -4236,20 +4306,6 @@ class ToolVideoMixin:
         if re.search(r"(?:^|\s)/(?:video|vid)(?:\s|$)", lower):
             return True
         return False
-
-    def _looks_like_douyin_search_request(self, text: str) -> bool:
-        content = _normalize_multimodal_query(text).lower()
-        if not content:
-            return False
-        platform_hit = ("抖音" in content) or ("douyin" in content)
-        if not platform_hit:
-            return False
-        search_cues = _prompt_cues(
-            "douyin_search_cues", ("搜索", "搜", "找", "推荐", "来点", "给我来", "查")
-        )
-        return any(
-            cue in content for cue in search_cues
-        ) and self._looks_like_video_request(content)
 
     @staticmethod
     def _looks_like_video_analysis_request(text: str) -> bool:
@@ -4266,18 +4322,8 @@ class ToolVideoMixin:
                 return True
         if "output=text" in re.sub(r"\s+", "", content):
             return True
-        cues = _prompt_cues(
-            "video_analysis_cues",
-            (
-                "解析",
-                "分析",
-                "评价",
-                "解读",
-                "讲讲",
-                "讲了什么",
-                "内容是什么",
-                "总结一下",
-                "怎么看",
-            ),
-        )
-        return any(cue in content for cue in cues)
+        # 只认上面两种显式控制令牌。「解析 / 分析 / 讲了什么 / 总结一下」这类自然语言
+        # 词表已删除：是否做内容分析改由工具参数 analyze_content 显式给出，
+        # 或者模型直接改调 analyze_video —— _prompt_cues 早已全局停用（恒返回空元组），
+        # 原来的词表判断本就永假。
+        return False

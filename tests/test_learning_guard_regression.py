@@ -13,6 +13,7 @@ from core.knowledge_updater import KnowledgeUpdater
 from core.memory import MemoryEngine
 from core.tools import ToolExecutor
 from core.trigger import TriggerEngine, TriggerInput
+from utils.learning_guard import assess_preferred_name_learning
 
 
 class _DummyKB:
@@ -62,39 +63,56 @@ class LearningGuardRegressionTests(unittest.TestCase):
         return memory
 
     def test_trigger_memory_declare_requires_directed_and_non_hype_context(self) -> None:
+        """称呼偏好只在"指向 bot 且非起哄语境"下可学。
+
+        契约本体归 utils.learning_guard（模型选完 learn_knowledge / remember_user_fact
+        之后的硬校验）；core/trigger.py 不再做这层语义唤醒。
+        """
         trigger = TriggerEngine({}, {"name": "YuKiKo", "nicknames": ["yukiko"]})
         now = datetime.now(timezone.utc)
 
         self.assertFalse(
-            trigger._looks_like_explicit_memory_declare(
-                TriggerInput(
-                    conversation_id="group:1",
-                    user_id="u1",
-                    text="以后都叫我妈妈",
-                    mentioned=False,
-                    is_private=False,
-                    timestamp=now,
-                    at_other_user_ids=[],
-                    reply_to_user_id="",
-                    bot_id="bot",
-                )
-            )
+            assess_preferred_name_learning(
+                "以后都叫我妈妈",
+                is_private=False,
+                mentioned=False,
+                bot_aliases=trigger.bot_aliases,
+                at_other_user_ids=[],
+                reply_to_user_id="",
+                bot_id="bot",
+            ).allow
         )
         self.assertTrue(
-            trigger._looks_like_explicit_memory_declare(
-                TriggerInput(
-                    conversation_id="group:1",
-                    user_id="u1",
-                    text="以后叫我阿背",
-                    mentioned=True,
-                    is_private=False,
-                    timestamp=now,
-                    at_other_user_ids=[],
-                    reply_to_user_id="bot",
-                    bot_id="bot",
-                )
-            )
+            assess_preferred_name_learning(
+                "以后叫我阿背",
+                is_private=False,
+                mentioned=True,
+                bot_aliases=trigger.bot_aliases,
+                at_other_user_ids=[],
+                reply_to_user_id="bot",
+                bot_id="bot",
+            ).allow
         )
+
+        # trigger 侧的 explicit_memory_fact 语义唤醒分支已删除：
+        # 未 @、未叫名字的称呼声明只能落回 not_directed，由 Agent + Navigator 判断意图。
+        self.assertFalse(hasattr(trigger, "_looks_like_explicit_memory_declare"))
+        undirected = trigger.evaluate(
+            TriggerInput(
+                conversation_id="group:1",
+                user_id="u1",
+                text="以后叫我阿背",
+                mentioned=False,
+                is_private=False,
+                timestamp=now,
+                at_other_user_ids=[],
+                reply_to_user_id="bot",
+                bot_id="bot",
+            ),
+            recent_messages=[],
+        )
+        self.assertNotEqual(undirected.reason, "explicit_memory_fact")
+        self.assertEqual(undirected.reason, "not_directed")
 
     def test_memory_only_learns_safe_preferred_name(self) -> None:
         memory = self._make_memory()

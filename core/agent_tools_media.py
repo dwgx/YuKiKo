@@ -120,6 +120,21 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
                     "target_message_id": {"type": "string", "description": "强制指定要分析的消息ID（可选）"},
                     "allow_recent_fallback": {"type": "boolean", "description": "无图片时是否允许回退到最近一张图片（可选）"},
                     "recent_only_when_unique": {"type": "boolean", "description": "回退时仅在最近图片唯一时才自动命中（可选）"},
+                    "web_lookup_on_uncertain": {
+                        "type": "boolean",
+                        "description": (
+                            "识别不确定时是否允许联网补查出处（可选，默认否）。"
+                            "用户想知道图里的人/作品/番剧/出处这类需要外部知识的问题时填 true；"
+                            "只是要描述画面内容就不用填。"
+                        ),
+                    },
+                    "is_animated": {
+                        "type": "boolean",
+                        "description": (
+                            "该图是否按动图处理（可选）。不填时由 OneBot 段元数据"
+                            "（sub_type / .gif 扩展名）自行判断，通常不需要你填。"
+                        ),
+                    },
                 },
                 "required": [],
             },
@@ -654,31 +669,23 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
             return default
         return parsed
 
-    all_scope_cues = (
-        "所有图片",
-        "全部图片",
-        "所有图",
-        "全部图",
-        "群里图片",
-        "群里的图片",
-        "群里所有图",
-        "每张图",
-        "每个图",
-        "逐张",
-        "一张张",
-        "批量",
-        "all images",
-        "every image",
-    )
-    all_action_cues = ("识别", "分析", "看看", "描述", "提取", "总结", "识图", "analyze", "describe", "ocr", "read")
-    inferred_analyze_all = any(cue in query_norm for cue in all_scope_cues) and any(cue in query_norm for cue in all_action_cues)
-    analyze_all = _to_flag(args.get("analyze_all", False), False) or inferred_analyze_all
+    # 批量识别只认模型显式声明的 analyze_all。原先还 OR 上一份本地推断
+    # （17 个范围词 × 11 个动作词的叉乘），会在模型没要求批量时把它改成批量，
+    # 模型看不到这条规则也无法申诉。范围判断写在 multimodal_media 分区说明里。
+    analyze_all = _to_flag(args.get("analyze_all", False), False)
     max_images = _to_positive_int(args.get("max_images"), 8 if analyze_all else 0)
 
     method_args: dict[str, Any] = {}
     if analyze_all:
         method_args["analyze_all"] = True
         method_args["max_images"] = max_images
+    # 透传模型的显式声明，否则 tools_vision 侧的读取恒取默认值、等于没接线。
+    if "web_lookup_on_uncertain" in args:
+        method_args["web_lookup_on_uncertain"] = _to_flag(
+            args.get("web_lookup_on_uncertain", False), False
+        )
+    if "is_animated" in args:
+        method_args["is_animated"] = _to_flag(args.get("is_animated", False), False)
     selected_source = "none"
     selected_segments: list[dict[str, Any]] = []
     if url:
@@ -693,22 +700,6 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
 
         # 没有显式图片时，不默认“盲猜最近一张图”。
         # 仅用户明确指向“这张/引用那张/刚才那张”时才允许最近图兜底，并且仅在最近唯一时使用。
-        reference_cues = (
-            "这张",
-            "这个图",
-            "这图",
-            "引用那张",
-            "回复那张",
-            "刚才那张",
-            "刚刚那张",
-            "前面那张",
-            "刚发的图",
-        )
-        prefer_reply_cues = ("引用那张", "回复那张", "刚才那张", "刚刚那张", "前面那张")
-        prefer_current_cues = ("这张", "这个图", "这图", "当前这张", "这张图")
-        explicit_reply_ref = any(cue in query_norm for cue in prefer_reply_cues)
-        explicit_current_ref = any(cue in query_norm for cue in prefer_current_cues)
-        explicit_reference = any(cue in query_norm for cue in reference_cues)
         has_direct_image_context = current_image_count > 0 or reply_image_count > 0
         if forced_target_message_id:
             if message_id and forced_target_message_id == message_id and current_image_count > 0:
@@ -729,21 +720,17 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
             if analyze_all:
                 selected_source = "current_and_reply"
                 selected_segments = current_segments + reply_segments
-            elif explicit_reply_ref:
-                selected_source = "reply_message"
-                selected_segments = reply_segments
-                if reply_to_message_id:
-                    method_args["target_message_id"] = reply_to_message_id
-            elif explicit_current_ref:
-                selected_source = "current_message"
-                selected_segments = current_segments
-                if message_id:
-                    method_args["target_message_id"] = message_id
             else:
+                # 两处都有图时不再用「这张 / 引用那张」词表猜目标：
+                # 由模型显式填 target_message_id，或声明 analyze_all 一起看。
                 return ToolCallResult(
                     ok=False,
-                    error="image_context_ambiguous",
-                    display="你这条消息和引用里都有图片。请说“分析这张图”或“分析引用的图”，或者直接回复目标图片。",
+                    error="ambiguous_target",
+                    display=(
+                        "这条消息和它引用的消息里都有图片，我不猜你指哪张。"
+                        "请填 target_message_id 指定目标消息，"
+                        "或传 analyze_all=true 让我把两边的图一起看。"
+                    ),
                 )
         elif current_image_count > 0:
             selected_source = "current_message"

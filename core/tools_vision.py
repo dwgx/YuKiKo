@@ -30,6 +30,16 @@ except Exception:  # pragma: no cover
 
 _tool_log = _logging.getLogger("yukiko.tools")
 
+# OneBot image 段 data.summary 里客户端自己填的动图标记（例如 "[动画表情]"）。
+# 这是段元数据，不是用户输入的自由文本 —— 用户意图走 analyze_image 的 is_animated 参数。
+_ANIMATED_SEGMENT_MARKERS = (
+    "动画表情",
+    "动图",
+    "动态图",
+    "动态贴纸",
+    "gif",
+)
+
 
 class ToolVisionMixin:
     """Mixin — 从 tools.py ToolExecutor 拆分。"""
@@ -84,6 +94,12 @@ class ToolVisionMixin:
             method_args.get("recent_only_when_unique", False), False
         )
         analyze_all = _to_flag(method_args.get("analyze_all", False), False)
+        # 动图与联网补查都由模型显式给参数（见 Prompt Navigator multimodal_media 分区说明），
+        # 本地不再从用户原话里猜。
+        explicit_animated = _to_flag(method_args.get("is_animated", False), False)
+        web_lookup_on_uncertain = _to_flag(
+            method_args.get("web_lookup_on_uncertain", False), False
+        )
         max_images_raw = normalize_text(str(method_args.get("max_images", "")))
         try:
             max_images = int(max_images_raw) if max_images_raw else 0
@@ -260,10 +276,8 @@ class ToolVisionMixin:
                 error="vision_local_unavailable",
             )
 
-        animated_hint = self._has_animated_image_hint(
-            query=query,
-            message_text=message_text,
-            raw_segments=raw_segments,
+        animated_hint = explicit_animated or self._has_animated_image_hint(
+            raw_segments=raw_segments
         )
         prompt = self._build_vision_prompt(
             query=query,
@@ -447,7 +461,9 @@ class ToolVisionMixin:
 
         if low_confidence_seen:
             web_fallback = await self._vision_uncertain_web_fallback(
-                query=query, message_text=message_text
+                query=query,
+                message_text=message_text,
+                web_lookup_requested=web_lookup_on_uncertain,
             )
             if web_fallback is not None:
                 return web_fallback
@@ -472,7 +488,9 @@ class ToolVisionMixin:
             )
 
         web_fallback = await self._vision_uncertain_web_fallback(
-            query=query, message_text=message_text
+            query=query,
+            message_text=message_text,
+            web_lookup_requested=web_lookup_on_uncertain,
         )
         if web_fallback is not None:
             return web_fallback
@@ -505,17 +523,18 @@ class ToolVisionMixin:
             )
 
     async def _vision_uncertain_web_fallback(
-        self, query: str, message_text: str
+        self, query: str, message_text: str, *, web_lookup_requested: bool
     ) -> ToolResult | None:
+        # 是否联网补查由模型在 analyze_image 里显式传 web_lookup_on_uncertain 决定，
+        # 不再由本地词表从用户原话猜「出处/来源/是什么梗」这类意图。
+        if not web_lookup_requested:
+            _tool_log.info(
+                "vision_web_fallback_skip%s | reason=web_lookup_not_requested",
+                _tool_trace_tag(),
+            )
+            return None
         merged = _normalize_multimodal_query(f"{query}\n{message_text}")
         if not merged:
-            return None
-        if not self._looks_like_vision_web_lookup_request(merged):
-            _tool_log.info(
-                "vision_web_fallback_skip%s | reason=no_web_lookup_intent | query=%s",
-                _tool_trace_tag(),
-                clip_text(merged, 80),
-            )
             return None
 
         refined = re.sub(
@@ -560,64 +579,6 @@ class ToolVisionMixin:
         }
         return ToolResult(
             ok=True, tool_name="vision_web_fallback", payload=payload, evidence=evidence
-        )
-
-    async def _analyze_image_from_message(
-        self,
-        query: str,
-        message_text: str,
-        raw_segments: list[dict[str, Any]],
-        conversation_id: str = "",
-        api_call: Callable[..., Awaitable[Any]] | None = None,
-    ) -> ToolResult | None:
-        if not self._vision_enable:
-            return ToolResult(
-                ok=False,
-                tool_name="vision_analyze_image",
-                payload={"text": "当前没开识图能力"},
-                error="vision_disabled",
-            )
-        if (
-            self._vision_require_independent_config
-            and not self._has_independent_vision_config()
-        ):
-            return ToolResult(
-                ok=False,
-                tool_name="vision_analyze_image",
-                payload={
-                    "text": "识图模型配置不完整（需要单独的 provider/base_url/model/api_key）"
-                },
-                error="vision_config_incomplete",
-            )
-
-        candidates = self._extract_message_media_urls(raw_segments, media_type="image")
-        if not candidates and conversation_id:
-            candidates = self._get_recent_media(
-                conversation_id=conversation_id, media_type="image"
-            )
-        if not candidates:
-            return None
-
-        analyze_all = self._looks_like_analyze_all_images_request(
-            f"{query}\n{message_text}"
-        )
-        method_args: dict[str, Any] = {
-            "allow_recent_fallback": bool(conversation_id),
-            "recent_only_when_unique": False,
-            "target_source": "search_shortcut",
-        }
-        if analyze_all:
-            method_args["analyze_all"] = True
-            method_args["max_images"] = 8
-
-        return await self._method_media_analyze_image(
-            method_name="vision_analyze_image",
-            method_args=method_args,
-            query=query,
-            message_text=message_text,
-            raw_segments=raw_segments,
-            conversation_id=conversation_id,
-            api_call=api_call,
         )
 
     def _can_use_remote_vision_model(self) -> bool:
@@ -687,12 +648,12 @@ class ToolVisionMixin:
                     "source": source,
                 }
             ]
-            prompt_hint = _normalize_multimodal_query(f"{query}\n{message_text}")
-            out = f"本地 OCR 识别结果：\n{text}"
-            if any(
-                cue in prompt_hint.lower() for cue in ("总结", "概括", "要点", "分析")
-            ):
-                out = f"我先走了本地 OCR（当前模型不支持图片理解）。识别到的文字如下：\n{text}"
+            # 走没走本地 OCR 已经由 payload 的 analysis_route 结构化传出，
+            # 措辞不再按用户原话里的「总结/概括/要点/分析」切换。
+            out = (
+                "我先走了本地 OCR（当前模型不支持图片理解）。识别到的文字如下：\n"
+                f"{text}"
+            )
             return ToolResult(
                 ok=True,
                 tool_name=method_name,
@@ -759,23 +720,14 @@ class ToolVisionMixin:
 
     @staticmethod
     def _has_animated_image_hint(
-        query: str,
-        message_text: str,
         raw_segments: list[dict[str, Any]] | None = None,
     ) -> bool:
-        merged = normalize_text(f"{query}\n{message_text}").lower()
-        animated_cues = (
-            "动画表情",
-            "动图",
-            "gif",
-            "动态图",
-            "表情包",
-            "贴纸",
-            "动表情",
-            "动态贴纸",
-        )
-        if any(cue in merged for cue in animated_cues):
-            return True
+        """只从 OneBot image 段的结构元数据判断是否动图。
+
+        用户原话里的「动图 / 表情包 / gif」不再参与判断 —— 那要模型显式传
+        analyze_image 的 is_animated 参数。这里认的是段自带的 sub_type、
+        客户端填的 summary 标记、以及文件名/URL 扩展名，属结构事实。
+        """
         for seg in raw_segments or []:
             if not isinstance(seg, dict):
                 continue
@@ -788,7 +740,7 @@ class ToolVisionMixin:
             sub_type = normalize_text(str(data.get("sub_type", ""))).lower()
             if sub_type == "1":
                 return True
-            if any(cue in summary for cue in animated_cues):
+            if any(marker in summary for marker in _ANIMATED_SEGMENT_MARKERS):
                 return True
             if file_name.endswith(".gif"):
                 return True
@@ -802,16 +754,10 @@ class ToolVisionMixin:
         merged = _normalize_multimodal_query(f"{query}\n{message_text}")
         if not merged:
             merged = "请描述这张图的主要内容，并提取可见文字。"
+        # 原来这里有一张「软件/任务栏/图标/窗口」词表，命中就追加桌面截图专用指令。
+        # 已删：merged 本身（用户问题原话）逐字进了 vision_main_prompt 的 user_query，
+        # 视觉模型看得到「开着哪些软件」，不需要本地再按关键词替它加戏。
         extra_parts: list[str] = []
-        merged_lower = merged.lower()
-        if any(
-            cue in merged_lower
-            for cue in ("软件", "应用", "程序", "开着哪些", "任务栏", "图标", "窗口")
-        ):
-            extra_parts.append(
-                "\n如果是桌面/任务栏截图："
-                "按从左到右列出可识别的软件或窗口名称；不确定的项标注“疑似”。"
-            )
         if animated_hint:
             extra_parts.append(
                 "\n如果这是动画表情、GIF 或多帧拼图："
@@ -2074,105 +2020,21 @@ class ToolVisionMixin:
         return out
 
     @staticmethod
-    def _looks_like_vision_web_lookup_request(text: str) -> bool:
-        content = _normalize_multimodal_query(text).lower()
-        if not content:
-            return False
-
-        # 去掉纯指代词，避免把“这个/这张图”误当成联网查询词。
-        stripped = normalize_text(
-            re.sub(
-                r"(分析|识别|看看|看下|看一看|看一下|图片|照片|截图|这张图|这个图|这个|这玩意|这是什么)",
-                " ",
-                content,
-            )
-        )
-        stripped = normalize_text(re.sub(r"\s+", " ", stripped))
-        if len(stripped) < 4:
-            return False
-
-        strong_cues = (
-            "查一下",
-            "搜一下",
-            "联网",
-            "百度",
-            "维基",
-            "百科",
-            "官网",
-            "出处",
-            "原图",
-            "来源",
-            "是什么梗",
-            "这是谁",
-            "哪个动漫",
-            "哪部电影",
-            "哪部剧",
-            "什么品牌",
-            "什么型号",
-        )
-        if any(cue in content for cue in strong_cues):
-            return True
-
-        # 保守兜底：至少包含“身份/来源”类疑问词，且不是只剩一个代词。
-        return bool(
-            re.search(r"(是谁|叫什么|来自哪里|哪来的|出自|来源|资料|背景)", content)
-        )
-
-    @staticmethod
     def _looks_like_image_analysis_request(text: str) -> bool:
+        """只认显式类型化命令 `/analyze <图片直链>`。
+
+        识图意图交给模型读 Prompt Navigator 的 multimodal_media 分区说明后直接调
+        analyze_image，不再由本地词表猜。原来这里还比对 prompts.yml 的
+        image_question_cues 词表，但该 key 在 config/ 里根本不存在
+        （get_list 实测返回 []），那条分支本就恒假，已删。
+        """
         content = _normalize_multimodal_query(text).lower()
         if not content:
             return False
         if re.search(
             r"(?:^|\s)/(?:analyze|analyse|summary|summarize)(?:\s|$)", content
+        ) and re.search(
+            r"https?://\S+\.(png|jpg|jpeg|webp|bmp|gif)(?:\?\S*)?$", content
         ):
-            if re.search(
-                r"https?://\S+\.(png|jpg|jpeg|webp|bmp|gif)(?:\?\S*)?$", content
-            ):
-                return True
-        cues = [
-            normalize_text(cue).lower()
-            for cue in _pl.get_list("image_question_cues")
-            if normalize_text(cue)
-        ]
-        if not cues:
-            return False
-        return any(cue in content for cue in cues)
-
-    @staticmethod
-    def _looks_like_analyze_all_images_request(text: str) -> bool:
-        content = _normalize_multimodal_query(text).lower()
-        if not content:
-            return False
-        scope_cues = (
-            "所有图片",
-            "全部图片",
-            "所有图",
-            "全部图",
-            "群里图片",
-            "群里的图片",
-            "群里所有图",
-            "每张图",
-            "每个图",
-            "逐张",
-            "一张张",
-            "批量",
-            "all images",
-            "every image",
-        )
-        action_cues = (
-            "识别",
-            "分析",
-            "看看",
-            "描述",
-            "提取",
-            "总结",
-            "识图",
-            "analyze",
-            "describe",
-            "ocr",
-            "read",
-        )
-        return any(cue in content for cue in scope_cues) and any(
-            cue in content for cue in action_cues
-        )
+            return True
+        return False
