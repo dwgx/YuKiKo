@@ -34,11 +34,29 @@ YuKiKo 要成为一个**由模型判断驱动的 QQ 群聊/私聊机器人**，�
 - [ ] **A3. `core/engine.py` `_self_check_decision:3502` 否决层** — 逐分支处理：
       关键词分支删除、语义搬进对应分区 `instructions`；结构信号分支改成喂给模型的 evidence。
       **不许留任何能覆盖模型判断的代码。**
-- [ ] **A4. `core/router.py`（1 个符号 + prompt）** — `_fast_path_decision:513`、
-      `_fallback_media_decision_without_model`、`_parse_decision` 里的 `router_override` 分支。
-      **配套主战场：`core/system_prompts.py:115` `router_system_prompt` 里硬编码了第二套意图分类器
-      （枚举整个 action 家族），它在和 PromptNavigator 抢同一个决策权，必须削成
-      只判断 should_handle + confidence。**
+- [x] **A4. router 不再选工具族** — 已修（`a060e6e` + `a4dcacf`）。
+      **prompt 侧**：`core/system_prompts.py` 的 `router_system_prompt` 原先枚举整个 action 家族
+      并用散文教关键词映射（「点歌 播歌 action=music_play」「画图请求 action=generate_image」）
+      —— 那是第二套意图分类器，与分区目录抢同一决策权，而且它看不到 section instructions
+      和工具 schema，判断依据比 Agent 少。严格模式下收缩为只判断
+      `should_handle` / `ignore|reply` / `confidence`，**4108 → 668 字符**。
+      安全按你的决策改为 `should_handle=true action=reply` 交后续环节，router 不再自出 `moderate`。
+      **代码侧**：`_parse_decision` 里两条「见图就强制 `action=search` + 硬塞
+      `method=media.analyze_image`」的覆盖已按严格模式门控。它们靠结构信号触发（非关键词），
+      但替模型决定了工具 —— 而 navigator 已做得更好：`_preselect` 读同一个图片段，
+      起始分区落 `multimodal_media`、`analyze_image` 进可见工具、
+      `image_url` 等作为**可被模型否决的**结构证据。
+      *实测：带图片段 → `multimodal_media` + evidence `['image_url','message_or_reply_media','url']`；无图 → `general_chat`。*
+      **保留**（逐个查过）：`_contains_explicit_adult_intent`（带词边界的结构令牌 `/nsfw`、`r18`）、
+      `_is_passive_multimodal_event`（OneBot 段占位符正则）、
+      `_looks_like_bot_address`（`bot_aliases` 身份匹配，与 trigger 同类）、
+      `_fallback_media_decision_without_model`（只在模型不可用时跑、纯结构信号，
+      正是你选的「只保留结构信号兜底」）。
+      非 navigator 部署走 else 分支保持原样。
+      *发现：`test_router_media_fallback_regression.py` 测的是 no-model 兜底
+      （reason `fallback_direct_media_no_model`），**并未覆盖这两条覆盖分支** ——
+      新增 `tests/test_router_override_scope_regression.py` 4 例补上。*
+
 - [x] **A5. `core/trigger.py` 已改为只做注意力门控** — 已修（`3f9fb32`）。
       删除 `_looks_like_explicit_bot_request`、`_looks_like_explicit_memory_declare`、
       `_explicit_request_signal_from_cues`、`_explicit_request_signal`，以及死包装 `_should_open_ai_probe`。
@@ -237,12 +255,25 @@ fallback 不进目录（`render_active_section_block` 已单独打印当前区�
 
 ### E0 续：埋点过程中暴露的既有缺陷
 
-- [ ] **E0-4. 写盘失败仍回报成功** — `_save_white` / `_save_ignore` / `_save_runtime_policy`
+- [x] **E0-4. 写盘失败仍回报成功** — 已修（`f04367d`）。
+      新增 `_with_persist_warning`，六处 return 全部包裹。内存状态确实改了所以不算失败，
+      但 JSON 没落盘、重启即回滚，回复现在会说明。
+      *实测：把 `whitelist_groups.json` 换成目录后，回复为
+      「已加白本群 777\n注意：本次改动没能写入磁盘，重启后会丢失…」，审计记 `persisted=False`。*
+- [ ] ~~**E0-4-old. 写盘失败仍回报成功**~~ — `_save_white` / `_save_ignore` / `_save_runtime_policy`
       原先返回 `None` 且把写盘异常吞在 `_log.debug` 里。现已改为返回 `bool` 并记
       `persisted: false`（`409f1a2`），**但用户侧回复文案仍说成功**。
       *实测：把 `whitelist_groups.json` 换成目录后，用户看到「已加白本群 777」而审计记 `persisted=False`。*
       需要让回复文案跟随 `persisted` 结果。
-- [ ] **E0-5. 群管理员可清除全局忽略且无法自行恢复** — `remove_ignored_user` 的 group scope
+- [x] **E0-5. 群管理员可清除全局忽略且无法自行恢复** — 已修（`f04367d`）。
+      `remove_ignored_user` 的升级分支加了 `is_super_admin` 门；群管理员收到明确提示去找超管。
+      `is_super_admin` 在未配 `super_users` 时返回 True，所以未配置的部署不受影响。
+      *实测：群管(20002)清除被拒且 `999` 仍在 `_ignored_global`；超管(10001)仍放行并记
+      `escalated_to_global=true` / `irreversible=false`。*
+      *一个既有测试的契约随之改变：原来断言该升级被**记录为** irreversible（如实审计一个漏洞），
+      现改名为 `..._cannot_clear_global_for_group_admin`，同样的执行者与场景，
+      改为断言被拒、全局项存活、且不留变更记录。*
+- [ ] ~~**E0-5-old. 群管理员可清除全局忽略**~~ — `remove_ignored_user` 的 group scope
       回落会把 **global** 忽略一并清掉，而恢复 global 需要超管权限。
       *实测：群管（非超管）清除后审计记 `irreversible=true` + `escalated_to_global=true`；
       同一调用由超管执行记 `false`。* 审计已能看见，但权限判定本身要修。
