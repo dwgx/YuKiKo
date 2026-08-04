@@ -253,13 +253,9 @@ config:
     followup_fast_path_enable: false
     zero_threshold_disables_undirected: true
     trust_ai_fully: false
+    fragment_join_enable: true
     mode: ai_full
-  self_check:
-    enable: true
-    block_at_other: true
-    listen_probe_min_confidence: 0.78
-    non_direct_reply_min_confidence: 0.88
-    cross_user_guard_seconds: 45
+  # self_check 已随 A3 删除，五个键零读取点，见 core/config_templates.py 同位注释。
   queue:
     group_concurrency: 3
     single_inflight_per_conversation: false

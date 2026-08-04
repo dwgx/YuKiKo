@@ -333,14 +333,12 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "followup_fast_path_enable": True,
             "zero_threshold_disables_undirected": True,
             "trust_ai_fully": False,
+            # core/engine.py:574 与 :7409 读它，但此前两处真相源都没有 ——
+            # 升级安装拿不到这个键，碎片合并闸门无法从 WebUI 关掉。
+            "fragment_join_enable": True,
         },
-        "self_check": {
-            "enable": True,
-            "block_at_other": True,
-            "listen_probe_min_confidence": 0.6,
-            "non_direct_reply_min_confidence": 0.82,
-            "cross_user_guard_seconds": 45,
-        },
+        # self_check 配置树已随 A3 删除 `_self_check_decision` 一并移除。
+        # 五个键在 Python 侧零读取点，留着只会让 WebUI 的开关拨了没反应。
         "queue": {
             "group_concurrency": 3,
             "single_inflight_per_conversation": False,

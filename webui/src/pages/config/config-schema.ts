@@ -256,14 +256,9 @@ export const SECTIONS: SectionDef[] = [
     { path: "routing.non_directed_min_confidence", label: "旁听门槛", type: "number", min: 0, max: 1, step: 0.01 },
     { path: "routing.ai_gate_min_confidence", label: "AI 门槛", type: "number", min: 0, max: 1, step: 0.01 },
     { path: "routing.zero_threshold_disables_undirected", label: "零阈值禁用非指向", type: "switch" },
+    { path: "routing.fragment_join_enable", label: "碎片消息合并", type: "switch" },
   ]},
-  { key: "self_check", label: "防误触护栏", fields: [
-    { path: "self_check.enable", label: "启用自检护栏", type: "switch" },
-    { path: "self_check.block_at_other", label: "@他人场景拦截", type: "switch" },
-    { path: "self_check.listen_probe_min_confidence", label: "旁听最低置信度", type: "number", min: 0, max: 1, step: 0.01 },
-    { path: "self_check.non_direct_reply_min_confidence", label: "非指向回复最低置信度", type: "number", min: 0, max: 1, step: 0.01 },
-    { path: "self_check.cross_user_guard_seconds", label: "跨用户隔离窗口(秒)", type: "number", min: 5, max: 180 },
-  ]},
+  // self_check 分组已移除：五个开关在 Python 侧零读取点，拨了不会有任何效果。
   { key: "queue", label: "队列策略", fields: [
     { path: "queue.group_concurrency", label: "会话并发数", type: "number", min: 1, max: 8 },
     { path: "queue.single_inflight_per_conversation", label: "单会话单 inflight", type: "switch" },
@@ -455,14 +450,6 @@ export const SECTION_META: Record<string, SectionMeta> = {
       "routing.trust_ai_fully",
       "routing.min_confidence",
       "routing.followup_min_confidence",
-    ],
-  },
-  self_check: {
-    description: "防止误触发和串台的最后一道护栏，建议保持开启。",
-    essentials: [
-      "self_check.enable",
-      "self_check.block_at_other",
-      "self_check.non_direct_reply_min_confidence",
     ],
   },
   queue: {

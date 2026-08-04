@@ -721,6 +721,45 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         ):
             self.assertFalse(hasattr(engine, dead_attr), dead_attr)
 
+    def test_at_other_hard_veto_is_gone_and_stays_evidence_only(self) -> None:
+        """原行为：消息 @ 了别人 → `at_other_not_for_bot_hard` 前置 ignore，模型看不到
+        一个 token，且 WebUI 的「@他人场景拦截」开关拨了没有任何效果（零读取点）。
+
+        现断言：否决层不存在，「@了谁」降级为纯证据。判断「这句是不是在跟我说话」
+        归模型 —— 结构事实仍三路可见（router / navigator / agent prompt），只是不再
+        替模型做决定。
+        """
+
+        engine = YukikoEngine.__new__(YukikoEngine)
+
+        # 否决方法与它唯一的放行判据一起删除；放行判据是为绕过否决而存在的。
+        for gone in ("_allow_at_other_target_dialog", "_has_recent_reply_to_user"):
+            self.assertFalse(hasattr(engine, gone), gone)
+
+        # 结构事实本身必须留着 —— 它还要作为证据喂给模型。
+        self.assertTrue(hasattr(engine, "_is_explicitly_replying_other_user"))
+
+    def test_dead_self_check_switches_removed_from_both_truth_sources(self) -> None:
+        """配置键的两处真相源必须同步：只改一处会让升级安装拿到不一致的 schema。
+
+        self_check 五个键零读取点，必须从模板和内置默认值同时消失；
+        `routing.fragment_join_enable` 反过来 —— 代码在读却两处都没定义，必须补上。
+        """
+
+        import yaml
+
+        from core.config_templates import _built_in_config_defaults
+
+        defaults = _built_in_config_defaults()
+        with open("config/templates/master.template.yml", encoding="utf-8") as fh:
+            template = yaml.safe_load(fh)["config"]
+
+        self.assertNotIn("self_check", defaults)
+        self.assertNotIn("self_check", template)
+
+        self.assertIn("fragment_join_enable", defaults["routing"])
+        self.assertIn("fragment_join_enable", template["routing"])
+
     def test_undirected_group_chitchat_silence_is_reachable_in_menu(self) -> None:
         """接管能力必须真的在菜单里：非指向群闲聊落 general_chat，且该区教了怎么沉默。
 

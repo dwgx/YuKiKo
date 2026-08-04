@@ -1097,18 +1097,10 @@ class YukikoEngine:
         if fragment_mentioned and not message.mentioned:
             message.mentioned = True
         self._track_directed_hint(message, text)
-        if self._is_explicitly_replying_other_user(
-            message
-        ) and not self._allow_at_other_target_dialog(message, text):
-            self.logger.info(
-                "消息已忽略 | 会话=%s | 用户=%s | 原因=%s | 文本=%s",
-                message.conversation_id,
-                message.user_id,
-                "at_other_not_for_bot_hard",
-                clip_text(text, 80),
-            )
-            return EngineResponse(action="ignore", reason="at_other_not_for_bot_hard")
-
+        # 这里以前是 at_other_not_for_bot_hard 前置否决：消息 @ 了别人就直接 ignore，
+        # 模型看不到一个 token。「@了谁」是结构事实，不是意图，已三路作为证据喂给模型
+        # （router :1737、prompt_navigator :2661 的 mention_target、agent prompt 的
+        # 「[用户@了: …]」），由模型自己判断这句是不是在跟它说话。
         undirected_high_confidence = (
             self.non_directed_high_confidence_only
             and not message.is_private
@@ -3292,28 +3284,6 @@ class YukikoEngine:
         aliases.discard("")
         return aliases
 
-    def _allow_at_other_target_dialog(self, message: EngineMessage, text: str) -> bool:
-        """允许 @他人但仍在和机器人聊该人 的场景通过前置拦截。"""
-
-        if message.mentioned or message.is_private:
-            return True
-
-        # 如果消息是明确回复另一个用户的（reply 引用），不放行
-        # 这种情况用户大概率在跟那个人说话，不是跟 bot 说话
-        reply_uid = str(message.reply_to_user_id or "").strip()
-        bot_id = str(message.bot_id or "").strip()
-        if reply_uid and reply_uid != bot_id:
-            return False
-
-        if self._looks_like_bot_call(text):
-            return True
-
-        # 最近刚回过同一用户，视为对话连续期，可容忍其 @某人后继续问机器人。
-        if self._has_recent_reply_to_user(message, within_seconds=150):
-            return True
-
-        return False
-
     @staticmethod
     def _looks_like_explicit_request(text: str) -> bool:
         content = normalize_text(text)
@@ -3482,29 +3452,6 @@ class YukikoEngine:
         if not content or self._is_passive_multimodal_text(text):
             return False
         return bool(self._get_recent_media_for_followup(message, "image"))
-
-    def _has_recent_reply_to_user(
-        self, message: EngineMessage, within_seconds: int = 120
-    ) -> bool:
-        state = self._last_reply_state.get(message.conversation_id, {})
-        if not isinstance(state, dict):
-            return False
-
-        last_uid = str(state.get("user_id", ""))
-        if last_uid != str(message.user_id):
-            return False
-
-        ts = state.get("timestamp")
-        if not isinstance(ts, datetime):
-            return False
-
-        try:
-            return (message.timestamp - ts).total_seconds() <= max(
-                10, int(within_seconds)
-            )
-        except Exception:
-
-            return False
 
     def _track_directed_hint(self, message: EngineMessage, text: str) -> None:
         now = (
