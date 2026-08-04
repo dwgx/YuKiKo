@@ -623,27 +623,12 @@ class YukikoEngine:
             1,
             int(queue_cfg.get("smart_interrupt_min_pending", 1)),
         )
-        self_check_cfg = self.config.get("self_check", {})
-        if not isinstance(self_check_cfg, dict):
-            self_check_cfg = {}
-        self.self_check_enable = bool(self_check_cfg.get("enable", True))
-        self.self_check_block_at_other = bool(
-            self_check_cfg.get("block_at_other", True)
-        )
-        self.self_check_listen_probe_min_confidence = max(
-            0.5,
-            min(1.0, float(self_check_cfg.get("listen_probe_min_confidence", 0.78))),
-        )
-        self.self_check_non_direct_reply_min_confidence = max(
-            0.0,
-            min(
-                1.0, float(self_check_cfg.get("non_direct_reply_min_confidence", 0.82))
-            ),
-        )
-        self.self_check_cross_user_guard_seconds = max(
-            8,
-            int(self_check_cfg.get("cross_user_guard_seconds", 45)),
-        )
+        # 原 `self_check` 配置树（enable / block_at_other / listen_probe_min_confidence /
+        # non_direct_reply_min_confidence / cross_user_guard_seconds）的唯一读点是
+        # `_self_check_decision`，该函数已随 A3 删除，这些字段随之变成只写不读的死状态，
+        # 因此不再解析。非指向自动接话的总闸仍在 `routing.*` 阈值那一侧（见 handle_message
+        # 里的 non_directed_threshold_disabled 分支），那是管理员显式配置而非语义判断。
+        # 配置键与 WebUI 面板的同步清理见 .migration/w3-engine-gates.md「需要别的文件配合」。
 
         # ── 总控面板映射（少量高层参数） ──
         control_cfg = self.config.get("control", {})
@@ -694,10 +679,6 @@ class YukikoEngine:
         )
         self.ai_gate_min_confidence = max(
             0.0, min(1.0, self.ai_gate_min_confidence + mode_bias)
-        )
-        self.self_check_non_direct_reply_min_confidence = max(
-            0.0,
-            min(1.0, self.self_check_non_direct_reply_min_confidence + mode_bias),
         )
         # 用户选择的策略: 非@仅高置信、且阈值 0 时必须不自动接话。
         self.non_directed_high_confidence_only = (
@@ -1054,42 +1035,6 @@ class YukikoEngine:
         if not text:
             return EngineResponse(action="ignore", reason="empty_message")
 
-        reply_to_bot_for_strategy = bool(
-            normalize_text(str(message.reply_to_user_id or ""))
-            and normalize_text(str(message.reply_to_user_id or ""))
-            == normalize_text(str(message.bot_id or ""))
-        )
-        explicit_for_strategy = bool(
-            message.is_private
-            or message.mentioned
-            or reply_to_bot_for_strategy
-            or self._looks_like_bot_call(text)
-        )
-        early_strategy_mode = self._detect_bot_strategy_directive(
-            text,
-            message=message,
-            explicit_bot_addressed=explicit_for_strategy,
-            followup_candidate=False,
-        )
-        if (
-            early_strategy_mode
-            and not message.is_private
-            and self.admin.enabled
-            and not self.admin.is_group_whitelisted(message.group_id)
-        ):
-            self.logger.info(
-                "bot_strategy_directive_before_whitelist | trace=%s | group=%s | user=%s | mode=%s",
-                message.trace_id,
-                message.group_id,
-                message.user_id,
-                early_strategy_mode,
-            )
-            return await self._handle_bot_strategy_directive(
-                message=message,
-                text=text,
-                mode=early_strategy_mode,
-            )
-
         # ── 白名单检查（非私聊 + 权限系统启用时）──
         if not message.is_private and self.admin.enabled:
             if not self.admin.is_group_whitelisted(message.group_id):
@@ -1349,18 +1294,6 @@ class YukikoEngine:
             or message.mentioned
             or self._looks_like_bot_call(message.text)
         )
-        strategy_mode = self._detect_bot_strategy_directive(
-            text,
-            message=message,
-            explicit_bot_addressed=explicit_bot_addressed,
-            followup_candidate=bool(getattr(trigger, "followup_candidate", False)),
-        )
-        if strategy_mode:
-            return await self._handle_bot_strategy_directive(
-                message=message,
-                text=text,
-                mode=strategy_mode,
-            )
         alias_call_hint = ""
         text, alias_token = self._strip_edge_bot_alias_tokens(text)
         if alias_token:
@@ -1756,54 +1689,34 @@ class YukikoEngine:
 
         # ── Agent 模式：优先走 Agent 循环 ──
         if self.agent.enable and self.model_client.enabled:
-            if self._should_ignore_passive_multimodal_turn(
+            # 这里以前有两道前置闸门，都已删除：
+            # 1) _should_ignore_passive_multimodal_turn —— 群友互发图/语音时直接 return，
+            #    模型根本没机会看到这轮消息，与「意图判断 100% 归模型」直接冲突；
+            # 2) _should_prefer_router_for_plain_text —— 靠一张结构否决清单绕开整个
+            #    Navigator 去走旧 Router 闲聊路径（且启用后必抛 AttributeError，见报告）。
+            # 现在一律进 Agent，由模型读分区说明决定做事还是用空文本 final_answer 沉默。
+            agent_result = await self._try_agent_path(
                 message=message,
                 text=text,
                 trigger=trigger,
                 explicit_bot_addressed=explicit_bot_addressed,
-            ):
-                self.logger.info(
-                    "消息已忽略 | 会话=%s | 用户=%s | 原因=%s | 文本=%s",
-                    message.conversation_id,
-                    message.user_id,
-                    "passive_multimodal_not_directed",
-                    clip_text(text, 80),
-                )
-                return EngineResponse(
-                    action="ignore", reason="passive_multimodal_not_directed"
-                )
-            elif self._should_prefer_router_for_plain_text(
-                message=message, text=text, trigger=trigger
-            ):
-                self.logger.info(
-                    "agent_bypass_plain_text | trace=%s | scene=%s | text=%s",
-                    message.trace_id,
-                    normalize_text(getattr(trigger, "scene_hint", "")) or "chat",
-                    clip_text(text, 120),
-                )
-            else:
-                agent_result = await self._try_agent_path(
-                    message=message,
-                    text=text,
-                    trigger=trigger,
-                    explicit_bot_addressed=explicit_bot_addressed,
-                    thread_state=thread_state,
-                    runtime_group_context=runtime_group_context_for_turn,
-                    memory_context=memory_context,
-                    related_memories=related_memories,
-                    user_profile_summary=user_profile_summary,
-                    preferred_name=preferred_name,
-                    recent_speakers=recent_speakers,
-                    compat_context=compat_context,
-                    user_policies=user_policies,
-                    user_directives=user_directives,
-                    runtime_admin_policy=runtime_admin_policy,
-                    at_other_user_names=at_other_user_names,
-                    affinity_hint=affinity_hint,
-                    mood_hint=mood_hint,
-                )
-                if agent_result is not None:
-                    return agent_result
+                thread_state=thread_state,
+                runtime_group_context=runtime_group_context_for_turn,
+                memory_context=memory_context,
+                related_memories=related_memories,
+                user_profile_summary=user_profile_summary,
+                preferred_name=preferred_name,
+                recent_speakers=recent_speakers,
+                compat_context=compat_context,
+                user_policies=user_policies,
+                user_directives=user_directives,
+                runtime_admin_policy=runtime_admin_policy,
+                at_other_user_names=at_other_user_names,
+                affinity_hint=affinity_hint,
+                mood_hint=mood_hint,
+            )
+            if agent_result is not None:
+                return agent_result
 
         router_media_summary = self._build_media_summary(message.raw_segments)
         if (
@@ -1853,25 +1766,13 @@ class YukikoEngine:
             )
             return EngineResponse(action="ignore", reason=route_fail_reason)
 
-        decision = self._normalize_decision_with_tool_policy(
-            message=message,
-            trigger=trigger,
-            decision=decision,
-            text=text,
-        )
-        self_check_reason = self._self_check_decision(
-            message=message, trigger=trigger, decision=decision
-        )
-        if self_check_reason:
-            self.logger.info(
-                "消息已忽略 | 会话=%s | 用户=%s | 原因=%s | 文本=%s",
-                message.conversation_id,
-                message.user_id,
-                self_check_reason,
-                clip_text(text, 80),
-            )
-            return EngineResponse(action="ignore", reason=self_check_reason)
-
+        # 这里以前是 `_normalize_decision_with_tool_policy` + `_self_check_decision`：
+        # 前者替模型补 query / 改写工具，后者用 13 条本地规则一票否决模型的判定。
+        # 两者已整体删除 —— 「群聊别乱回」改由模型读分区说明后用空文本 final_answer 表达，
+        # 结构事实与社交时序作为 evidence 喂给模型，不再作为覆盖模型的代码。
+        # 保留项：非指向总闸仍由下方 `non_directed_threshold_disabled` 承担（那是管理员显式配置，
+        # 不是语义判断）；检索工具缺参改由 core/agent.py 的 `_missing_required_tool_args`
+        # 回喂 `missing_required_args:*` 让模型自己补。
         directed_like_call = (
             message.mentioned
             or message.is_private
@@ -2571,29 +2472,6 @@ class YukikoEngine:
             merged_media_text = normalize_text(
                 f"{self._extract_multimodal_user_text(message.text)}\n{text}"
             )
-            forced_method, _forced_args, forced_reason = self._infer_forced_tool_plan(
-                message=message,
-                text=merged_media_text or text,
-            )
-            # 明确可由本地工具直接处理的媒体任务，跳过 Agent 循环，避免慢思考超时。
-            # 注意：browser.resolve_video 不再跳过 Agent，因为 Agent 的 parse_video
-            # 有更完善的抖音视频/图文判断逻辑和 douyin_share 回退。
-            if (
-                not self._strict_prompt_navigator_enabled()
-                and forced_method in {
-                    "video.analyze",
-                    "media.analyze_image",
-                    "media.pick_video_from_message",
-                }
-            ):
-                self.logger.info(
-                    "agent_bypass_local_tool | trace=%s | method=%s | reason=%s",
-                    message.trace_id,
-                    forced_method,
-                    forced_reason or "local_force",
-                )
-                return None
-
             media_like_text = bool(
                 self._looks_like_video_request(merged_media_text)
                 or self._looks_like_video_analysis_intent(merged_media_text)
@@ -2667,26 +2545,10 @@ class YukikoEngine:
                 agent_result.total_time_ms,
                 agent_result.reason,
             )
-            if self._should_block_undirected_agent_plain_reply(
-                message=message,
-                text=text,
-                trigger=trigger,
-                agent_result=agent_result,
-            ):
-                self.logger.info(
-                    "agent_undirected_plain_reply_block | trace=%s | conversation=%s | user=%s | trigger_reason=%s | text=%s | reply=%s",
-                    message.trace_id,
-                    message.conversation_id,
-                    message.user_id,
-                    normalize_text(str(getattr(trigger, "reason", ""))) or "-",
-                    clip_text(text, 100),
-                    clip_text(normalize_text(agent_result.reply_text), 120),
-                )
-                return EngineResponse(
-                    action="ignore",
-                    reason="agent_undirected_plain_reply_block",
-                    meta={"trace_id": message.trace_id},
-                )
+            # 这里以前是 `_should_block_undirected_agent_plain_reply`：模型已经产出回复后，
+            # 代码再按 trigger.reason 把「没调工具的纯文本」整条丢掉。实测它与回复内容无关
+            # （同一场景下换任何文本都照丢），属于代码事后否决模型，已删除。
+            # 「非指向群聊该不该开口」改由模型读分区说明后用空文本 final_answer 表达。
             # Agent 路径也写入 followup 候选缓存，确保候选结果可被后续追问稳定复用。
             self._remember_agent_followup_cache(
                 message=message, agent_result=agent_result
@@ -2991,84 +2853,6 @@ class YukikoEngine:
             reply_style="short",
         )
 
-    def _normalize_decision_with_tool_policy(
-        self,
-        message: EngineMessage,
-        trigger: Any,
-        decision: RouterDecision,
-        text: str,
-    ) -> RouterDecision:
-        _ = trigger
-        action = normalize_text(str(decision.action)).lower()
-        tool_args = decision.tool_args if isinstance(decision.tool_args, dict) else {}
-        merged_text = normalize_text(
-            f"{self._extract_multimodal_user_text(message.text)}\n{text}"
-        )
-        changed = False
-        new_tool_args = dict(tool_args)
-        # 搜索动作至少补齐 query，避免空参数导致工具无法执行。
-        if action == "search":
-            if not normalize_text(
-                str(new_tool_args.get("query", ""))
-            ) and not normalize_text(str(new_tool_args.get("method", ""))):
-                new_tool_args["query"] = merged_text or text
-                changed = True
-        forced_method, forced_method_args, forced_reason = self._infer_forced_tool_plan(
-            message=message,
-            text=merged_text or text,
-        )
-        if forced_method:
-            current_method = normalize_text(
-                str(new_tool_args.get("method", ""))
-            ).lower()
-            if action != "search" or current_method != forced_method:
-                next_args = dict(new_tool_args)
-                next_args["method"] = forced_method
-                next_args["method_args"] = forced_method_args
-                if not normalize_text(str(next_args.get("query", ""))):
-                    next_args["query"] = merged_text or text
-                self.logger.info(
-                    "decision_tool_override | trace=%s | 会话=%s | 用户=%s | from=%s | method=%s | reason=%s",
-                    message.trace_id,
-                    message.conversation_id,
-                    message.user_id,
-                    action or "unknown",
-                    forced_method,
-                    forced_reason,
-                )
-                return RouterDecision(
-                    should_handle=True,
-                    action="search",
-                    reason=f"{normalize_text(decision.reason)}|{forced_reason}",
-                    reason_code=getattr(decision, "reason_code", "") or forced_reason,
-                    confidence=max(
-                        0.78, float(getattr(decision, "confidence", 0.0) or 0.0)
-                    ),
-                    reply_style=decision.reply_style,
-                    tool_name=decision.tool_name,
-                    tool_args=next_args,
-                    target_user_id=decision.target_user_id,
-                )
-        if changed:
-            return RouterDecision(
-                should_handle=decision.should_handle,
-                action=decision.action,
-                reason=decision.reason,
-                reason_code=getattr(decision, "reason_code", ""),
-                confidence=decision.confidence,
-                reply_style=decision.reply_style,
-                tool_name=decision.tool_name,
-                tool_args=new_tool_args,
-                target_user_id=decision.target_user_id,
-            )
-        return decision
-
-    def _infer_forced_tool_plan(
-        self, message: EngineMessage, text: str
-    ) -> tuple[str, dict[str, Any], str]:
-        _ = (message, text)
-        return "", {}, ""
-
     def _looks_like_structural_video_entrypoint(
         self, message: EngineMessage, text: str
     ) -> bool:
@@ -3084,106 +2868,6 @@ class YukikoEngine:
             return False
 
         return bool(self._extract_first_video_url_from_text(content))
-
-    def _should_prefer_router_for_plain_text(
-        self, message: EngineMessage, text: str, trigger: Any
-    ) -> bool:
-        config = getattr(self, "config", {})
-        agent_cfg = config.get("agent", {}) if isinstance(config, dict) else {}
-        if not bool(agent_cfg.get("prefer_router_for_directed_plain_text", False)):
-            return False
-
-        content = normalize_text(text)
-        if not content:
-            return False
-
-        if content.startswith("/"):
-            return False
-
-        if message.raw_segments or message.reply_media_segments:
-            return False
-
-        if self._extract_first_image_url_from_text(
-            content
-        ) or self._extract_first_video_url_from_text(content):
-            return False
-
-        if self._extract_first_url(content):
-            return False
-
-        if self._looks_like_download_task_intent(content):
-            return False
-
-        if self._looks_like_local_file_request(
-            content
-        ) and self._pick_local_path_candidate(content):
-            return False
-
-        if self._looks_like_github_request(content) and (
-            self._looks_like_repo_readme_request(content)
-            or self._looks_like_explicit_request(content)
-        ):
-            return False
-
-        if self._looks_like_qq_avatar_intent(content):
-            return False
-
-        if (
-            self._looks_like_image_analyze_intent(content)
-            or self._looks_like_video_request(content)
-            or self._looks_like_video_analysis_intent(content)
-            or self._looks_like_video_resolve_intent(content)
-        ):
-            return False
-
-        directed = bool(
-            message.is_private
-            or message.mentioned
-            or getattr(trigger, "active_session", False)
-            or self._looks_like_bot_call(content)
-        )
-        if not directed:
-            return False
-
-        scene_hint = normalize_text(str(getattr(trigger, "scene_hint", ""))).lower()
-        if scene_hint in {"chat", "emotion_support", "conflict_mediation", "followup"}:
-            return True
-
-        if len(content) <= 160:
-            return True
-
-        return False
-
-    def _should_ignore_passive_multimodal_turn(
-        self,
-        message: EngineMessage,
-        text: str,
-        trigger: Any,
-        explicit_bot_addressed: bool,
-    ) -> bool:
-        _ = text
-        if explicit_bot_addressed or message.mentioned or message.is_private:
-            return False
-
-        if not self._is_passive_multimodal_text(message.text):
-            return False
-
-        user_text = normalize_text(self._extract_multimodal_user_text(message.text))
-        if user_text and (
-            self._looks_like_explicit_request(user_text)
-            or self._looks_like_media_instruction(user_text)
-            or self._looks_like_bot_call(user_text)
-        ):
-            return False
-
-        if self._has_recent_directed_hint(message):
-            return False
-
-        reason = normalize_text(str(getattr(trigger, "reason", ""))).lower()
-        if reason == "recent_media_followup":
-            return False
-
-        return True
 
     async def _retry_tool_after_failure(
         self,
@@ -3511,228 +3195,6 @@ class YukikoEngine:
 
         return ""
 
-    def _self_check_decision(
-        self, message: EngineMessage, trigger: Any, decision: RouterDecision
-    ) -> str:
-        """本地自检：在 AI 判定后做一致性约束，降低误回与越界风险。"""
-
-        if not self.self_check_enable:
-            return ""
-
-        action = normalize_text(str(decision.action)).lower()
-        text_norm = normalize_text(message.text)
-        confidence = float(decision.confidence)
-        followup_active = bool(getattr(trigger, "followup_candidate", False)) or bool(
-            getattr(trigger, "active_session", False)
-        )
-        all_segments: list[dict[str, Any]] = []
-        for segment_group in (message.raw_segments, message.reply_media_segments):
-            if not isinstance(segment_group, list):
-                continue
-
-            all_segments.extend(seg for seg in segment_group if isinstance(seg, dict))
-        has_image_signal = any(
-            normalize_text(str((seg or {}).get("type", ""))).lower() == "image"
-            for seg in all_segments
-        ) or bool(self._extract_first_image_url_from_text(text_norm))
-        has_video_signal = any(
-            normalize_text(str((seg or {}).get("type", ""))).lower() == "video"
-            for seg in all_segments
-        ) or bool(self._extract_first_video_url_from_text(text_norm))
-        # 不再用中文关键词判定图像引用，仅依赖结构化信号（raw_segments / URL）
-        image_reference = False
-        if action in {"ignore"}:
-            return ""
-
-        if (
-            normalize_text(str(getattr(decision, "reason_code", ""))).lower()
-            == "followup_multimodal_fast_path"
-        ):
-            return ""
-
-        # 明确工具型诉求不允许走纯 reply，防止"会说不会做"。
-        if action == "reply" and (
-            (
-                self._looks_like_image_analyze_intent(text_norm)
-                and has_image_signal
-            )
-            or (self._looks_like_video_resolve_intent(text_norm) and has_video_signal)
-            or (
-                self._looks_like_local_file_request(text_norm)
-                and bool(self._pick_local_path_candidate(text_norm))
-            )
-            or (
-                self._looks_like_github_request(text_norm)
-                and (
-                    self._looks_like_repo_readme_request(text_norm)
-                    or self._looks_like_explicit_request(text_norm)
-                )
-            )
-        ):
-            return "self_check:tool_required_for_request"
-
-        if (
-            action in {"reply", "search", "generate_image", "plugin_call"}
-            and self._is_passive_multimodal_text(message.text)
-            and not message.mentioned
-            and not message.is_private
-            and not self._has_recent_directed_hint(message)
-            and not self._looks_like_bot_call(text_norm)
-            and not self._looks_like_media_instruction(
-                self._extract_multimodal_user_text(message.text)
-            )
-        ):
-            return "self_check:passive_multimodal_not_directed"
-
-        # 多用户群聊中，若机器人刚回复过 A，B 在短时间内的非指向消息不能"接续 A 的上下文"。
-        if action in {
-            "reply",
-            "search",
-            "generate_image",
-            "plugin_call",
-        } and self._is_cross_user_context_collision(
-            message=message, trigger=trigger, text=text_norm
-        ):
-            return "self_check:cross_user_context_isolated"
-
-        # 群聊 followup 窗口内，非明确请求的闲聊不自动接话，避免连续"嗯嗯/确实"刷屏。
-        if (
-            action == "reply"
-            and not message.mentioned
-            and not message.is_private
-            and (followup_active or bool(getattr(trigger, "active_session", False)))
-            and int(getattr(trigger, "busy_users", 0) or 0) > 1
-            and not self._looks_like_bot_call(text_norm)
-            and not self._has_recent_directed_hint(message)
-            and not self._looks_like_explicit_request(text_norm)
-            and not self._looks_like_media_instruction(
-                self._extract_multimodal_user_text(message.text)
-            )
-            and len(text_norm) <= 36
-        ):
-            return "self_check:group_followup_chitchat"
-
-        # 非指向群聊中的低信息短句（如“??/牛逼/笑死”）默认不接话，避免乱回复。
-        if (
-            action == "reply"
-            and not message.mentioned
-            and not message.is_private
-            and not self._looks_like_bot_call(text_norm)
-            and not self._has_recent_directed_hint(message)
-            and not self._looks_like_explicit_request(text_norm)
-            and not self._looks_like_media_instruction(
-                self._extract_multimodal_user_text(message.text)
-            )
-            and self._looks_like_low_info_group_chitchat(text_norm)
-        ):
-            return "self_check:undirected_group_chitchat"
-
-        if (
-            self.self_check_block_at_other
-            and message.at_other_user_only
-            and not message.mentioned
-        ):
-            if not self._allow_at_other_target_dialog(
-                message, normalize_text(message.text)
-            ):
-                return "self_check:at_other_not_for_bot"
-
-        # 群聊非指向消息在多人场景默认更保守：
-        # 未@、非私聊、非followup 且没有“明确叫bot”时，必须先通过 listen_probe 才可继续。
-        if (
-            action in {"reply", "search", "generate_image", "plugin_call"}
-            and not message.mentioned
-            and not message.is_private
-            and not bool(getattr(trigger, "followup_candidate", False))
-            and not bool(getattr(trigger, "active_session", False))
-            and not self._looks_like_bot_call(text_norm)
-            and not self._has_recent_directed_hint(message)
-            and int(getattr(trigger, "busy_users", 0) or 0) > 1
-            and not bool(getattr(trigger, "listen_probe", False))
-        ):
-            return "self_check:undirected_requires_listen_probe"
-
-        # 监听探测阶段更保守：除非高置信，不主动介入。
-        if (
-            bool(getattr(trigger, "listen_probe", False))
-            and not message.mentioned
-            and not message.is_private
-            and action in {"reply", "search", "generate_image", "plugin_call"}
-            and int(getattr(trigger, "busy_users", 0) or 0) > 1
-            and not self._looks_like_explicit_request(normalize_text(message.text))
-            and confidence < self.self_check_listen_probe_min_confidence
-        ):
-            return "self_check:listen_probe_low_confidence"
-
-        # 非指向场景默认不回，除非监听探测且达到更高置信阈值。
-        if (
-            action == "reply"
-            and not message.mentioned
-            and not message.is_private
-            and not bool(getattr(trigger, "followup_candidate", False))
-            and not bool(getattr(trigger, "active_session", False))
-            and not self._looks_like_bot_call(text_norm)
-            and not self._has_recent_directed_hint(message)
-        ):
-            listen_probe = bool(getattr(trigger, "listen_probe", False))
-            busy_users = int(getattr(trigger, "busy_users", 0) or 0)
-            # 阈值=0 表示关闭非指向自动接话（仅对白名单指向消息放行）。
-            if (
-                self.routing_zero_disables_undirected
-                and self.non_directed_high_confidence_only
-                and self.self_check_non_direct_reply_min_confidence <= 0.0
-            ):
-                return "self_check:not_directed_reply_threshold_disabled"
-
-            # 多人群聊继续要求 listen_probe；低活跃群仅依赖高置信门槛。
-            if (
-                (not listen_probe and busy_users > 1)
-                or confidence < self.self_check_non_direct_reply_min_confidence
-            ):
-                return "self_check:not_directed_reply"
-
-        # 非指向场景的普通回复必须更高置信，避免"偷摸插话"。
-        if (
-            action == "reply"
-            and not message.mentioned
-            and not message.is_private
-            and not bool(getattr(trigger, "followup_candidate", False))
-            and not bool(getattr(trigger, "active_session", False))
-            and not self._has_recent_directed_hint(message)
-            and float(decision.confidence)
-            < self.self_check_non_direct_reply_min_confidence
-        ):
-            return "self_check:non_direct_reply_low_confidence"
-
-        # 非指向场景的"工具型动作"更容易误接话：在多人群聊里要求更高置信或明确指向。
-        if (
-            action in {"search", "generate_image", "plugin_call"}
-            and not message.mentioned
-            and not message.is_private
-            and not bool(getattr(trigger, "followup_candidate", False))
-            and not bool(getattr(trigger, "active_session", False))
-            and not self._has_recent_directed_hint(message)
-            and int(getattr(trigger, "busy_users", 0) or 0) > 1
-        ):
-            if confidence < self.self_check_non_direct_reply_min_confidence:
-                return "self_check:not_directed_action_low_confidence"
-
-        # 搜索动作至少要有可执行线索（query 或 method）。
-        if action == "search":
-            tool_args = (
-                decision.tool_args if isinstance(decision.tool_args, dict) else {}
-            )
-            query = normalize_text(str(tool_args.get("query", "")))
-            method_name = normalize_text(str(tool_args.get("method", "")))
-            if (
-                not query
-                and not method_name
-                and len(normalize_text(message.text)) <= 10
-            ):
-                return "self_check:search_without_query"
-
-        return ""
-
     def _looks_like_bot_call(self, text: str) -> bool:
         content = normalize_text(text).lower()
         if not content:
@@ -3740,171 +3202,6 @@ class YukikoEngine:
 
         aliases = self._get_bot_aliases()
         return any(alias in content for alias in aliases)
-
-    def _detect_bot_strategy_directive(
-        self,
-        text: str,
-        *,
-        message: EngineMessage,
-        explicit_bot_addressed: bool,
-        followup_candidate: bool = False,
-    ) -> str:
-        content = normalize_text(text).lower()
-        if not content:
-            return ""
-        reply_to_bot = bool(
-            normalize_text(str(message.reply_to_user_id or ""))
-            and normalize_text(str(message.reply_to_user_id or ""))
-            == normalize_text(str(message.bot_id or ""))
-        )
-        directed_like = bool(
-            explicit_bot_addressed
-            or reply_to_bot
-            or followup_candidate
-            or message.is_private
-        )
-        if not directed_like:
-            return ""
-        compact = re.sub(r"\s+", "", content)
-        if len(compact) > 48 and not any(
-            cue in compact
-            for cue in (
-                "你闭嘴",
-                "机器人闭嘴",
-                "bot闭嘴",
-                "别回复了",
-                "别回了",
-                "停止回复",
-            )
-        ):
-            return ""
-        active_cues = ("可以说话", "恢复说话", "别闭嘴", "不用闭嘴", "不要闭嘴", "活跃模式")
-        if any(cue in compact for cue in active_cues):
-            return "active"
-        cold_cues = (
-            "闭嘴",
-            "别说话",
-            "不要说话",
-            "不说话",
-            "别回复",
-            "别回了",
-            "别回",
-            "停止回复",
-            "沉默一下",
-            "先别回",
-            "先别说",
-            "冷漠模式",
-        )
-        if any(cue in compact for cue in cold_cues):
-            return "cold"
-        quiet_cues = ("少说话", "安静点", "安静一下", "消停点", "消停", "别插嘴", "安静模式")
-        if any(cue in compact for cue in quiet_cues):
-            return "quiet"
-        return ""
-
-    def _should_block_undirected_agent_plain_reply(
-        self,
-        *,
-        message: EngineMessage,
-        text: str,
-        trigger: Any,
-        agent_result: AgentResult,
-    ) -> bool:
-        if message.is_private or message.mentioned:
-            return False
-        reply_to_bot = bool(
-            normalize_text(str(message.reply_to_user_id or ""))
-            and normalize_text(str(message.reply_to_user_id or ""))
-            == normalize_text(str(message.bot_id or ""))
-        )
-        if reply_to_bot:
-            return False
-        text_norm = normalize_text(text)
-        if self._looks_like_bot_call(text_norm) or self._has_recent_directed_hint(message):
-            return False
-        if normalize_text(str(agent_result.action)).lower() != "reply":
-            return False
-        if int(getattr(agent_result, "tool_calls_made", 0) or 0) > 0:
-            return False
-        if (
-            getattr(agent_result, "image_url", "")
-            or getattr(agent_result, "image_urls", [])
-            or getattr(agent_result, "video_url", "")
-            or getattr(agent_result, "audio_file", "")
-        ):
-            return False
-        reason = normalize_text(str(getattr(trigger, "reason", ""))).lower()
-        guarded = reason in {
-            "active_session",
-            "followup_window",
-            "ai_router_candidate",
-            "ai_router_gate",
-        } or reason.startswith("ai_listen_probe")
-        if not guarded:
-            return False
-        return True
-
-    async def _handle_bot_strategy_directive(
-        self,
-        *,
-        message: EngineMessage,
-        text: str,
-        mode: str,
-    ) -> EngineResponse:
-        self.logger.info(
-            "bot_strategy_directive | trace=%s | conversation=%s | user=%s | mode=%s | text=%s",
-            message.trace_id,
-            message.conversation_id,
-            message.user_id,
-            mode,
-            clip_text(text, 80),
-        )
-        self.trigger.close_session(
-            message.conversation_id,
-            message.user_id,
-            message.is_private,
-        )
-        if not self.admin.is_super_admin(message.user_id):
-            self.logger.info(
-                "bot_strategy_directive_non_admin | trace=%s | conversation=%s | user=%s",
-                message.trace_id,
-                message.conversation_id,
-                message.user_id,
-            )
-            return EngineResponse(action="ignore", reason="bot_strategy_directive_non_admin")
-
-        command_arg = {
-            "cold": "冷漠",
-            "quiet": "安静",
-            "active": "活跃",
-        }.get(mode, "冷漠")
-        result = await self.admin.handle_command(
-            text=f"/yuki 行为 {command_arg}",
-            user_id=message.user_id,
-            group_id=message.group_id,
-            sender_role=message.sender_role or "",
-            engine=self,
-            api_call=message.api_call,
-        )
-        reply_map = {
-            "cold": "收到，已切到冷漠模式。",
-            "quiet": "收到，已切到安静模式。",
-            "active": "收到，已恢复活跃模式。",
-        }
-        reply_text = reply_map.get(mode, result or "收到。")
-        self.logger.info(
-            "bot_strategy_directive_applied | trace=%s | conversation=%s | user=%s | mode=%s | result=%s",
-            message.trace_id,
-            message.conversation_id,
-            message.user_id,
-            mode,
-            clip_text(str(result or ""), 100),
-        )
-        return EngineResponse(
-            action="reply",
-            reason="bot_strategy_directive",
-            reply_text=reply_text,
-        )
 
     def _is_bot_alias_only_message(self, text: str) -> bool:
         content = normalize_text(text).lower()
@@ -4164,63 +3461,25 @@ class YukikoEngine:
             summaries.append(f"video:{url}")
         return summaries[:5]
 
-    def _looks_like_recent_media_followup_instruction(self, text: str) -> bool:
-        content = normalize_text(self._extract_multimodal_user_text(text) or text)
-        if not content or self._is_passive_multimodal_text(text):
-            return False
-        compact = re.sub(r"\s+", "", content.lower())
-        if not compact or len(compact) > 160:
-            return False
-        cues = (
-            "cyber",
-            "cyberpunk",
-            "赛博",
-            "p图",
-            "p一下",
-            "修图",
-            "改成",
-            "改一下",
-            "换成",
-            "变成",
-            "做成",
-            "整成",
-            "转成",
-            "画成",
-            "风格",
-            "滤镜",
-            "高清",
-            "放大",
-            "识别",
-            "分析",
-            "看看",
-            "看下",
-            "这张",
-            "这个图",
-            "刚才那张",
-            "刚刚那张",
-            "刚发的图",
-            "图里",
-            "图片",
-            "表情包",
-        )
-        if any(cue in compact for cue in cues):
-            return True
-        return bool(
-            re.search(
-                r"\b(analyze|describe|ocr|read|edit|remix|style|filter)\b",
-                content,
-                flags=re.IGNORECASE,
-            )
-        )
-
     def _looks_like_recent_media_followup(
         self, message: EngineMessage, text: str
     ) -> bool:
+        """近期媒体追问的**结构候选**判定。
+
+        只用客观事实：本轮不带媒体段、非私聊非 @、且这个会话里近期确实出现过图片。
+        原先这里还叠了一张 32 词的中文编辑/分析词表来决定「要不要开口」，已删除 ——
+        实测它漏判「这上面写的啥」「给它加个边框」，又把「今天天气分析得挺准」
+        误判成在指那张图。现在只负责把这轮消息**送进**模型视野，
+        是否真的在指那份媒体由模型读 multimodal_media 分区说明后自己判断，
+        判断不该开口时用空文本 final_answer 收场。
+        """
+
         if message.is_private or message.mentioned:
             return False
         if message.raw_segments or message.reply_media_segments:
             return False
-        if not self._looks_like_recent_media_followup_instruction(text):
+        content = normalize_text(self._extract_multimodal_user_text(text) or text)
+        if not content or self._is_passive_multimodal_text(text):
             return False
         return bool(self._get_recent_media_for_followup(message, "image"))
 
@@ -4246,49 +3505,6 @@ class YukikoEngine:
         except Exception:
 
             return False
-
-    def _is_cross_user_context_collision(
-        self, message: EngineMessage, trigger: Any, text: str
-    ) -> bool:
-        if message.is_private or message.mentioned:
-            return False
-
-        if bool(getattr(trigger, "followup_candidate", False)) or bool(
-            getattr(trigger, "active_session", False)
-        ):
-            return False
-
-        if self._looks_like_bot_call(text) or self._has_recent_directed_hint(message):
-            return False
-
-        state = self._last_reply_state.get(message.conversation_id, {})
-        if not isinstance(state, dict):
-            return False
-
-        last_uid = str(state.get("user_id", ""))
-        if not last_uid or last_uid == str(message.user_id):
-            return False
-
-        last_ts = state.get("timestamp")
-        if not isinstance(last_ts, datetime):
-            return False
-
-        now = (
-            message.timestamp
-            if isinstance(message.timestamp, datetime)
-            else datetime.now(timezone.utc)
-        )
-        try:
-            age_seconds = (now - last_ts).total_seconds()
-        except Exception:
-
-            return False
-
-        if age_seconds > float(self.self_check_cross_user_guard_seconds):
-            return False
-
-        # 跨用户隔离窗口内，仅允许明显"在叫机器人"的句子继续进入。
-        return True
 
     def _track_directed_hint(self, message: EngineMessage, text: str) -> None:
         now = (
@@ -4548,17 +3764,6 @@ class YukikoEngine:
         return YukikoEngine._has_control_token(text, "/music", "/song", "mode=music")
 
     @staticmethod
-    def _looks_like_music_search_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-
-        if not YukikoEngine._looks_like_music_request(content):
-            return False
-
-        return YukikoEngine._has_control_token(text, "/search", "mode=search")
-
-    @staticmethod
     def _extract_music_keyword(text: str) -> str:
         content = normalize_text(text)
         if not content:
@@ -4575,87 +3780,6 @@ class YukikoEngine:
             "`\"'[](){}<>.,;:!?\uFF0C\u3002\uFF1F\uFF01\uFF1A"
         )
         return content
-
-    @staticmethod
-    def _build_music_match_tokens(keyword: str) -> list[str]:
-        content = normalize_text(keyword).lower()
-        if not content:
-            return []
-
-        out: list[str] = []
-        seen: set[str] = set()
-        for token in tokenize(content):
-            value = normalize_text(token).lower().strip()
-            if not value or value.startswith("/") or "=" in value:
-                continue
-
-            if re.search(r"[a-z0-9]", value):
-                compact = re.sub(r"[^a-z0-9_.-]+", "", value)
-                if len(compact) < 2:
-                    continue
-
-                value = compact
-            elif re.fullmatch(r"[\u4e00-\u9fff]+", value):
-                if len(value) < 2:
-                    continue
-
-            else:
-                continue
-
-            if value in seen:
-                continue
-
-            seen.add(value)
-            out.append(value)
-            if len(out) >= 6:
-                break
-
-        return out
-
-    @classmethod
-    def _is_music_fallback_relevant(cls, keyword: str, payload: dict[str, Any]) -> bool:
-        tokens = cls._build_music_match_tokens(keyword)
-        if not tokens:
-            return False
-
-        if not isinstance(payload, dict):
-            return False
-
-        corpus_parts: list[str] = [
-            normalize_text(str(payload.get("video_url", ""))),
-            normalize_text(str(payload.get("text", ""))),
-        ]
-        rows = payload.get("results", [])
-        if isinstance(rows, list) and rows:
-            first = rows[0]
-            if isinstance(first, dict):
-                corpus_parts.extend(
-                    [
-                        normalize_text(str(first.get("title", ""))),
-                        normalize_text(str(first.get("snippet", ""))),
-                        normalize_text(str(first.get("url", ""))),
-                    ]
-                )
-        corpus = normalize_text("\n".join(corpus_parts)).lower()
-        if not corpus:
-            return False
-
-        compact = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", corpus)
-        hit = 0
-        for token in tokens:
-            t = normalize_text(token).lower()
-            if not t:
-                continue
-
-            if t in corpus:
-                hit += 1
-                continue
-
-            compact_t = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", t)
-            if compact_t and compact_t in compact:
-                hit += 1
-        required = len(tokens) if len(tokens) <= 2 else 2
-        return hit >= required
 
     def _looks_like_github_request(self, text: str) -> bool:
         content = normalize_text(text).lower()
@@ -4697,34 +3821,6 @@ class YukikoEngine:
         owner = match.group(1)
         repo = re.sub(r"\.git$", "", match.group(2), flags=re.IGNORECASE)
         return f"{owner}/{repo}"
-
-    def _looks_like_qq_avatar_intent(self, text: str) -> bool:
-        content = normalize_text(text)
-        if not content:
-            return False
-
-        if not self._has_control_token(text, "/avatar", "/qqavatar", "type=avatar"):
-            return False
-
-        return bool(
-            re.search(r"(?<!\d)[1-9]\d{5,11}(?!\d)", content)
-            or self._has_control_token(text, "target=self", "/me")
-        )
-
-    def _looks_like_qq_profile_intent(self, text: str) -> bool:
-        content = normalize_text(text)
-        if not content:
-            return False
-
-        if not self._has_control_token(
-            text, "/qqprofile", "/profile", "type=qq-profile"
-        ):
-            return False
-
-        return bool(
-            re.search(r"(?<!\d)[1-9]\d{5,11}(?!\d)", content)
-            or self._has_control_token(text, "target=self", "/me")
-        )
 
     @staticmethod
     def _normalize_reply_echo_text(text: str) -> str:
@@ -4866,60 +3962,6 @@ class YukikoEngine:
             scored.append((score, item))
         scored.sort(key=lambda it: it[0], reverse=True)
         return scored[0][1] if scored else ""
-
-    @staticmethod
-    @staticmethod
-    @staticmethod
-    def _looks_like_local_file_request(text: str) -> bool:
-        content = normalize_text(text)
-        if not content:
-            return False
-        has_local_path = bool(
-            re.search(r"(?:[A-Za-z]:\\|\\\\|(?:^|\s)(?:\./|\.\./|/))", content)
-        )
-        has_file_ext = bool(
-            re.search(
-                r"\.(?:zip|7z|rar|exe|apk|ipa|msi|pdf|docx?|xlsx?|pptx?|txt|mp3|mp4)\b",
-                content,
-                flags=re.IGNORECASE,
-            )
-        )
-        has_control = YukikoEngine._has_control_token(
-            text,
-            "/upload",
-            "/download",
-            "/file",
-            "mode=file",
-            "mode=upload",
-            "mode=download",
-            "output=file",
-        )
-        return has_control and (has_local_path or has_file_ext)
-
-    def _looks_like_local_media_request(text: str) -> bool:
-        content = normalize_text(text)
-        if not content:
-            return False
-
-        has_local_path = bool(re.search(r"(?:[A-Za-z]:\\|\\\\|/)", content))
-        has_media_ext = bool(
-            re.search(
-                r"\.(?:jpg|jpeg|png|gif|webp|bmp|mp4|webm|mov|m4v|mp3|wav|flac|ogg)\b",
-                content,
-                flags=re.IGNORECASE,
-            )
-        )
-        return has_local_path and has_media_ext
-
-    @staticmethod
-    def _looks_like_local_media_path(path: str) -> bool:
-        value = normalize_text(path).lower()
-        if not value:
-            return False
-
-        return bool(
-            re.search(r"\.(?:jpg|jpeg|png|gif|webp|bmp|mp4|webm|mov|m4v)$", value)
-        )
 
     @staticmethod
     def _extract_urls_from_text(text: str) -> list[str]:
@@ -6375,12 +5417,6 @@ class YukikoEngine:
         return content
 
     @staticmethod
-    def _contains_video_send_negative_claim(text: str) -> bool:
-        _ = text
-        # 已移除本地负面话术猜测，统一交给模型或显式状态判断。
-        return False
-
-    @staticmethod
     def _inject_user_name(reply_text: str, user_name: str, should_address: bool) -> str:
         if not should_address:
             return reply_text
@@ -7329,17 +6365,6 @@ class YukikoEngine:
                 )
             )
         )
-
-    @staticmethod
-    def _looks_like_direct_video_url(url: str) -> bool:
-        value = normalize_text(url).lower()
-        if not value:
-            return False
-
-        if value.startswith("file://"):
-            return True
-
-        return bool(re.search(r"\.(?:mp4|mov|webm|m4v|flv|mkv)(?:\?|$)", value))
 
     def _rotate_cached_choice(
         self,
