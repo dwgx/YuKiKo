@@ -160,11 +160,17 @@ YuKiKo 要成为一个**由模型判断驱动的 QQ 群聊/私聊机器人**，�
       `scripts/deploy.py` 装不上，只能手装 `pytest`+`httpx`+`PyYAML`。
       **导致大部分测试套件无法 import（缺 nonebot），全量验证做不了。** 建议改用 3.12 建 venv。
 
-- [ ] **C5. `requirements.txt` 存在真实依赖冲突，全新安装必然失败** —
-      第 5 行钉死 `PyYAML==6.0.3`，而第 12 行 `f2==0.0.1.7` 要求 `pyyaml==6.0.2`，
-      pip 直接 `ResolutionImpossible`。当前测试环境是跳过 `f2` 装起来的，
-      因此抖音解析相关代码路径未覆盖。**这会让任何人 clone 后装不上依赖。**
-      需要你定：升 `f2`、松开 `PyYAML` 钉版、还是移除 `f2`。
+- [x] **C5. `requirements.txt` 依赖冲突已解** — 已修（`3c9cd38`）。
+      原先第 5 行钉 `PyYAML==6.0.3`，而 `f2==0.0.1.7` 死钉 `pyyaml==6.0.2`（等号），
+      pip 直接 `ResolutionImpossible` —— **任何人 clone 后都装不上依赖**。
+      「升 f2」这条路不通：`0.0.1.7` 已是最新（`pip index versions` 确认 0.0.1.0–0.0.1.7），
+      其 wheel METADATA 写明 `Requires-Dist: pyyaml==6.0.2`。故改钉 `PyYAML==6.0.2` 并留注释。
+      安全依据：仓库只用 `yaml.safe_load`(17 处) / `yaml.safe_dump`(19 处)，6.0.x 内稳定。
+      `f2` 会把 `m3u8` 6.0.0 降到 3.6.0，但仓库无任何代码 import 它
+      （`core/tools_video.py` 那三处只是对 URL 里 `.m3u8` 做字符串匹配），不受影响。
+      *验证：用全新 python3.11 venv 从零安装成功（不是靠已装好的环境），
+      `f2.apps.douyin.handler.DouyinHandler` 与 `AwemeIdFetcher`（`core/video_analyzer.py:604-605`
+      实际用的两个符号）均可 import；抖音解析路径首次进入可测状态。*
 
 ## D. 测试（A 组的验收标准）
 
