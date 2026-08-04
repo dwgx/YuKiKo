@@ -102,10 +102,7 @@ from core.agent_tools_utility import (  # noqa: F401
     _handle_final_answer,
     _handle_send_emoji,
     _handle_think,
-    _looks_like_explicit_sticker_send_message,
-    _looks_like_sticker_management_message,
     _make_learn_sticker_handler,
-    _should_block_sticker_send_for_management_turn,
     register_sticker_tools,
 )
 

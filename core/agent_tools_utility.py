@@ -128,80 +128,57 @@ async def _handle_navigate_section(args: dict[str, Any], context: dict[str, Any]
 
 # ── Sticker / Face tools ──
 
-_STICKER_SEND_CUES = (
-    "发个表情",
-    "发一个表情",
-    "发表情",
-    "发送表情",
-    "来个表情",
-    "来一个表情",
-    "用表情",
-    "回个表情",
-    "发张表情包",
-    "来张表情包",
-    "发出来看看",
-    "看看效果",
-    "预览",
-    "把刚学的发",
-)
+# 「这一轮是要发表情，还是在维护表情包库」由模型在 turn_goal 参数里显式声明。
+# 旧实现用两张中文词表读原始用户消息，在模型已经选定工具之后把它的选择推翻，
+# 模型既看不到这条规则也无法申诉；现在改为模型自己声明、工具只校验声明本身。
+_STICKER_TURN_GOAL_SEND = "send"
+_STICKER_TURN_GOAL_MANAGE = "manage"
+_STICKER_TURN_GOALS = (_STICKER_TURN_GOAL_SEND, _STICKER_TURN_GOAL_MANAGE)
 
-_STICKER_MANAGEMENT_CUES = (
-    "学习表情",
-    "学这个表情",
-    "添加表情",
-    "收录表情",
-    "记住这个表情",
-    "表情包库",
-    "表情库",
-    "meme更新",
-    "更新了吗",
-    "学会了吗",
-    "学到了吗",
-    "描述不对",
-    "识别错",
-    "纠正表情",
-    "改这个表情",
-    "最近学的",
-    "刚学的是什么",
-)
+_STICKER_TURN_GOAL_PARAM: dict[str, Any] = {
+    "type": "string",
+    "enum": list(_STICKER_TURN_GOALS),
+    "description": (
+        "必填。你判断出的本轮用户目标，只能填 send 或 manage。"
+        "send=用户确实要你把表情发到聊天里（含学完之后要求预览、要求发出来看看效果）。"
+        "manage=用户在维护或查询表情包库（收录 / 学习 / 纠正描述分类 / 问学会了吗更新了吗有多少张 / "
+        "重新扫描），这一轮不该有表情被发出去——此时不要调本工具，改用 learn_sticker、"
+        "correct_sticker、list_emojis、browse_sticker_categories、scan_stickers。"
+        "不要因为用户话里出现「表情」两个字就填 send。"
+    ),
+}
 
 
-def _looks_like_explicit_sticker_send_message(text: str) -> bool:
-    content = normalize_text(text).lower()
-    if not content:
-        return False
-    if any(cue in content for cue in _STICKER_SEND_CUES):
-        return True
-    return bool(
-        re.search(r"(发|来|回|用).{0,8}(表情|表情包|emoji|sticker)", content)
-        or re.search(r"(表情|表情包).{0,8}(发|来|回|看)", content)
-    )
-
-
-def _looks_like_sticker_management_message(text: str) -> bool:
-    content = normalize_text(text).lower()
-    if not content:
-        return False
-    if any(cue in content for cue in _STICKER_MANAGEMENT_CUES):
-        return True
-    if "表情" not in content and "meme" not in content and "emoji" not in content:
-        return False
-    return bool(
-        re.search(r"(学习|添加|收录|记住|纠正|修改|更新|识别|描述|标签|分类).{0,8}(表情|表情包)", content)
-        or re.search(r"(表情|表情包).{0,8}(学习|添加|收录|纠正|更新|描述|标签|分类)", content)
-    )
-
-
-def _should_block_sticker_send_for_management_turn(context: dict[str, Any]) -> bool:
-    message_text = normalize_text(
-        str(context.get("original_message_text", "") or context.get("message_text", ""))
-    )
-    if not message_text:
-        return False
-    return (
-        _looks_like_sticker_management_message(message_text)
-        and not _looks_like_explicit_sticker_send_message(message_text)
-    )
+def _check_sticker_send_turn_goal(args: dict[str, Any]) -> ToolCallResult | None:
+    """校验模型声明的本轮目标。允许发送返回 None，否则返回可申诉的 observation。"""
+    goal = normalize_text(str(args.get("turn_goal", ""))).lower()
+    if not goal:
+        return ToolCallResult(
+            ok=False,
+            error="missing_arg:turn_goal",
+            display=(
+                "缺少 turn_goal 参数。用户确实要你把表情发到聊天里就传 turn_goal=send；"
+                "用户是在收录 / 纠正 / 查询表情包库就不要调本工具，改用 "
+                "learn_sticker / correct_sticker / list_emojis / browse_sticker_categories。"
+            ),
+        )
+    if goal not in _STICKER_TURN_GOALS:
+        return ToolCallResult(
+            ok=False,
+            error=f"invalid_arg:turn_goal:{goal}",
+            display=f"turn_goal 只能填 send 或 manage，收到的是 {goal}。",
+        )
+    if goal == _STICKER_TURN_GOAL_MANAGE:
+        return ToolCallResult(
+            ok=False,
+            error="wrong_tool_for_manage_goal",
+            display=(
+                "你声明本轮 turn_goal=manage（在维护或查询表情包库），管理类这一轮不该把表情发出去。"
+                "收录用 learn_sticker，纠正用 correct_sticker，问库状态用 list_emojis / "
+                "browse_sticker_categories，刷新用 scan_stickers。"
+            ),
+        )
+    return None
 
 
 def _extract_message_segments_from_onebot_payload(raw: Any) -> list[dict[str, Any]]:
@@ -289,12 +266,9 @@ def _extract_first_sticker_media_payload(
 
 async def _handle_send_face(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     """Send a classic QQ face by emotion/description query."""
-    if _should_block_sticker_send_for_management_turn(context):
-        return ToolCallResult(
-            ok=False,
-            data={},
-            display="当前是在学习或查询表情包状态，不应直接发送表情",
-        )
+    goal_rejection = _check_sticker_send_turn_goal(args)
+    if goal_rejection is not None:
+        return goal_rejection
     query = str(args.get("query", "")).strip()
     if not query:
         return ToolCallResult(ok=False, data={}, display="缺少 query 参数")
@@ -334,12 +308,9 @@ async def _handle_send_face(args: dict[str, Any], context: dict[str, Any]) -> To
 
 async def _handle_send_emoji(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     """Send a local emoji image. Supports keyword search or random."""
-    if _should_block_sticker_send_for_management_turn(context):
-        return ToolCallResult(
-            ok=False,
-            data={},
-            display="当前是在学习或查询表情包状态，不应直接发送表情包",
-        )
+    goal_rejection = _check_sticker_send_turn_goal(args)
+    if goal_rejection is not None:
+        return goal_rejection
     query = normalize_text(str(args.get("query", ""))).strip()
     if not query:
         query = normalize_text(str(args.get("keyword", ""))).strip()
@@ -702,8 +673,9 @@ def register_sticker_tools(registry: "AgentToolRegistry", model_client: Any = No
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "情绪或表情描述"},
+                    "turn_goal": dict(_STICKER_TURN_GOAL_PARAM),
                 },
-                "required": ["query"],
+                "required": ["query", "turn_goal"],
             },
             category="napcat",
         ),
@@ -735,8 +707,9 @@ def register_sticker_tools(registry: "AgentToolRegistry", model_client: Any = No
                         "type": "string",
                         "description": "兼容字段：等价于 query",
                     },
+                    "turn_goal": dict(_STICKER_TURN_GOAL_PARAM),
                 },
-                "required": [],
+                "required": ["turn_goal"],
             },
             category="napcat",
         ),
@@ -767,8 +740,9 @@ def register_sticker_tools(registry: "AgentToolRegistry", model_client: Any = No
                         "type": "string",
                         "description": "兼容字段：等价于 query",
                     },
+                    "turn_goal": dict(_STICKER_TURN_GOAL_PARAM),
                 },
-                "required": [],
+                "required": ["turn_goal"],
             },
             category="napcat",
         ),

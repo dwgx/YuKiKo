@@ -127,7 +127,9 @@ class NativeStickerToolRegressionTests(unittest.IsolatedAsyncioTestCase):
                 return {"status": "ok"}
 
             result = await _handle_send_emoji(
-                {"query": "贴贴"},
+                # turn_goal 现在必填：本轮目标由模型显式声明，工具不再从原文猜。
+                # 这条测试验的是原生 mface 段的选取，与参数校验无关，故直接声明 send。
+                {"query": "贴贴", "turn_goal": "send"},
                 {
                     "sticker_manager": manager,
                     "api_call": api_call,
