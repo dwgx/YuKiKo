@@ -608,6 +608,77 @@ class AgentLoop:
         except Exception:
             return str(args or {})
 
+    @staticmethod
+    def _decode_tool_call_arguments(
+        raw: Any,
+        *,
+        tool_name: str = "",
+        trace_id: str = "",
+        step_idx: int = -1,
+    ) -> dict[str, Any]:
+        """解析原生 tool_call 的 arguments，容忍串接的多个 JSON 对象。
+
+        实测 skiapi 会返回 `{}{"keyword": "..."}` —— 真参数前粘了一个空对象，
+        `json.loads` 抛 `Extra data`。此前这里静默兜成 `{}`，结果每个带参工具
+        都拿到空参数且日志无痕，故障完全不可见。
+
+        逐段 raw_decode，合并所有解出的对象，后出现的键覆盖先出现的空值。
+        任何异常都必须留日志 —— 静默是这个 bug 能藏这么久的唯一原因。
+        """
+
+        if isinstance(raw, dict):
+            return raw
+        if raw is None:
+            return {}
+
+        text = raw if isinstance(raw, str) else str(raw)
+        if not text.strip():
+            return {}
+
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        merged: dict[str, Any] = {}
+        decoder = json.JSONDecoder()
+        idx = 0
+        chunks = 0
+        while idx < len(text):
+            while idx < len(text) and text[idx].isspace():
+                idx += 1
+            if idx >= len(text):
+                break
+            try:
+                obj, end = decoder.raw_decode(text, idx)
+            except ValueError:
+                break
+            chunks += 1
+            if isinstance(obj, dict):
+                merged.update(obj)
+            idx = end
+
+        if merged:
+            _log.warning(
+                "agent_tool_args_recovered_from_malformed_json | trace=%s | step=%d "
+                "| tool=%s | chunks=%d | raw_len=%d",
+                trace_id,
+                step_idx,
+                tool_name,
+                chunks,
+                len(text),
+            )
+            return merged
+
+        _log.warning(
+            "agent_tool_args_unparseable | trace=%s | step=%d | tool=%s | raw=%s",
+            trace_id,
+            step_idx,
+            tool_name,
+            clip_text(text, 200),
+        )
+        return {}
+
     def _truncate_tool_args_for_log(self, tool_args: dict[str, Any]) -> str:
         """将 tool_args 序列化并截断用于日志，默认 600 字符。"""
         limit = getattr(self, "tool_args_log_max_chars", 600)
@@ -1180,10 +1251,12 @@ class AgentLoop:
                     for tc in tool_calls:
                         if tc.get("type") == "function":
                             func = tc.get("function", {})
-                            try:
-                                args = json.loads(func.get("arguments", "{}"))
-                            except (json.JSONDecodeError, TypeError, ValueError):
-                                args = {}
+                            args = self._decode_tool_call_arguments(
+                                func.get("arguments"),
+                                tool_name=str(func.get("name") or ""),
+                                trace_id=ctx.trace_id,
+                                step_idx=step_idx,
+                            )
                             parsed = {
                                 "tool": func.get("name"),
                                 "args": args,
