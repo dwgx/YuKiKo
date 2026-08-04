@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from core.agent import AgentContext, AgentLoop
 from core.agent_tools import ToolCallResult, _handle_analyze_local_video
 from core.engine import YukikoEngine
+from core.prompt_navigator import PromptNavigator, default_prompt_navigator_payload
 
 
 class ToolCallLeakRegressionTests(unittest.TestCase):
@@ -172,8 +173,37 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
         url = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc123"
         self.assertTrue(loop._looks_like_image_url(url))
 
+    # ── A6：七个 forced-tool helper 已删。下面这组测试保留原来的场景，
+    # 把断言从「本地词表挑出哪个工具」翻转成「结构闸门要求过工具 + 分区暴露了正确的工具」。
+    # 真正的契约「有媒体 + 一句短问句必须调工具，不能纯文本作答」一条没丢。
+
+    _NAV_TOOLS = [
+        "think",
+        "final_answer",
+        "navigate_section",
+        "analyze_image",
+        "resolve_image",
+        "analyze_voice",
+        "analyze_local_video",
+        "analyze_video",
+        "parse_video",
+        "split_video",
+        "learn_sticker",
+        "fetch_webpage",
+    ]
+
+    def _nav_state(self, ctx):
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        return nav, nav.initial_state(ctx, self._NAV_TOOLS)
+
     def test_agent_forces_image_tool_for_short_image_question(self) -> None:
+        """原断言：词表把 image + 「這是什麽」强制成 analyze_image(url, question)。
+
+        现断言：图片 segment 这个结构事实让分区落在 multimodal_media，
+        analyze_image 在该分区可见，且结构闸门要求先过工具。选哪个工具由模型决定。
+        """
         loop = AgentLoop.__new__(AgentLoop)
+        loop.config = {}
         ctx = self._make_ctx(
             message_text="MULTIMODAL_EVENT_AT user mentioned bot and sent multimodal message: image:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc123\n這是什麽",
             raw_segments=[
@@ -185,42 +215,54 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
                 }
             ],
         )
-        forced = loop._select_forced_media_tool(ctx)
-        self.assertIsNotNone(forced)
-        assert forced is not None
-        self.assertEqual(forced[0], "analyze_image")
-        self.assertEqual(
-            forced[1].get("url"),
-            "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc123",
-        )
-        self.assertIn("這是什麽", forced[1].get("question", ""))
+        nav, state = self._nav_state(ctx)
+        self.assertEqual(state.active_section, "multimodal_media")
+        self.assertIn("analyze_image", nav.scoped_tools(state))
+        ctx.navigator_state = state
+        self.assertTrue(loop._requires_tool_review_before_final(ctx))
 
     def test_agent_forces_local_video_tool_for_short_question(self) -> None:
+        """原断言：词表把 video + 「这是什么」强制成 analyze_local_video。
+
+        现断言分两种结构，因为它们客观上不是一回事：
+        - 真正的本地视频文件 → multimodal_media，analyze_local_video 可见；
+        - http 视频直链 → video_url，parse_video / analyze_video 可见。
+        旧词表对这两种一律吐 analyze_local_video，对直链是错的。
+        """
         loop = AgentLoop.__new__(AgentLoop)
-        ctx = self._make_ctx(
+        loop.config = {}
+
+        local_ctx = self._make_ctx(
+            message_text="这是什么",
+            raw_segments=[{"type": "video", "data": {"file": "/tmp/yukiko/demo.mp4"}}],
+            media_summary=["video:/tmp/yukiko/demo.mp4"],
+        )
+        nav, state = self._nav_state(local_ctx)
+        self.assertEqual(state.active_section, "multimodal_media")
+        self.assertIn("analyze_local_video", nav.scoped_tools(state))
+        local_ctx.navigator_state = state
+        self.assertTrue(loop._requires_tool_review_before_final(local_ctx))
+
+        url_ctx = self._make_ctx(
             message_text="这是什么",
             raw_segments=[
-                {
-                    "type": "video",
-                    "data": {"url": "https://example.com/demo.mp4"},
-                }
+                {"type": "video", "data": {"url": "https://example.com/demo.mp4"}}
             ],
             media_summary=["video:https://example.com/demo.mp4"],
         )
-        forced = loop._select_forced_media_tool(ctx)
-        self.assertEqual(
-            forced,
-            (
-                "analyze_local_video",
-                {
-                    "url": "https://example.com/demo.mp4",
-                    "question": "这是什么",
-                },
-            ),
-        )
+        nav, state = self._nav_state(url_ctx)
+        self.assertEqual(state.active_section, "video_url")
+        self.assertIn("parse_video", nav.scoped_tools(state))
+        self.assertIn("analyze_video", nav.scoped_tools(state))
 
     def test_agent_forces_split_video_tool_for_structured_video_request(self) -> None:
+        """typed command contract，KEEP 类：`mode=audio` / `10s-20s` 是用户敲的显式 token。
+
+        改的只是「谁选 split_video」——以前本地词表选，现在模型选；
+        模型选定之后，这些 typed token 仍然要被解析进 args，这一半不能丢。
+        """
         loop = AgentLoop.__new__(AgentLoop)
+        loop.config = {}
         ctx = self._make_ctx(
             message_text="mode=audio 10s-20s",
             raw_segments=[
@@ -231,22 +273,22 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
             ],
             media_summary=["video:https://example.com/demo.mp4"],
         )
-        forced = loop._select_forced_media_tool(ctx)
-        self.assertEqual(
-            forced,
-            (
-                "split_video",
-                {
-                    "url": "https://example.com/demo.mp4",
-                    "mode": "audio",
-                    "start_seconds": 10.0,
-                    "end_seconds": 20.0,
-                },
-            ),
-        )
+        nav, state = self._nav_state(ctx)
+        self.assertIn("split_video", nav.scoped_tools(state))
+
+        args = loop._normalize_tool_args("split_video", {}, ctx)
+        self.assertEqual(args.get("mode"), "audio")
+        self.assertEqual(args.get("start_seconds"), 10.0)
+        self.assertEqual(args.get("end_seconds"), 20.0)
+        self.assertEqual(args.get("url"), "https://example.com/demo.mp4")
 
     def test_agent_requires_tool_first_for_media_even_without_keyword_cues(self) -> None:
+        """原来问 `_should_force_tool_first`（内部靠词表），现在问结构闸门。
+
+        「嗯」里没有任何可匹配的词，闸门照样 True —— 这正是不需要词表的证据。
+        """
         loop = AgentLoop.__new__(AgentLoop)
+        loop.config = {}
         ctx = self._make_ctx(
             message_text="嗯",
             raw_segments=[
@@ -257,10 +299,15 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
             ],
             media_summary=["video:https://example.com/demo.mp4"],
         )
-        self.assertTrue(loop._should_force_tool_first(ctx))
+        self.assertTrue(loop._requires_tool_review_before_final(ctx))
 
     def test_agent_forces_voice_tool_for_short_question(self) -> None:
+        """原断言：词表把 record + 「说了什么」强制成 analyze_voice。
+
+        现断言：语音 segment → multimodal_media，analyze_voice 在该分区可见。
+        """
         loop = AgentLoop.__new__(AgentLoop)
+        loop.config = {}
         ctx = self._make_ctx(
             message_text="说了什么",
             raw_segments=[
@@ -271,28 +318,25 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
             ],
             media_summary=["record:https://example.com/demo.mp3"],
         )
-        forced = loop._select_forced_media_tool(ctx)
-        self.assertEqual(
-            forced, ("analyze_voice", {"url": "https://example.com/demo.mp3"})
-        )
+        nav, state = self._nav_state(ctx)
+        self.assertEqual(state.active_section, "multimodal_media")
+        self.assertIn("analyze_voice", nav.scoped_tools(state))
+        ctx.navigator_state = state
+        self.assertTrue(loop._requires_tool_review_before_final(ctx))
 
-    def test_agent_prefers_enhanced_image_generation_tool(self) -> None:
-        loop = AgentLoop.__new__(AgentLoop)
-        loop.tool_registry = self._StubRegistry(
-            {"generate_image_enhanced", "generate_image"}
-        )
-        ctx = self._make_ctx(message_text="帮我生成一张猫娘图片，眼睛里有爱心")
-        forced = loop._select_forced_media_tool(ctx)
-        # 图片生成不再通过本地关键词强制触发，交由 AI 自主决定
-        self.assertIsNone(forced)
+    def test_agent_does_not_locally_force_image_generation(self) -> None:
+        """原来两条测试（enhanced / basic）都只是断言 `_select_forced_media_tool` 返回 None。
 
-    def test_agent_falls_back_to_basic_image_generation_tool(self) -> None:
+        那个函数已经删掉，断言合并成：符号不存在，且创作类请求没有结构闸门，
+        分区由模型自己挑。
+        """
+        self.assertFalse(hasattr(AgentLoop, "_select_forced_media_tool"))
         loop = AgentLoop.__new__(AgentLoop)
-        loop.tool_registry = self._StubRegistry({"generate_image"})
-        ctx = self._make_ctx(message_text="画个猫娘")
-        forced = loop._select_forced_media_tool(ctx)
-        # 图片生成不再通过本地关键词强制触发
-        self.assertIsNone(forced)
+        loop.config = {}
+        for text in ("帮我生成一张猫娘图片，眼睛里有爱心", "画个猫娘"):
+            ctx = self._make_ctx(message_text=text)
+            with self.subTest(text=text):
+                self.assertFalse(loop._requires_tool_review_before_final(ctx))
 
     def test_agent_direct_reply_without_forced_image_tool(self) -> None:
         """当 AI 模型直接返回文本拒绝时，不再通过关键词强制触发 generate_image。"""

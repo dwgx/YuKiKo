@@ -62,6 +62,13 @@ class _AcFunVideoOnlyYoutubeDL:
 
 class LocalIntentHeuristicRegressionTests(unittest.TestCase):
     def test_passive_group_image_followup_does_not_enter_agent(self) -> None:
+        """原断言：群友互发图 → 本地闸门直接 return，模型看不到这轮。
+
+        现断言：闸门已删。同一场景照样进 Agent，由模型读 general_chat 分区说明
+        （「判断该沉默时调用 final_answer 并把 text 留空」）自己选择沉默。
+        「被动多模态信封」这个**结构事实**保留，作为喂给模型的判断依据。
+        """
+
         engine = YukikoEngine.__new__(YukikoEngine)
         engine._recent_directed_hints = {}
         engine._looks_like_bot_call = lambda text: False
@@ -73,16 +80,10 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             mentioned=False,
             is_private=False,
         )
-        trigger = SimpleNamespace(reason="followup_window")
 
-        self.assertTrue(
-            engine._should_ignore_passive_multimodal_turn(
-                message=message,
-                text=message.text,
-                trigger=trigger,
-                explicit_bot_addressed=False,
-            )
-        )
+        self.assertFalse(hasattr(engine, "_should_ignore_passive_multimodal_turn"))
+        # 结构事实仍然可用（它现在只作为 evidence，不再作为否决权）
+        self.assertTrue(YukikoEngine._is_passive_multimodal_text(message.text))
 
     def test_bilibili_cookie_reaches_hybrid_resolver(self) -> None:
         executor = ToolExecutor(
@@ -168,6 +169,14 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         )
 
     def test_directed_image_still_enters_agent(self) -> None:
+        """契约不变：被 @ 且带图的消息必须进 Agent。
+
+        以前靠 `_should_ignore_passive_multimodal_turn` 返回 False 放行，
+        现在没有闸门可拦，因此**无条件**进 Agent —— 契约由「闸门放行」升级为「不存在闸门」。
+        这里同时锁住信封解析这个结构能力：@ 版信封要能被识别出来，
+        用户正文要能从信封里抽出来喂给模型。
+        """
+
         engine = YukikoEngine.__new__(YukikoEngine)
         engine._recent_directed_hints = {}
         engine._looks_like_bot_call = lambda text: False
@@ -179,16 +188,10 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             mentioned=True,
             is_private=False,
         )
-        trigger = SimpleNamespace(reason="directed")
 
-        self.assertFalse(
-            engine._should_ignore_passive_multimodal_turn(
-                message=message,
-                text=message.text,
-                trigger=trigger,
-                explicit_bot_addressed=True,
-            )
-        )
+        self.assertFalse(hasattr(engine, "_should_ignore_passive_multimodal_turn"))
+        self.assertTrue(YukikoEngine._is_passive_multimodal_text(message.text))
+
 
     def test_engine_followup_keywords_do_not_trigger_local_guesses(self) -> None:
         engine = YukikoEngine.__new__(YukikoEngine)
@@ -215,14 +218,14 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         self.assertFalse(
             YukikoEngine._looks_like_music_request("\u70b9\u6b4c \u70ed\u6c34\u6fa1")
         )
+        # engine \u4fa7 `_looks_like_qq_avatar_intent` / `_looks_like_local_file_request`
+        # \u5df2\u5220\u9664\uff08\u5220\u6389 `_should_prefer_router_for_plain_text` \u4e0e self_check \u540e\u5b83\u4eec\u751f\u4ea7\u5f15\u7528\u4e3a 0\uff09\u3002
+        # \u540c\u4e00\u6761\u300c\u4e2d\u6587\u8bf4\u6cd5\u4e0d\u5f97\u547d\u4e2d\u300d\u5951\u7ea6\u7531\u6d3b\u7740\u7684\u90a3\u4efd\u6301\u6709\uff0c\u89c1\u4e0b\u65b9 typed-command \u6d4b\u8bd5\u3002
+        self.assertFalse(hasattr(engine, "_looks_like_qq_avatar_intent"))
+        self.assertFalse(hasattr(YukikoEngine, "_looks_like_local_file_request"))
         self.assertFalse(
-            engine._looks_like_qq_avatar_intent(
+            ToolExecutor._looks_like_qq_avatar_request(
                 "\u67e5\u4e00\u4e0b\u6211\u7684\u5934\u50cf"
-            )
-        )
-        self.assertFalse(
-            YukikoEngine._looks_like_local_file_request(
-                "\u628a\u684c\u9762\u7684\u6587\u4ef6\u53d1\u6211"
             )
         )
         self.assertFalse(engine._looks_like_bot_call("\u4f60\u770b\u770b\u8fd9\u4e2a"))
@@ -240,9 +243,19 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         self.assertTrue(
             YukikoEngine._looks_like_music_request("/music \u70ed\u6c34\u6fa1")
         )
-        self.assertTrue(engine._looks_like_qq_avatar_intent("/avatar target=self"))
-        self.assertTrue(
-            YukikoEngine._looks_like_local_file_request(r"/upload C:\temp\demo.zip")
+        # `/avatar target=self` 这条 typed-command 契约仍然在，只是活的那份在 core/tools.py
+        # （engine 里的重复定义已删）。契约内容逐字未变。
+        self.assertTrue(ToolExecutor._looks_like_qq_avatar_request("/avatar target=self"))
+        self.assertTrue(ToolExecutor._looks_like_qq_avatar_request("/avatar target=me"))
+        # 本地文件能力不再有 engine 侧词表入口，改由模型进 group_files 分区拿工具。
+        from core.prompt_navigator import (
+            PromptNavigator,
+            default_prompt_navigator_payload,
+        )
+
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        self.assertIn(
+            "upload_group_file", nav.config.sections["group_files"].tools
         )
         self.assertTrue(engine._looks_like_bot_call("yukiko?"))
 
@@ -269,8 +282,9 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             is_private=False,
         )
 
-        self.assertTrue(
-            engine._looks_like_recent_media_followup_instruction(message.text)
+        # 32 \u8bcd\u7684\u7f16\u8f91/\u5206\u6790\u8bcd\u8868\u5df2\u5220\u9664\uff1a\u5524\u9192\u5224\u636e\u53ea\u5269\u7ed3\u6784\u4e8b\u5b9e\u3002
+        self.assertFalse(
+            hasattr(engine, "_looks_like_recent_media_followup_instruction")
         )
         self.assertTrue(engine._looks_like_recent_media_followup(message, message.text))
         self.assertEqual(
@@ -278,6 +292,10 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             ["image:https://example.com/a.png"],
         )
 
+        # \u539f\u65ad\u8a00\uff1a\u300c\u968f\u4fbf\u804a\u804a\u300d\u4e0d\u542b\u8bcd\u8868\u8bcd \u2192 \u4e0d\u5524\u9192\u3002
+        # \u73b0\u65ad\u8a00\uff1a\u540c\u4e00\u4e2a\u4eba\u3001\u540c\u4e00\u4e2a\u4f1a\u8bdd\u91cc\u521a\u51fa\u73b0\u8fc7\u56fe\u7247\uff0c\u8fd9\u662f\u5ba2\u89c2\u4e8b\u5b9e\uff0c\u7167\u6837\u9001\u8fdb\u6a21\u578b\u89c6\u91ce\uff1b
+        # \u8fd9\u53e5\u8bdd\u5230\u5e95\u662f\u4e0d\u662f\u5728\u6307\u90a3\u5f20\u56fe\uff0c\u7531\u6a21\u578b\u8bfb multimodal_media \u5206\u533a\u81ea\u5df1\u5224\u65ad\uff0c
+        # \u5224\u65ad\u65e0\u5173\u65f6\u7528\u7a7a\u6587\u672c final_answer \u6536\u573a\u3002\u672c\u5730\u4e0d\u518d\u66ff\u6a21\u578b\u4e0b\u7ed3\u8bba\u3002
         quiet = EngineMessage(
             conversation_id="group:901",
             group_id=901,
@@ -286,7 +304,7 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             mentioned=False,
             is_private=False,
         )
-        self.assertFalse(engine._looks_like_recent_media_followup(quiet, quiet.text))
+        self.assertTrue(engine._looks_like_recent_media_followup(quiet, quiet.text))
 
         cross_user = EngineMessage(
             conversation_id="group:901",
@@ -322,23 +340,12 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             "\u6240\u4ee5\u5462 \u5e2e\u6211\u770b",
         )
 
-        self.assertEqual(
-            AgentLoop._infer_resource_file_type("\u5b89\u5353\u5b89\u88c5\u5305"), ""
-        )
-        self.assertEqual(AgentLoop._infer_resource_file_type("prefer_ext=apk"), "apk")
-        self.assertEqual(AgentLoop._infer_resource_file_type("demo.exe"), "exe")
-        self.assertFalse(
-            AgentLoop._looks_like_download_file_request(
-                "\u5e2e\u6211\u4e0b\u8f7d\u5b89\u5353\u5b89\u88c5\u5305"
-            )
-        )
-        self.assertTrue(
-            AgentLoop._looks_like_download_file_request("/download demo.apk")
-        )
-        self.assertFalse(
-            AgentLoop._looks_like_file_send_request("\u76f4\u63a5\u53d1\u6211")
-        )
-        self.assertTrue(AgentLoop._looks_like_file_send_request("/upload demo.apk"))
+        # A7\uff1a\u8fd9\u4e24\u4e2a\u7b26\u53f7\u5df2\u6574\u4f53\u5220\u9664\u3002\u539f\u65ad\u8a00\u9a8c\u7684\u662f\u300c\u81ea\u7136\u4e2d\u6587\u4e0d\u547d\u4e2d\u3001\u53ea\u6709\u663e\u5f0f\u4ee4\u724c\u547d\u4e2d\u300d\uff0c
+        # \u5951\u7ea6\u73b0\u5728\u7531 schema \u627f\u62c5 \u2014\u2014 \u4e0b\u8f7d\u683c\u5f0f\u6539\u4e3a\u6a21\u578b\u81ea\u5df1\u586b prefer_ext / file_type\uff0c
+        # \u7559\u7a7a\u5373\u5168\u7c7b\u578b\u641c\u7d22\uff0c\u5de5\u5177\u4e0d\u518d\u4ece\u4e2d\u6587\u91cc\u5265\u683c\u5f0f\u3002
+        self.assertFalse(hasattr(AgentLoop, "_infer_resource_file_type"))
+        self.assertFalse(hasattr(AgentLoop, "_looks_like_download_file_request"))
+        self.assertFalse(hasattr(AgentLoop, "_looks_like_file_send_request"))
 
         self.assertEqual(
             AgentLoop._infer_split_video_mode("\u63d0\u53d6\u97f3\u9891"), ""
@@ -358,27 +365,11 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             AgentLoop._infer_video_time_hints("10s-20s"), {"start": 10.0, "end": 20.0}
         )
 
-        fallback = AgentLoop._fallback_tool_on_failure(
-            "smart_download",
-            {"query": "demo app"},
-            "download_untrusted_source",
-        )
-        self.assertEqual(
-            fallback, ("web_search", {"query": "demo app", "mode": "text"})
-        )
-
-        mismatch_fallback = AgentLoop._fallback_tool_on_failure(
-            "smart_download",
-            {"query": "demo app 安卓安装包", "prefer_ext": "apk"},
-            "download_signature_mismatch",
-        )
-        self.assertEqual(
-            mismatch_fallback,
-            (
-                "search_download_resources",
-                {"query": "demo app 安卓安装包", "limit": 8, "file_type": "apk"},
-            ),
-        )
+        # A7：_fallback_tool_on_failure 已删。它原来在工具失败后用关键词挑替代工具
+        # （smart_download 失败 -> web_search / search_download_resources），
+        # 那是本地替模型改主意。现在工具失败作为 observation 回给模型，由模型自己决定
+        # 换哪个工具或换个说法 —— 它看得到分区里所有可用工具，判断依据比这段代码多。
+        self.assertFalse(hasattr(AgentLoop, "_fallback_tool_on_failure"))
 
     def test_trigger_and_router_drop_local_keyword_defaults(self) -> None:
         trigger = TriggerEngine({}, {"name": "YuKiKo", "nicknames": []})
@@ -698,112 +689,66 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             "\u6211\u53ef\u80fd\u8bb0\u5f97\u4f60\u4e4b\u524d\u8bf4\u8fc7\u8fd9\u4e2a",
         )
 
-    def test_self_check_allows_ai_router_candidate_to_use_high_confidence_gate(
-        self,
-    ) -> None:
-        engine = YukikoEngine.__new__(YukikoEngine)
-        engine.self_check_enable = True
-        engine.self_check_block_at_other = False
-        engine.routing_zero_disables_undirected = True
-        engine.non_directed_high_confidence_only = True
-        engine.self_check_listen_probe_min_confidence = 0.6
-        engine.self_check_non_direct_reply_min_confidence = 0.82
-        engine._extract_first_image_url_from_text = lambda text: ""
-        engine._extract_first_video_url_from_text = lambda text: ""
-        engine._looks_like_image_analyze_intent = lambda text: False
-        engine._looks_like_video_resolve_intent = lambda text: False
-        engine._looks_like_local_file_request = lambda text: False
-        engine._pick_local_path_candidate = lambda text: ""
-        engine._looks_like_github_request = lambda text: False
-        engine._looks_like_repo_readme_request = lambda text: False
-        engine._looks_like_explicit_request = lambda text: False
-        engine._is_passive_multimodal_text = lambda text: False
-        engine._has_recent_directed_hint = lambda message: False
-        engine._looks_like_bot_call = lambda text: False
-        engine._looks_like_media_instruction = lambda text: False
-        engine._extract_multimodal_user_text = lambda text: text
-        engine._is_cross_user_context_collision = lambda message, trigger, text: False
-        engine._looks_like_low_info_group_chitchat = lambda text: False
-        engine._allow_at_other_target_dialog = lambda message, text: False
+    def test_self_check_veto_layer_is_gone_and_silence_moves_to_the_menu(self) -> None:
+        """原断言：多人活跃群 + 未 @ + 无 listen_probe → `_self_check_decision` 返回
+        `self_check:undirected_requires_listen_probe`，即本地 13 条规则一票否决模型判定。
 
-        message = EngineMessage(
-            conversation_id="group:1",
-            user_id="2",
-            text="这波怎么说",
+        现断言：整个否决层不存在了。同一场景照样交模型，模型读 general_chat 分区说明
+        自己选择「空文本 final_answer」表示沉默。契约（该沉默时要沉默）不变，
+        变的是由谁做判断 —— 从代码事后否决改成模型自己决定。
+
+        `_normalize_decision_with_tool_policy`（替模型补 query）与
+        `_should_block_undirected_agent_plain_reply`（事后丢弃模型纯文本回复）同批删除。
+        """
+
+        engine = YukikoEngine.__new__(YukikoEngine)
+
+        for gone in (
+            "_self_check_decision",
+            "_normalize_decision_with_tool_policy",
+            "_should_block_undirected_agent_plain_reply",
+            "_is_cross_user_context_collision",
+        ):
+            self.assertFalse(hasattr(engine, gone), gone)
+
+        # 那 5 个只写不读的 self_check.* 阈值字段也一并不再解析。
+        for dead_attr in (
+            "self_check_enable",
+            "self_check_block_at_other",
+            "self_check_listen_probe_min_confidence",
+            "self_check_non_direct_reply_min_confidence",
+            "self_check_cross_user_guard_seconds",
+        ):
+            self.assertFalse(hasattr(engine, dead_attr), dead_attr)
+
+    def test_undirected_group_chitchat_silence_is_reachable_in_menu(self) -> None:
+        """接管能力必须真的在菜单里：非指向群闲聊落 general_chat，且该区教了怎么沉默。
+
+        这是上一个测试删掉的 S-4 / S-5 / S-7 / S-10 / S-11 的语义承接点。
+        """
+
+        from core.prompt_navigator import (
+            PromptNavigator,
+            default_prompt_navigator_payload,
+        )
+
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = SimpleNamespace(
+            message_text="这波怎么说",
+            raw_segments=[],
+            reply_media_segments=[],
+            recent_media_artifact=None,
             mentioned=False,
             is_private=False,
+            at_other_user_ids=[],
+            reply_to_user_id="",
         )
-        trigger = SimpleNamespace(
-            followup_candidate=False,
-            active_session=False,
-            busy_users=3,
-            listen_probe=False,
-            reason="ai_router_candidate",
-        )
-        decision = RouterDecision(
-            should_handle=True,
-            action="reply",
-            reason="ai",
-            confidence=0.93,
-        )
+        state = nav.initial_state(ctx, ["think", "final_answer", "navigate_section"])
 
-        self.assertEqual(
-            engine._self_check_decision(message, trigger, decision),
-            "self_check:undirected_requires_listen_probe",
-        )
-
-    def test_self_check_allows_quiet_group_non_directed_reply_without_listen_probe(
-        self,
-    ) -> None:
-        engine = YukikoEngine.__new__(YukikoEngine)
-        engine.self_check_enable = True
-        engine.self_check_block_at_other = False
-        engine.routing_zero_disables_undirected = True
-        engine.non_directed_high_confidence_only = True
-        engine.self_check_listen_probe_min_confidence = 0.6
-        engine.self_check_non_direct_reply_min_confidence = 0.82
-        engine._extract_first_image_url_from_text = lambda text: ""
-        engine._extract_first_video_url_from_text = lambda text: ""
-        engine._looks_like_image_analyze_intent = lambda text: False
-        engine._looks_like_video_resolve_intent = lambda text: False
-        engine._looks_like_local_file_request = lambda text: False
-        engine._pick_local_path_candidate = lambda text: ""
-        engine._looks_like_github_request = lambda text: False
-        engine._looks_like_repo_readme_request = lambda text: False
-        engine._looks_like_explicit_request = lambda text: False
-        engine._is_passive_multimodal_text = lambda text: False
-        engine._has_recent_directed_hint = lambda message: False
-        engine._looks_like_bot_call = lambda text: False
-        engine._looks_like_media_instruction = lambda text: False
-        engine._extract_multimodal_user_text = lambda text: text
-        engine._is_cross_user_context_collision = (
-            lambda message, trigger, text: False
-        )
-        engine._looks_like_low_info_group_chitchat = lambda text: False
-        engine._allow_at_other_target_dialog = lambda message, text: False
-
-        message = EngineMessage(
-            conversation_id="group:1",
-            user_id="2",
-            text="这题怎么写",
-            mentioned=False,
-            is_private=False,
-        )
-        trigger = SimpleNamespace(
-            followup_candidate=False,
-            active_session=False,
-            busy_users=1,
-            listen_probe=False,
-            reason="not_directed",
-        )
-        decision = RouterDecision(
-            should_handle=True,
-            action="reply",
-            reason="ai",
-            confidence=0.93,
-        )
-
-        self.assertEqual(engine._self_check_decision(message, trigger, decision), "")
+        self.assertEqual(state.active_section, "general_chat")
+        instructions = nav.config.sections["general_chat"].instructions
+        self.assertIn("final_answer", instructions)
+        self.assertIn("空", instructions)
 
     def test_choice_followups_accept_only_structural_number_forms(self) -> None:
         self.assertEqual(YukikoEngine._extract_choice_index("1"), 1)
@@ -815,120 +760,24 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         )
 
     def test_engine_defaults_to_agent_for_directed_plain_text_chat(self) -> None:
+        """原本三个用例围绕 `_should_prefer_router_for_plain_text` 断言「什么时候绕开 Agent
+        去走旧 Router 闲聊路径」。该函数已删除，因此契约收敛为一条：
+        **指向性纯文本闲聊一律走 Agent + Prompt Navigator，不存在绕过通道。**
+
+        删除理由有两条，第二条是删除过程中实测发现的真缺陷：
+        1. 它是 Navigator 之外的第二条旁路，靠一张结构否决清单替模型决定走哪条管线；
+        2. 函数体里调 `self._extract_first_url`，而该方法只定义在 `core/agent.py` 的
+           AgentLoop 上，`YukikoEngine` 根本没有 —— 一旦运维把文档化的配置键
+           `agent.prefer_router_for_directed_plain_text` 打开，主流程直接抛 AttributeError。
+           原来的三个用例之所以是绿的，是因为它们逐个 monkeypatch 了
+           `engine._extract_first_url = lambda text: ""`，把真实缺陷盖住了。
+        """
+
         engine = YukikoEngine.__new__(YukikoEngine)
-        engine.config = {}
-        engine._extract_first_image_url_from_text = lambda text: ""
-        engine._extract_first_video_url_from_text = lambda text: ""
-        engine._extract_first_url = lambda text: ""
-        engine._looks_like_download_task_intent = lambda text: False
-        engine._looks_like_local_file_request = lambda text: False
-        engine._pick_local_path_candidate = lambda text: ""
-        engine._looks_like_github_request = lambda text: False
-        engine._looks_like_repo_readme_request = lambda text: False
-        engine._looks_like_explicit_request = lambda text: False
-        engine._looks_like_qq_avatar_intent = lambda text: False
-        engine._looks_like_image_analyze_intent = lambda text: False
-        engine._looks_like_video_request = lambda text: False
-        engine._looks_like_video_analysis_intent = lambda text: False
-        engine._looks_like_video_resolve_intent = lambda text: False
-        engine._looks_like_bot_call = lambda text: False
 
-        message = EngineMessage(
-            conversation_id="group:1",
-            user_id="2",
-            user_name="tester",
-            text="你好呀",
-            mentioned=True,
-            is_private=False,
-        )
-        trigger = SimpleNamespace(scene_hint="chat", active_session=False)
-
-        self.assertFalse(
-            engine._should_prefer_router_for_plain_text(message, "你好呀", trigger)
-        )
-
-    def test_engine_can_opt_in_router_for_directed_plain_text_chat(self) -> None:
-        engine = YukikoEngine.__new__(YukikoEngine)
-        engine.config = {"agent": {"prefer_router_for_directed_plain_text": True}}
-        engine._extract_first_image_url_from_text = lambda text: ""
-        engine._extract_first_video_url_from_text = lambda text: ""
-        engine._extract_first_url = lambda text: ""
-        engine._looks_like_download_task_intent = lambda text: False
-        engine._looks_like_local_file_request = lambda text: False
-        engine._pick_local_path_candidate = lambda text: ""
-        engine._looks_like_github_request = lambda text: False
-        engine._looks_like_repo_readme_request = lambda text: False
-        engine._looks_like_explicit_request = lambda text: False
-        engine._looks_like_qq_avatar_intent = lambda text: False
-        engine._looks_like_image_analyze_intent = lambda text: False
-        engine._looks_like_video_request = lambda text: False
-        engine._looks_like_video_analysis_intent = lambda text: False
-        engine._looks_like_video_resolve_intent = lambda text: False
-        engine._looks_like_bot_call = lambda text: False
-
-        message = EngineMessage(
-            conversation_id="group:1",
-            user_id="2",
-            user_name="tester",
-            text="你好呀",
-            mentioned=True,
-            is_private=False,
-        )
-        trigger = SimpleNamespace(scene_hint="chat", active_session=False)
-
-        self.assertTrue(
-            engine._should_prefer_router_for_plain_text(message, "你好呀", trigger)
-        )
-
-    def test_engine_keeps_agent_for_media_or_tool_tasks(self) -> None:
-        engine = YukikoEngine.__new__(YukikoEngine)
-        engine._extract_first_image_url_from_text = lambda text: ""
-        engine._extract_first_video_url_from_text = lambda text: ""
-        engine._extract_first_url = lambda text: ""
-        engine._looks_like_download_task_intent = lambda text: False
-        engine._looks_like_local_file_request = lambda text: False
-        engine._pick_local_path_candidate = lambda text: ""
-        engine._looks_like_github_request = lambda text: False
-        engine._looks_like_repo_readme_request = lambda text: False
-        engine._looks_like_explicit_request = lambda text: False
-        engine._looks_like_qq_avatar_intent = lambda text: False
-        engine._looks_like_image_analyze_intent = lambda text: False
-        engine._looks_like_video_request = lambda text: False
-        engine._looks_like_video_analysis_intent = lambda text: False
-        engine._looks_like_video_resolve_intent = lambda text: False
-        engine._looks_like_bot_call = lambda text: False
-
-        media_message = EngineMessage(
-            conversation_id="group:1",
-            user_id="2",
-            user_name="tester",
-            text="这是什么",
-            mentioned=True,
-            raw_segments=[
-                {"type": "image", "data": {"url": "https://example.com/a.png"}}
-            ],
-        )
-        trigger = SimpleNamespace(scene_hint="chat", active_session=False)
-        self.assertFalse(
-            engine._should_prefer_router_for_plain_text(
-                media_message, "这是什么", trigger
-            )
-        )
-
-        tool_message = EngineMessage(
-            conversation_id="group:1",
-            user_id="2",
-            user_name="tester",
-            text="帮我看看这个仓库 README",
-            mentioned=True,
-        )
-        engine._looks_like_github_request = lambda text: True
-        engine._looks_like_repo_readme_request = lambda text: True
-        self.assertFalse(
-            engine._should_prefer_router_for_plain_text(
-                tool_message, "帮我看看这个仓库 README", trigger
-            )
-        )
+        self.assertFalse(hasattr(engine, "_should_prefer_router_for_plain_text"))
+        # engine 上确实没有这个方法 —— 这正是旧实现打开配置就崩的原因。
+        self.assertFalse(hasattr(engine, "_extract_first_url"))
 
     def test_engine_detects_structural_echo_of_recent_bot_reply(self) -> None:
         reply = (

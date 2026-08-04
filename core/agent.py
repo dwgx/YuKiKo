@@ -78,6 +78,19 @@ _RE_LOCAL_FILE_REF = re.compile(
 )
 _RE_SYNTHETIC_USER_PREFIX = re.compile(r"^\s*用户\d{2,12}\s*[，,、:：]\s*")
 
+# 布尔型必填参数：模型填 False 是一次明确声明，不能当成「参数缺失」。
+# 只对这些字段放行 False，其它必填参数（query/url/…）填 False 仍然算缺。
+_DECLARED_FLAG_ARGS = frozenset({"upload"})
+
+# 必填参数缺失时回喂给模型的补充说明。通用文案只说「缺 X」，
+# 对这种「必须自己表态」的参数不够，模型需要知道两个取值各代表什么动作。
+_MISSING_ARG_HINTS: dict[str, str] = {
+    "upload": (
+        "upload 必填：用户要你把文件发到聊天里就填 true，"
+        "只是让你取内容/校验/看信息就填 false。不要因为消息里出现「发」字就填 true。"
+    ),
+}
+
 
 def _strip_trailing_url_noise(url: str) -> str:
     target = normalize_text(url).strip().rstrip(").,，。!?！？】》」』")
@@ -935,28 +948,26 @@ class AgentLoop:
                         llm_budget, float(self.llm_step_timeout_seconds_after_tool)
                     )
                 llm_timeout = min(llm_budget, max(6.0, remaining - 1.5))
-                fallback_tool_candidate = None
+                # 分区已经有明确证据时，不等满 llm_budget：早点超时进小 prompt 重试，
+                # 由模型在该分区的真实工具里挑一个，而不是本地 if-链替它挑。
                 if (
                     strict_tool_routing
                     and tool_calls_made == 0
+                    and self.navigator_obvious_tool_timeout_seconds > 0
+                    and llm_timeout > self.navigator_obvious_tool_timeout_seconds
                     and (
                         not steps
                         or self._has_only_navigator_tool_policy_blocks(steps)
                     )
-                ):
-                    fallback_tool_candidate = self._navigator_timeout_fallback_tool(ctx)
-                if (
-                    fallback_tool_candidate
-                    and self.navigator_obvious_tool_timeout_seconds > 0
-                    and llm_timeout > self.navigator_obvious_tool_timeout_seconds
+                    and self._has_navigator_section_evidence(ctx)
                 ):
                     llm_timeout = self.navigator_obvious_tool_timeout_seconds
                     _log.info(
-                        "navigator_obvious_tool_timeout_cap | trace=%s | step=%d | section=%s | tool=%s | timeout=%.1fs",
+                        "navigator_obvious_tool_timeout_cap | trace=%s | step=%d | section=%s | evidence=%s | timeout=%.1fs",
                         ctx.trace_id,
                         step_idx,
                         ctx.navigator_state.active_section if ctx.navigator_state else "",
-                        fallback_tool_candidate[0],
+                        ",".join((ctx.navigator_state.evidence if ctx.navigator_state else [])[:6]),
                         llm_timeout,
                     )
                 schemas: list[dict[str, Any]] = []
@@ -988,112 +999,95 @@ class AgentLoop:
                             timeout=llm_timeout,
                         )
                 except asyncio.TimeoutError:
-                    timeout_log = _log.info if fallback_tool_candidate else _log.warning
-                    timeout_log(
+                    _log.warning(
                         "agent_llm_timeout | trace=%s | step=%d | timeout=%.1fs",
                         ctx.trace_id,
                         step_idx,
                         llm_timeout,
                     )
-                    fallback_tool = fallback_tool_candidate
-                    if fallback_tool:
-                        tool_name_fb, tool_args_fb = fallback_tool
-                        parsed = {"tool": tool_name_fb, "args": dict(tool_args_fb)}
-                        response_text = json.dumps(parsed, ensure_ascii=False)
-                        assistant_msg = {"role": "assistant", "content": response_text}
-                        synthetic_tool_call = True
+                    retry_tool = self._consume_navigator_pending_tool_retry(ctx)
+                    if retry_tool:
                         _log.info(
-                            "navigator_timeout_tool_fallback | trace=%s | step=%d | section=%s | tool=%s | evidence=%s",
+                            "navigator_pending_tool_retry | trace=%s | step=%d | section=%s | tool=%s",
                             ctx.trace_id,
                             step_idx,
                             ctx.navigator_state.active_section if ctx.navigator_state else "",
-                            tool_name_fb,
-                            ",".join((ctx.navigator_state.evidence if ctx.navigator_state else [])[:6]),
+                            retry_tool[0],
                         )
                     else:
-                        retry_tool = self._consume_navigator_pending_tool_retry(ctx)
-                        if retry_tool:
-                            _log.info(
-                                "navigator_pending_tool_retry | trace=%s | step=%d | section=%s | tool=%s",
-                                ctx.trace_id,
-                                step_idx,
-                                ctx.navigator_state.active_section if ctx.navigator_state else "",
-                                retry_tool[0],
+                        retry_tool = await self._navigator_timeout_tool_retry(
+                            ctx=ctx,
+                            step_idx=step_idx,
+                            tool_calls_made=tool_calls_made,
+                            steps=steps,
+                            remaining=remaining,
+                        )
+                    if retry_tool:
+                        tool_name_retry, tool_args_retry = retry_tool
+                        parsed = {"tool": tool_name_retry, "args": dict(tool_args_retry)}
+                        response_text = json.dumps(parsed, ensure_ascii=False)
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": response_text,
+                        }
+                        synthetic_tool_call = True
+                        _log.info(
+                            "navigator_timeout_tool_retry | trace=%s | step=%d | section=%s | tool=%s",
+                            ctx.trace_id,
+                            step_idx,
+                            ctx.navigator_state.active_section if ctx.navigator_state else "",
+                            tool_name_retry,
+                        )
+                    retry_section = None
+                    if not synthetic_tool_call:
+                        retry_section = await self._navigator_timeout_section_retry(
+                            ctx=ctx,
+                            step_idx=step_idx,
+                            tool_calls_made=tool_calls_made,
+                            steps=steps,
+                            remaining=remaining,
+                        )
+                    if retry_section:
+                        if retry_section[2]:
+                            ctx.navigator_pending_tool_retry = (
+                                retry_section[2],
+                                dict(retry_section[3] or {}),
                             )
-                        else:
-                            retry_tool = await self._navigator_timeout_tool_retry(
-                                ctx=ctx,
-                                step_idx=step_idx,
-                                tool_calls_made=tool_calls_made,
-                                steps=steps,
-                                remaining=remaining,
-                            )
-                        if retry_tool:
-                            tool_name_retry, tool_args_retry = retry_tool
-                            parsed = {"tool": tool_name_retry, "args": dict(tool_args_retry)}
-                            response_text = json.dumps(parsed, ensure_ascii=False)
-                            assistant_msg = {
-                                "role": "assistant",
-                                "content": response_text,
-                            }
-                            synthetic_tool_call = True
-                            _log.info(
-                                "navigator_timeout_tool_retry | trace=%s | step=%d | section=%s | tool=%s",
-                                ctx.trace_id,
-                                step_idx,
-                                ctx.navigator_state.active_section if ctx.navigator_state else "",
-                                tool_name_retry,
-                            )
-                        retry_section = None
-                        if not synthetic_tool_call:
-                            retry_section = await self._navigator_timeout_section_retry(
-                                ctx=ctx,
-                                step_idx=step_idx,
-                                tool_calls_made=tool_calls_made,
-                                steps=steps,
-                                remaining=remaining,
-                            )
-                        if retry_section:
-                            if retry_section[2]:
-                                ctx.navigator_pending_tool_retry = (
-                                    retry_section[2],
-                                    dict(retry_section[3] or {}),
-                                )
-                            parsed = {
-                                "tool": NAVIGATE_SECTION_TOOL,
-                                "args": {
-                                    "section_id": retry_section[0],
-                                    "reason": retry_section[1],
-                                },
-                            }
-                            response_text = json.dumps(parsed, ensure_ascii=False)
-                            assistant_msg = {
-                                "role": "assistant",
-                                "content": response_text,
-                            }
-                            synthetic_tool_call = True
-                            _log.info(
-                                "navigator_timeout_section_retry | trace=%s | step=%d | section=%s | reason=%s",
-                                ctx.trace_id,
-                                step_idx,
-                                retry_section[0],
-                                clip_text(retry_section[1], 120),
-                            )
-                        elif not synthetic_tool_call and steps:
-                            return await self._build_fallback_result(
-                                ctx, steps, tool_calls_made, t0, "llm_timeout"
-                            )
-                        elif not synthetic_tool_call:
-                            fallback = _pl.get_message(
-                                "llm_timeout_fallback",
-                                "我这边处理超时了。你可以把问题再精简一点，我马上继续。",
-                            )
-                            return AgentResult(
-                                reply_text=fallback,
-                                action="reply",
-                                reason="agent_llm_timeout",
-                                total_time_ms=self._elapsed(t0),
-                            )
+                        parsed = {
+                            "tool": NAVIGATE_SECTION_TOOL,
+                            "args": {
+                                "section_id": retry_section[0],
+                                "reason": retry_section[1],
+                            },
+                        }
+                        response_text = json.dumps(parsed, ensure_ascii=False)
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": response_text,
+                        }
+                        synthetic_tool_call = True
+                        _log.info(
+                            "navigator_timeout_section_retry | trace=%s | step=%d | section=%s | reason=%s",
+                            ctx.trace_id,
+                            step_idx,
+                            retry_section[0],
+                            clip_text(retry_section[1], 120),
+                        )
+                    elif not synthetic_tool_call and steps:
+                        return await self._build_fallback_result(
+                            ctx, steps, tool_calls_made, t0, "llm_timeout"
+                        )
+                    elif not synthetic_tool_call:
+                        fallback = _pl.get_message(
+                            "llm_timeout_fallback",
+                            "我这边处理超时了。你可以把问题再精简一点，我马上继续。",
+                        )
+                        return AgentResult(
+                            reply_text=fallback,
+                            action="reply",
+                            reason="agent_llm_timeout",
+                            total_time_ms=self._elapsed(t0),
+                        )
                     if not synthetic_tool_call and parsed is None:
                         if steps:
                             return await self._build_fallback_result(
@@ -1116,29 +1110,21 @@ class AgentLoop:
                         step_idx,
                         exc,
                     )
-                    fallback_tool = None
-                    if (
-                        strict_tool_routing
-                        and tool_calls_made == 0
-                        and (
-                            not steps
-                            or self._has_only_navigator_tool_policy_blocks(steps)
-                        )
-                    ):
-                        fallback_tool = self._navigator_timeout_fallback_tool(ctx)
-                    if fallback_tool:
-                        tool_name_fb, tool_args_fb = fallback_tool
-                        parsed = {"tool": tool_name_fb, "args": dict(tool_args_fb)}
+                    # LLM 报错时不再本地挑工具兜底：如果上一轮 section retry 已经让模型
+                    # 指定了下一个工具，用它；否则把错误如实交给上层，不发明动作。
+                    retry_tool = self._consume_navigator_pending_tool_retry(ctx)
+                    if retry_tool:
+                        tool_name_retry, tool_args_retry = retry_tool
+                        parsed = {"tool": tool_name_retry, "args": dict(tool_args_retry)}
                         response_text = json.dumps(parsed, ensure_ascii=False)
                         assistant_msg = {"role": "assistant", "content": response_text}
                         synthetic_tool_call = True
                         _log.info(
-                            "navigator_llm_error_tool_fallback | trace=%s | step=%d | section=%s | tool=%s | evidence=%s",
+                            "navigator_llm_error_pending_tool_retry | trace=%s | step=%d | section=%s | tool=%s",
                             ctx.trace_id,
                             step_idx,
                             ctx.navigator_state.active_section if ctx.navigator_state else "",
-                            tool_name_fb,
-                            ",".join((ctx.navigator_state.evidence if ctx.navigator_state else [])[:6]),
+                            tool_name_retry,
                         )
                     elif steps:
                         return await self._build_fallback_result(
@@ -1290,9 +1276,6 @@ class AgentLoop:
             tool_args = parsed.get("args", {})
             if not isinstance(tool_args, dict):
                 tool_args = {}
-            tool_name, tool_args = self._rewrite_download_tool_if_needed(
-                tool_name, tool_args, ctx
-            )
             tool_args = self._normalize_tool_args(tool_name, tool_args, ctx)
             if tool_name == NAVIGATE_SECTION_TOOL:
                 ok, nav_result = self._handle_navigate_section_tool(ctx, tool_args)
@@ -1362,11 +1345,19 @@ class AgentLoop:
                         total_time_ms=self._elapsed(t0),
                         steps=steps,
                     )
+                miss_hints = " ".join(
+                    _MISSING_ARG_HINTS[name]
+                    for name in missing_args
+                    if name in _MISSING_ARG_HINTS
+                )
                 self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                     "tool": tool_name,
                                     "ok": False,
                                     "error": f"工具 {tool_name} 缺少必填参数: {miss_text}",
-                                    "display": f"{tool_name} 缺少参数({miss_text})，请补全后重试。",
+                                    "display": (
+                                        f"{tool_name} 缺少参数({miss_text})，请补全后重试。"
+                                        + (f" {miss_hints}" if miss_hints else "")
+                                    ),
                                 })
                 continue
 
@@ -1928,49 +1919,10 @@ class AgentLoop:
                 result.display = f"{tool_name} 失败: {result.error}"
             result_tool_name = tool_name
 
-            if not result.ok:
-                fallback = self._fallback_tool_on_failure(
-                    tool_name, tool_args, result.error
-                )
-                if fallback:
-                    fb_tool_name, fb_tool_args = fallback
-                    _log.info(
-                        "agent_tool_fallback_try | trace=%s | step=%d | from=%s | to=%s | args=%s",
-                        ctx.trace_id,
-                        step_idx,
-                        tool_name,
-                        fb_tool_name,
-                        json.dumps(fb_tool_args, ensure_ascii=False)[:200],
-                    )
-                    remaining_for_fallback = deadline_ts - time.monotonic()
-                    if remaining_for_fallback <= 3:
-                        return await self._build_fallback_result(
-                            ctx, steps, tool_calls_made, t0, "total_timeout"
-                        )
-                    fb_timeout = min(
-                        self._resolve_tool_timeout_seconds(fb_tool_name, has_media),
-                        max(4.0, remaining_for_fallback - 1.0),
-                    )
-                    try:
-                        fb_result = await asyncio.wait_for(
-                            self.tool_registry.call(
-                                fb_tool_name, fb_tool_args, tool_context
-                            ),
-                            timeout=fb_timeout,
-                        )
-                    except asyncio.TimeoutError:
-                        fb_result = ToolCallResult(
-                            ok=False,
-                            display=f"{fb_tool_name} 执行超时（>{int(fb_timeout)}s）",
-                            error=f"tool_timeout:{fb_tool_name}",
-                            data={},
-                        )
-                    tool_calls_made += 1
-                    if not fb_result.display and fb_result.error:
-                        fb_result.display = f"{fb_tool_name} 失败: {fb_result.error}"
-                    if fb_result.ok:
-                        result = fb_result
-                        result_tool_name = fb_tool_name
+            # 工具失败后不再由本地 if-链偷偷换一个工具重跑：错误已经通过
+            # _append_tool_result 回喂给模型，由模型自己决定下一步（换工具 / 换分区 /
+            # 直接说明失败）。旧实现在同一个 step 里静默执行第二个工具，
+            # 模型看不到这次调用，也无法否决它选的替代工具和拼出来的 query。
             if result.ok and ext_sig:
                 seen_external_fact_signatures.add(ext_sig)
                 successful_external_fact_tools += 1
@@ -2174,144 +2126,27 @@ class AgentLoop:
         )
         return bool(self._extract_first_url(merged))
 
-    def _navigator_timeout_fallback_tool(
-        self,
-        ctx: AgentContext,
-    ) -> tuple[str, dict[str, Any]] | None:
-        """Execute the active Navigator section's obvious first tool when the LLM stalls."""
+    def _has_navigator_section_evidence(self, ctx: AgentContext) -> bool:
+        """当前分区是否由结构证据选中（而不是默认闲聊分区）。
+
+        只用来决定「首轮 LLM 要不要早点超时、把决定权交给小 prompt 重试」，
+        不用来选工具：工具名一律由模型在分区可见工具里挑。
+        """
         state = ctx.navigator_state
         if state is None:
-            return None
+            return False
         active = normalize_text(state.active_section)
-        visible_tools = set(ctx.native_tools or [])
-        evidence = set(state.evidence or [])
-        if (
-            active == "video_url"
-            and "parse_video" in visible_tools
-            and self.tool_registry.has_tool("parse_video")
-            and evidence & {"video_url", "url", "recent_media_artifact"}
-        ):
-            merged = "\n".join(
-                normalize_text(str(item or ""))
-                for item in (
-                    ctx.message_text,
-                    ctx.original_message_text,
-                    ctx.reply_to_text,
-                )
-            )
-            url = self._extract_first_video_url(merged) or self._extract_first_url(merged)
-            artifact = ctx.recent_media_artifact if isinstance(ctx.recent_media_artifact, dict) else {}
-            if not url and artifact:
-                url = normalize_text(str(artifact.get("source_url", ""))) or normalize_text(
-                    str(artifact.get("url", ""))
-            )
-            if url:
-                return "parse_video", {"url": url}
-        if active == "download_resources" and evidence & {
-            "download_file_extension",
-        }:
-            merged = normalize_text(
-                " ".join(
-                    str(item or "")
-                    for item in (
-                        ctx.message_text,
-                        ctx.original_message_text,
-                        ctx.reply_to_text,
-                    )
-                )
-            )
-            url = self._extract_first_url(merged)
-            file_type = self._infer_resource_file_type(merged)
-            if (
-                url
-                and "smart_download" in visible_tools
-                and self.tool_registry.has_tool("smart_download")
-            ):
-                payload: dict[str, Any] = {"url": url, "query": merged, "kind": "auto"}
-                if file_type:
-                    payload["prefer_ext"] = file_type
-                return "smart_download", payload
-        if (
-            active == "multimodal_media"
-            and evidence & {"message_or_reply_media", "image_url", "url"}
-        ):
-            merged = "\n".join(
-                normalize_text(str(item or ""))
-                for item in (
-                    ctx.message_text,
-                    ctx.original_message_text,
-                    ctx.reply_to_text,
-                )
-            )
-            image_url = self._extract_first_image_url(merged)
-            if image_url:
-                if (
-                    "analyze_image" in visible_tools
-                    and self.tool_registry.has_tool("analyze_image")
-                    and self._looks_like_image_question(merged)
-                ):
-                    return "analyze_image", {
-                        "url": image_url,
-                        "question": normalize_text(ctx.message_text)
-                        or "请简短说明这张图片内容",
-                        "allow_recent_fallback": False,
-                    }
-                if (
-                    "resolve_image" in visible_tools
-                    and self.tool_registry.has_tool("resolve_image")
-                ):
-                    return "resolve_image", {"url": image_url}
-            summaries = list(ctx.reply_media_summary or []) + list(ctx.media_summary or [])
-            summary_text = "\n".join(normalize_text(str(item)) for item in summaries)
-            if (
-                "analyze_image" in visible_tools
-                and self.tool_registry.has_tool("analyze_image")
-                and "image:" in summary_text
-            ):
-                return "analyze_image", {
-                    "question": normalize_text(ctx.message_text)
-                    or "请简短说明这张图片内容",
-                    "allow_recent_fallback": True,
-                }
-            if (
-                "analyze_voice" in visible_tools
-                and self.tool_registry.has_tool("analyze_voice")
-                and ("record:" in summary_text or "audio:" in summary_text)
-            ):
-                return "analyze_voice", {
-                    "question": normalize_text(ctx.message_text)
-                    or "请转录并总结这段语音",
-                }
-            if (
-                "analyze_local_video" in visible_tools
-                and self.tool_registry.has_tool("analyze_local_video")
-                and "video:" in summary_text
-            ):
-                return "analyze_local_video", {
-                    "question": normalize_text(ctx.message_text)
-                    or "请简短分析这个视频",
-                }
-        if active == "web_research" and evidence & {"url"}:
-            merged = normalize_text(
-                " ".join(
-                    str(item or "")
-                    for item in (
-                        ctx.message_text,
-                        ctx.original_message_text,
-                        ctx.reply_to_text,
-                    )
-                )
-            )
-            url = self._extract_first_web_url(merged) or self._extract_first_url(merged)
-            if self._has_non_url_instruction_text(ctx):
-                return None
-            if (
-                url
-                and "fetch_webpage" in visible_tools
-                and self.tool_registry.has_tool("fetch_webpage")
-            ):
-                return "fetch_webpage", {"url": url}
-        return None
+        if not active or active in {"general_chat", "fallback_debug"}:
+            return False
+        if not set(state.evidence or []):
+            return False
+        domain_tools = [
+            normalize_text(str(name))
+            for name in (ctx.native_tools or [])
+            if normalize_text(str(name))
+            not in {"", "think", "final_answer", NAVIGATE_SECTION_TOOL}
+        ]
+        return any(self.tool_registry.has_tool(name) for name in domain_tools)
 
     def _consume_navigator_pending_tool_retry(
         self, ctx: AgentContext
@@ -2690,16 +2525,6 @@ class AgentLoop:
     def _navigator_retry_model_kwargs(self) -> dict[str, str]:
         model = normalize_text(str(getattr(self, "navigator_retry_model", "") or ""))
         return {"model": model} if model else {}
-
-    @classmethod
-    def _has_non_url_instruction_text(cls, ctx: AgentContext) -> bool:
-        for raw in (ctx.message_text, ctx.original_message_text):
-            text = normalize_text(str(raw or ""))
-            if text and cls._strip_urls_and_hosts(text):
-                return True
-        if normalize_text(ctx.reply_to_text) and normalize_text(ctx.message_text):
-            return True
-        return False
 
     @staticmethod
     def _strip_urls_and_hosts(text: str) -> str:
@@ -3703,12 +3528,11 @@ class AgentLoop:
             if tool_name in {"download_file", "smart_download"}:
                 _set_if_empty("query", contextual_query or text)
                 _set_if_empty("kind", "auto")
-                if self._looks_like_file_send_request(contextual_query or text):
-                    _set_if_empty("upload", True)
+                # upload 是带副作用的动作（往群里传文件），必须由模型显式声明，
+                # 见 _missing_required_tool_args。这里只补结构参数：声明了要传，
+                # 目标群号从 ctx 结构里取，不再从中文里猜「要不要传」。
+                if self._to_declared_flag(fixed.get("upload")):
                     _set_if_empty("group_id", int(ctx.group_id or 0))
-                inferred_ext = self._infer_resource_file_type(contextual_query or text)
-                if inferred_ext:
-                    _set_if_empty("prefer_ext", inferred_ext)
         elif tool_name in {"github_search", "douyin_search", "search_knowledge"}:
             _set_if_empty("query", contextual_query or text)
         elif tool_name in {"search_web_media", "search_media"}:
@@ -3730,15 +3554,13 @@ class AgentLoop:
         elif tool_name == "analyze_image":
             _set_if_empty("question", text)
             _set_if_empty("allow_recent_fallback", True)
-            if self._looks_like_all_images_request(full_text):
-                fixed["analyze_all"] = True
-                _set_if_empty("max_images", 8)
-                fixed["recent_only_when_unique"] = False
+            # 批量识别只认模型显式声明的 analyze_all（工具侧同样只认它，
+            # 见 core/agent_tools_media.py 的 analyze_all 读取）。原先这里按中文词表
+            # 把 1 张图的分析悄悄扩成 8 张，模型并不知道自己的调用被改写了。
         elif tool_name == "search_download_resources":
             _set_if_empty("query", contextual_query or text)
-            _set_if_empty(
-                "file_type", self._infer_resource_file_type(contextual_query or text)
-            )
+            # file_type 由模型自己填：它是缩小搜索面的可选参数，
+            # 空着就是全类型搜索，不需要本地从中文里剥后缀。
         elif tool_name == "cli_invoke":
             _set_if_empty("prompt", text)
         elif tool_name == "get_user_info":
@@ -3771,8 +3593,10 @@ class AgentLoop:
         }:
             if qq_id:
                 _set_if_empty("qq_number", str(qq_id))
-        elif tool_name in {"send_emoji", "send_sticker"}:
-            _set_if_empty("query", self._infer_emoji_query(contextual_query or text))
+        # send_emoji / send_sticker 的 query 不再由本地从中文里剥词：
+        # 旧实现把「来个表情包」和「发一张猫猫表情」压成同一个 '随机'，
+        # 用户真正指定的「猫猫」被丢掉。现在 query 是必填参数（见
+        # _missing_required_tool_args），模型自己说要发什么。
 
         return fixed
 
@@ -3785,8 +3609,10 @@ class AgentLoop:
             "parse_video": ["url"],
             "analyze_video": ["url"],
             "fetch_webpage": ["url"],
-            "download_file": ["url"],
-            "smart_download": ["url"],
+            # upload 决定「文件只是下载下来，还是直接传进群里」——是带副作用的动作。
+            # 以前由本地词表（"直接发我" 之类）替模型决定，现在必须由模型显式声明。
+            "download_file": ["url", "upload"],
+            "smart_download": ["url", "upload"],
             "github_search": ["query"],
             "douyin_search": ["query"],
             "search_knowledge": ["query"],
@@ -3803,6 +3629,10 @@ class AgentLoop:
             "get_qzone_albums": ["qq_number"],
             "analyze_qzone": ["qq_number"],
             "get_qzone_photos": ["qq_number", "album_id"],
+            # query 说明要发哪个表情。以前本地从中文里剥词并在剥不到时填 '随机'，
+            # 于是「发一张猫猫表情」丢掉了「猫猫」；现在模型必须自己说。
+            "send_emoji": ["query"],
+            "send_sticker": ["query"],
         }
         fields = required.get(tool_name, [])
         missing: list[str] = []
@@ -3810,6 +3640,10 @@ class AgentLoop:
             val = args.get(field)
             if val is None:
                 missing.append(field)
+                continue
+            # bool 是 int 的子类，下面 `val == 0` 会把 False 判成缺参数。
+            # 对布尔型必填参数，False 是模型做出的明确声明（"不要上传"），必须放行。
+            if field in _DECLARED_FLAG_ARGS and isinstance(val, bool):
                 continue
             if isinstance(val, str) and not normalize_text(val):
                 missing.append(field)
@@ -4016,28 +3850,18 @@ class AgentLoop:
         )
         return any(re.search(pattern, t) for pattern in patterns)
 
-    def _extract_recent_url(self, ctx: AgentContext) -> str:
-        for direct_text in (
-            normalize_text(ctx.reply_to_text),
-            normalize_text(ctx.message_text),
-        ):
-            url = self._extract_first_url(direct_text)
-            if url:
-                return url
-        for media_type in ("video", "image", "audio"):
-            url = self._extract_recent_media_url(ctx, media_type)
-            if url:
-                return url
-        # 优先从最近上下文里找 URL（通常包含机器人上一条发出的链接）
-        for line in reversed(ctx.memory_context[-16:]):
-            url = self._extract_first_url(normalize_text(line))
-            if url:
-                return url
-        for line in reversed(ctx.related_memories[:8]):
-            url = self._extract_first_url(normalize_text(line))
-            if url:
-                return url
-        return ""
+    @staticmethod
+    def _to_declared_flag(value: Any) -> bool:
+        """把模型声明的布尔参数读成 bool。
+
+        模型可能给真 bool，也可能给 "true"/"false" 字符串；后者用 bool() 判断会把
+        "false" 当真。这里只做类型解析，不读用户原文，因此不是意图猜测。
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        return normalize_text(str(value or "")).lower() in {"true", "1", "yes", "y", "on"}
 
     @staticmethod
     def _to_safe_int(value: Any) -> int:
@@ -4098,32 +3922,6 @@ class AgentLoop:
         t = _RE_PUNCTUATION_CJK.sub(" ", t)
         t = _RE_WHITESPACE.sub(" ", t).strip()
         return t[:80]
-
-    @staticmethod
-    def _infer_resource_file_type(text: str) -> str:
-        t = normalize_text(text).lower()
-        plain = _RE_WHITESPACE.sub("", t)
-        if "prefer_ext=apk" in plain or re.search(r"\.apk(?:\?|#|$)", t):
-            return "apk"
-        if "prefer_ext=ipa" in plain or re.search(r"\.ipa(?:\?|#|$)", t):
-            return "ipa"
-        if (
-            "prefer_ext=exe" in plain
-            or re.search(r"\.exe(?:\?|#|$)", t)
-            or re.search(r"(?<![a-z0-9])exe(?![a-z0-9])", t)
-        ):
-            return "exe"
-
-        mapping = (
-            ("prefer_ext=msi", "msi"),
-            ("prefer_ext=zip", "zip"),
-            ("prefer_ext=pdf", "pdf"),
-            ("prefer_ext=mod", "mod"),
-        )
-        for cue, ft in mapping:
-            if cue in plain:
-                return ft
-        return ""
 
     @staticmethod
     def _infer_split_video_mode(text: str) -> str:
@@ -4313,73 +4111,6 @@ class AgentLoop:
             return ""
         return clip_text(text, 100)
 
-    @staticmethod
-    def _fallback_tool_on_failure(
-        tool_name: str, args: dict[str, Any], error: str = ""
-    ) -> tuple[str, dict[str, Any]] | None:
-        query = normalize_text(str(args.get("query", "")))
-        err = normalize_text(error).lower()
-        if tool_name == "wayback_timeline":
-            url = normalize_text(str(args.get("url", "")))
-            if url:
-                payload: dict[str, Any] = {"url": url}
-                limit_raw = args.get("limit", 8)
-                try:
-                    limit = int(limit_raw)
-                except (TypeError, ValueError):
-                    limit = 8
-                payload["limit"] = min(max(limit, 1), 20)
-                year_raw = args.get("year")
-                if year_raw not in (None, ""):
-                    try:
-                        payload["year"] = int(year_raw)
-                    except (TypeError, ValueError):
-                        pass
-                return "wayback_lookup", payload
-        if tool_name in {"smart_download", "download_file"} and err.startswith(
-            "download_untrusted_source"
-        ):
-            if query:
-                return "web_search", {"query": query, "mode": "text"}
-            url = normalize_text(str(args.get("url", "")))
-            if url:
-                return "web_search", {"query": url, "mode": "text"}
-            return None
-        if tool_name in {"smart_download", "download_file"} and err in {
-            "download_payload_is_html",
-            "download_signature_mismatch",
-            "download_path_missing",
-            "download_failed",
-        }:
-            file_type = (
-                normalize_text(str(args.get("prefer_ext", ""))).lower().strip(".")
-            )
-            if not file_type and query:
-                file_type = AgentLoop._infer_resource_file_type(query)
-            fallback_query = query
-            if not fallback_query:
-                fallback_query = normalize_text(str(args.get("url", "")))
-            if fallback_query:
-                payload: dict[str, Any] = {"query": fallback_query, "limit": 8}
-                if file_type:
-                    payload["file_type"] = file_type
-                return "search_download_resources", payload
-            return None
-        if not query:
-            return None
-        if tool_name == "search_download_resources":
-            return "web_search", {"query": f"{query} 官网 下载", "mode": "text"}
-        if tool_name in {"search_web_media", "search_media"}:
-            media_type = (
-                normalize_text(str(args.get("media_type", "image"))).lower() or "image"
-            )
-            if media_type == "video":
-                return "web_search", {"query": query, "mode": "video"}
-            if media_type == "gif":
-                return "web_search", {"query": f"{query} gif", "mode": "image"}
-            return "web_search", {"query": query, "mode": "image"}
-        return None
-
     def _resolve_tool_timeout_seconds(self, tool_name: str, has_media: bool) -> float:
         heavy_tools = {
             "parse_video",
@@ -4483,475 +4214,13 @@ class AgentLoop:
                 parts.append(f"{key}={clip_text(value, 180)}")
         return "|".join(parts) if len(parts) > 1 else ""
 
-    @staticmethod
-    def _infer_emoji_query(text: str) -> str:
-        t = normalize_text(text)
-        if not t:
-            return "随机"
-        lower = t.lower()
-        if any(
-            cue in lower
-            for cue in (
-                "刚学",
-                "刚刚学",
-                "刚才学",
-                "最近学",
-                "刚学的",
-                "刚刚学的",
-                "刚刚那个",
-                "刚才那个",
-            )
-        ):
-            return "最近"
-        if any(
-            cue in lower
-            for cue in ("随机", "随便", "来个", "来一张", "来张", "发个", "发一张")
-        ):
-            return "随机"
-        cleaned = re.sub(
-            r"(请|請|麻烦|麻煩|帮我|幫我|给我|給我|把|发表情包|發表情包|表情包|表情|emoji|emote|动图|動圖|gif|贴纸|貼紙|发|發|来|來|一张|一張|一个|一個|一下|吧|呀|啊|嘛|呢)",
-            " ",
-            t,
-            flags=re.IGNORECASE,
-        )
-        cleaned = _RE_WHITESPACE.sub(" ", cleaned).strip()
-        if cleaned:
-            return cleaned[:40]
-        return "随机"
-
-    @staticmethod
-    def _is_explicit_emoji_request(text: str) -> bool:
-        t = normalize_text(text).lower()
-        if not t:
-            return False
-        cues = ("表情包", "表情", "emoji", "emote", "动图", "gif", "贴纸")
-        return any(cue in t for cue in cues)
-
     def _looks_like_choice_followup(self, text: str) -> bool:
         _ = text
         # 快捷跟进链路已下线，统一交给常规意图理解和工具调用。
         return False
 
-    @staticmethod
-    def _looks_like_file_send_request(text: str) -> bool:
-        t = normalize_text(text).lower()
-        if not t:
-            return False
-        plain = _RE_WHITESPACE.sub("", t)
-        explicit_tokens = (
-            "/upload",
-            "upload=1",
-            "send_file=1",
-            "send=group_file",
-            "group_file=1",
-        )
-        return any(token in plain for token in explicit_tokens)
-
-    @staticmethod
-    def _looks_like_download_file_request(text: str) -> bool:
-        t = normalize_text(text).lower()
-        if not t:
-            return False
-        plain = _RE_WHITESPACE.sub("", t)
-        if any(token in plain for token in ("/download", "download=1", "prefer_ext=")):
-            return True
-        return bool(_RE_DOWNLOAD_EXT.search(t))
-
-    def _rewrite_download_tool_if_needed(
-        self,
-        tool_name: str,
-        tool_args: dict[str, Any],
-        ctx: AgentContext,
-    ) -> tuple[str, dict[str, Any]]:
-        name = normalize_text(tool_name)
-        if name not in self._DOWNLOAD_LLM_EXTRACT_TOOLS:
-            return name, tool_args
-
-        merged_text = normalize_text(f"{ctx.message_text}\n{ctx.reply_to_text}")
-        if not self._looks_like_download_file_request(merged_text):
-            return name, tool_args
-
-        url_from_args = normalize_text(str(tool_args.get("url", "")))
-        candidate_url = (
-            url_from_args
-            or self._extract_first_url(normalize_text(ctx.message_text))
-            or self._extract_first_url(normalize_text(ctx.reply_to_text))
-            or self._extract_recent_url(ctx)
-        )
-        contextual_query = self._rebuild_query_with_context(
-            normalize_text(ctx.message_text), ctx
-        ) or normalize_text(ctx.message_text)
-        inferred_ext = self._infer_resource_file_type(contextual_query)
-
-        if candidate_url:
-            rewritten_args: dict[str, Any] = {
-                "url": candidate_url,
-                "query": contextual_query or merged_text,
-                "kind": "auto",
-            }
-            if inferred_ext:
-                rewritten_args["prefer_ext"] = inferred_ext
-            if self._looks_like_file_send_request(merged_text):
-                rewritten_args["upload"] = True
-                if ctx.group_id:
-                    rewritten_args["group_id"] = int(ctx.group_id)
-            _log.info(
-                "agent_download_tool_rewrite | trace=%s | from=%s | to=smart_download | url=%s",
-                ctx.trace_id,
-                name,
-                clip_text(candidate_url, 160),
-            )
-            return "smart_download", rewritten_args
-
-        rewritten_query = contextual_query or merged_text
-        rewritten_args = {"query": rewritten_query}
-        if inferred_ext:
-            rewritten_args["file_type"] = inferred_ext
-        _log.info(
-            "agent_download_tool_rewrite | trace=%s | from=%s | to=search_download_resources | query=%s",
-            ctx.trace_id,
-            name,
-            clip_text(rewritten_query, 160),
-        )
-        return "search_download_resources", rewritten_args
-
     def _looks_like_profile_analysis_request(self, text: str) -> bool:
         return _shared_qq_profile_request(text, config=self.config)
-
-    def _should_force_tool_first(self, ctx: AgentContext) -> bool:
-        """Return True only for structural inputs that require tool handling."""
-        text = normalize_text(ctx.message_text).lower()
-        if not text and not ctx.media_summary and not ctx.reply_media_summary:
-            return False
-
-        if self._select_forced_media_tool(ctx):
-            return True
-
-        if ctx.media_summary or ctx.reply_media_summary:
-            return True
-
-        # 任何外链默认工具优先（解析/抓取/校验）
-        if _RE_URL_SCHEME.search(text):
-            return True
-
-        return False
-
-    @staticmethod
-    def _has_segment_type(
-        segments: list[dict[str, Any]] | None, wanted: set[str]
-    ) -> bool:
-        for seg in segments or []:
-            if not isinstance(seg, dict):
-                continue
-            seg_type = normalize_text(str(seg.get("type", ""))).lower()
-            if seg_type in wanted:
-                return True
-        return False
-
-    def _has_image_media(self, ctx: AgentContext) -> bool:
-        return (
-            any(item.startswith("image:") for item in (ctx.media_summary or []))
-            or any(
-                item.startswith("image:") for item in (ctx.reply_media_summary or [])
-            )
-            or self._text_has_image_hint(ctx.message_text)
-            or self._text_has_image_hint(ctx.reply_to_text)
-            or self._has_segment_type(ctx.raw_segments, {"image"})
-            or self._has_segment_type(ctx.reply_media_segments, {"image"})
-        )
-
-    def _has_video_media(self, ctx: AgentContext) -> bool:
-        return (
-            any(item.startswith("video:") for item in (ctx.media_summary or []))
-            or any(
-                item.startswith("video:") for item in (ctx.reply_media_summary or [])
-            )
-            or self._has_segment_type(ctx.raw_segments, {"video"})
-            or self._has_segment_type(ctx.reply_media_segments, {"video"})
-        )
-
-    def _has_voice_media(self, ctx: AgentContext) -> bool:
-        return (
-            any(
-                item.startswith(prefix)
-                for item in (ctx.media_summary or [])
-                for prefix in ("audio:", "record:")
-            )
-            or any(
-                item.startswith(prefix)
-                for item in (ctx.reply_media_summary or [])
-                for prefix in ("audio:", "record:")
-            )
-            or self._has_segment_type(ctx.raw_segments, {"audio", "record"})
-            or self._has_segment_type(ctx.reply_media_segments, {"audio", "record"})
-        )
-
-    @staticmethod
-    def _looks_like_generic_media_question(text: str) -> bool:
-        t = normalize_text(text).lower()
-        if not t:
-            return True
-        direct_cues = (
-            "这是什么",
-            "這是什麼",
-            "這是什麽",
-            "这是啥",
-            "這是啥",
-            "啥意思",
-            "什么意思",
-            "什麼意思",
-            "什麽意思",
-            "看下",
-            "看一下",
-            "看看",
-            "帮我看",
-            "幫我看",
-            "解释一下",
-            "解釋一下",
-            "说说",
-            "說說",
-            "讲了什么",
-            "講了什麼",
-            "说了什么",
-            "說了什麼",
-            "写了什么",
-            "寫了什麼",
-            "读一下",
-            "讀一下",
-            "内容是什么",
-            "內容是什麼",
-        )
-        if any(cue in t for cue in direct_cues):
-            return True
-        ask_tokens = (
-            "什么",
-            "什麼",
-            "啥",
-            "谁",
-            "誰",
-            "哪",
-            "怎么",
-            "怎麼",
-            "意思",
-            "内容",
-            "內容",
-            "看",
-            "读",
-            "讀",
-            "讲",
-            "講",
-            "写",
-            "寫",
-        )
-        return len(t) <= 12 and any(token in t for token in ask_tokens)
-
-    def _should_force_image_tool_first(self, ctx: AgentContext) -> bool:
-        text = normalize_text(ctx.message_text).lower()
-        if not self._has_image_media(ctx):
-            return False
-        if self._looks_like_image_question(text):
-            return True
-        if self._looks_like_generic_media_question(text):
-            return True
-        reference_cues = tuple(
-            normalize_text(cue).lower()
-            for cue in _pl.get_list("image_reference_cues")
-            if normalize_text(cue)
-        )
-        if (
-            ("?" in text or "？" in text)
-            and reference_cues
-            and any(cue in text for cue in reference_cues)
-        ):
-            return True
-        return False
-
-    def _should_force_local_video_tool_first(self, ctx: AgentContext) -> bool:
-        text = normalize_text(ctx.message_text).lower()
-        if not self._has_video_media(ctx):
-            return False
-        if self._looks_like_generic_media_question(text):
-            return True
-        return not text
-
-    def _select_forced_video_tool(
-        self, ctx: AgentContext
-    ) -> tuple[str, dict[str, Any]] | None:
-        text = normalize_text(ctx.message_text)
-        contextual_text = self._rebuild_query_with_context(text, ctx) or text
-        has_video_media = self._has_video_media(ctx)
-        explicit_video_url = self._extract_first_video_url(text) or self._extract_first_video_url(
-            normalize_text(ctx.reply_to_text)
-        )
-        video_url = explicit_video_url or self._extract_recent_media_url(ctx, "video")
-        if not has_video_media and not video_url:
-            return None
-        instruction_text = normalize_text(_RE_URL_STRIP.sub(" ", contextual_text))
-        if video_url and self._looks_like_video_parse_request(contextual_text):
-            return "parse_video", {"url": video_url}
-        mode = self._infer_split_video_mode(instruction_text)
-        time_hints = self._infer_video_time_hints(instruction_text)
-        frame_hint = self._infer_frame_count_hint(instruction_text)
-
-        if not mode:
-            if frame_hint > 0:
-                mode = "frames"
-            elif time_hints.get("start") is not None and time_hints.get("end") is not None:
-                mode = "clip"
-            elif time_hints.get("point") is not None:
-                mode = "cover"
-
-        if mode:
-            forced_args: dict[str, Any] = {"mode": mode}
-            if video_url:
-                forced_args["url"] = video_url
-            if mode in {"clip", "audio"}:
-                if time_hints.get("start") is not None:
-                    forced_args["start_seconds"] = time_hints["start"]
-                if time_hints.get("end") is not None:
-                    forced_args["end_seconds"] = time_hints["end"]
-            elif mode == "cover":
-                if time_hints.get("point") is not None:
-                    forced_args["frame_time_seconds"] = time_hints["point"]
-            elif mode == "frames" and frame_hint > 0:
-                forced_args["max_frames"] = frame_hint
-            return "split_video", forced_args
-
-        if video_url:
-            forced_args = {"url": video_url}
-            if self._looks_like_video_parse_request(contextual_text):
-                return "parse_video", forced_args
-            if self._looks_like_video_analysis_request(contextual_text):
-                return "analyze_video", forced_args
-            if not has_video_media:
-                return "parse_video", forced_args
-
-        if self._should_force_local_video_tool_first(ctx):
-            forced_args = {}
-            if video_url:
-                forced_args["url"] = video_url
-            if text:
-                forced_args["question"] = text
-            return "analyze_local_video", forced_args
-
-        return None
-
-    @staticmethod
-    def _looks_like_video_parse_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = (
-            "解析",
-            "直链",
-            "下载",
-            "下載",
-            "发我",
-            "發我",
-            "发出来",
-            "發出來",
-            "转发",
-            "轉發",
-            "搬运",
-            "保存",
-            "parse",
-            "download",
-        )
-        return any(cue in content for cue in cues)
-
-    @staticmethod
-    def _looks_like_video_analysis_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = (
-            "分析",
-            "总结",
-            "總結",
-            "评价",
-            "評價",
-            "看看",
-            "看下",
-            "看一下",
-            "讲了什么",
-            "講了什麼",
-            "内容",
-            "內容",
-            "解说",
-            "解說",
-            "字幕",
-            "弹幕",
-            "熱評",
-            "热评",
-            "analyze",
-            "summary",
-        )
-        return any(cue in content for cue in cues)
-
-    def _should_force_voice_tool_first(self, ctx: AgentContext) -> bool:
-        text = normalize_text(ctx.message_text).lower()
-        if not self._has_voice_media(ctx):
-            return False
-        if self._looks_like_generic_media_question(text):
-            return True
-        voice_cues = (
-            "语音",
-            "語音",
-            "录音",
-            "錄音",
-            "音频",
-            "音頻",
-            "转文字",
-            "轉文字",
-            "听不清",
-            "聽不清",
-            "内容",
-            "內容",
-        )
-        return any(cue in text for cue in voice_cues)
-
-    def _select_forced_web_tool(
-        self, ctx: AgentContext
-    ) -> tuple[str, dict[str, Any]] | None:
-        text = normalize_text(ctx.message_text)
-        if not self._looks_like_webpage_fetch_request(text):
-            return None
-        url = self._extract_first_web_url(text)
-        if not url:
-            return None
-        return "fetch_webpage", {"url": url}
-
-    def _select_forced_media_tool(
-        self, ctx: AgentContext
-    ) -> tuple[str, dict[str, Any]] | None:
-        # 图片生成不再通过本地关键词强制触发，完全交给 AI Agent 根据上下文自主决定是否调用工具。
-
-        if self._has_image_media(ctx):
-            forced_args: dict[str, Any] = {}
-            first_url = self._extract_first_url(ctx.message_text)
-            if first_url and self._looks_like_image_url(first_url):
-                forced_args["url"] = first_url
-            else:
-                recent_image_url = self._extract_recent_media_url(ctx, "image")
-                if recent_image_url:
-                    forced_args["url"] = recent_image_url
-            question = normalize_text(ctx.message_text)
-            if question:
-                forced_args["question"] = question
-            return "analyze_image", forced_args
-
-        forced_video_tool = self._select_forced_video_tool(ctx)
-        if forced_video_tool:
-            return forced_video_tool
-
-        if self._should_force_voice_tool_first(ctx):
-            forced_args: dict[str, Any] = {}
-            voice_url = self._extract_recent_media_url(ctx, "audio")
-            if voice_url:
-                forced_args["url"] = voice_url
-            return "analyze_voice", forced_args
-
-        return None
 
     @staticmethod
     def _looks_like_image_question(text: str) -> bool:
@@ -4965,45 +4234,6 @@ class AgentLoop:
         if any(tok in t for tok in ("/analyze", "mode=analyze", "ocr=true")):
             return True
         return False
-
-    @staticmethod
-    def _looks_like_all_images_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        scope_cues = (
-            "所有图片",
-            "全部图片",
-            "所有图",
-            "全部图",
-            "群里图片",
-            "群里的图片",
-            "群里所有图",
-            "每张图",
-            "每个图",
-            "逐张",
-            "一张张",
-            "批量",
-            "all images",
-            "every image",
-        )
-        action_cues = (
-            "识别",
-            "分析",
-            "看看",
-            "描述",
-            "提取",
-            "总结",
-            "识图",
-            "read",
-            "analyze",
-            "describe",
-            "ocr",
-        )
-        return any(cue in content for cue in scope_cues) and any(
-            cue in content for cue in action_cues
-        )
-
 
     def _append_tool_result(
         self,

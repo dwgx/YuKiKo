@@ -548,32 +548,66 @@ class AgentProtectionTests(unittest.TestCase):
         self.assertFalse(loop._tool_is_high_risk("final_answer"))
 
     def test_force_tool_first_for_media(self):
-        """媒体消息应强制走工具路径。"""
+        """媒体消息必须先过工具，不能纯文本作答。
+
+        契约不变，判据换人：原来问 `_should_force_tool_first`（那个函数内部靠
+        `_select_forced_media_tool` 的中文词表猜工具名），现在问结构闸门
+        `_requires_tool_review_before_final` —— 它只看 OneBot segment / media_summary /
+        URL 这些结构事实，不读中文。工具名不再由本地决定，由模型在分区可见工具里挑。
+        """
         loop = _make_loop([])
         ctx = _make_ctx(
             message_text="这是什么",
             media_summary=["image:https://example.com/a.png"],
             raw_segments=[{"type": "image", "data": {"url": "https://example.com/a.png"}}],
         )
-        self.assertTrue(loop._should_force_tool_first(ctx))
+        self.assertTrue(loop._requires_tool_review_before_final(ctx))
+
+    def test_media_tool_review_does_not_depend_on_wording(self):
+        """同一段媒体换任何说法，结构闸门恒定 True —— 这正是删掉词表的意义。"""
+        loop = _make_loop([])
+        for text in ("这是什么", "总结一下", "解析", "嗯", "哈哈", ""):
+            ctx = _make_ctx(
+                message_text=text,
+                media_summary=["video:https://example.com/demo.mp4"],
+                raw_segments=[
+                    {"type": "video", "data": {"url": "https://example.com/demo.mp4"}}
+                ],
+            )
+            with self.subTest(text=text):
+                self.assertTrue(loop._requires_tool_review_before_final(ctx))
 
     def test_force_tool_first_for_url(self):
-        """包含 URL 的消息应强制走工具路径。"""
+        """包含 URL 的消息应强制走工具路径（URL 是结构事实）。"""
         loop = _make_loop([])
         ctx = _make_ctx(message_text="帮我看看 https://example.com/article")
-        self.assertTrue(loop._should_force_tool_first(ctx))
+        self.assertTrue(loop._requires_tool_review_before_final(ctx))
 
     def test_force_tool_first_for_search(self):
-        """纯自然语言搜索请求交给 Prompt Navigator/LLM 分区判断。"""
+        """纯自然语言搜索请求交给 Prompt Navigator/LLM 分区判断，本地不设闸门。"""
         loop = _make_loop([])
         ctx = _make_ctx(message_text="帮我搜索一下 python 教程")
-        self.assertFalse(loop._should_force_tool_first(ctx))
+        self.assertFalse(loop._requires_tool_review_before_final(ctx))
 
     def test_no_force_tool_for_greeting(self):
         """普通问候不强制走工具。"""
         loop = _make_loop([])
         ctx = _make_ctx(message_text="你好")
-        self.assertFalse(loop._should_force_tool_first(ctx))
+        self.assertFalse(loop._requires_tool_review_before_final(ctx))
+
+    def test_forced_tool_helpers_are_gone(self):
+        """A6：七个 forced-tool helper 已删除，防止以后有人把词表重新接回来。"""
+        for name in (
+            "_should_force_tool_first",
+            "_should_force_image_tool_first",
+            "_should_force_local_video_tool_first",
+            "_should_force_voice_tool_first",
+            "_select_forced_media_tool",
+            "_select_forced_video_tool",
+            "_select_forced_web_tool",
+        ):
+            with self.subTest(symbol=name):
+                self.assertFalse(hasattr(AgentLoop, name))
 
     def test_args_signature_normalization(self):
         """工具参数签名应忽略大小写和空格差异。"""
