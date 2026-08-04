@@ -80,6 +80,13 @@ class AdminEngine:
         "拉黑本群": "white_rm",
         "白名单": "white_list",
         "whitelist": "white",
+        # canonical 名必须能直接解析：admin_command 的 schema
+        # （core/agent_tools_admin.py:43-45）就是教模型写 white_add / white_rm / white_list 的，
+        # 而这三个字符串以前只存在于 _SUB 的「值」里、不是「键」，模型照着 schema 写反而得到
+        # 「未知命令」。_FUZZY_COMMAND_MAP 删除后中文别名也会消失，_SUB 是唯一通路。
+        "white_add": "white_add",
+        "white_rm": "white_rm",
+        "white_list": "white_list",
         "群信息": "group_info",
         "debug": "debug",
         "update": "update",
