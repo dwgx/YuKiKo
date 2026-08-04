@@ -21,9 +21,16 @@ config:
     knowledge_require_explicit_user_fact: true
     knowledge_block_speculative: true
     knowledge_block_tool_echo: true
+  # 分离式审计流：storage/audit/<stream>/YYYY-MM-DD.jsonl
+  # 五条流：tool_calls / memory_writes / group_ops / prompt_edits / knowledge
+  audit:
+    enable: true
+
   memory:
     enable_daily_log: true
     enable_vector_memory: true
+    # embedding 保留天数；0 = 永不删除（默认，与「永久知识库」一致）
+    embedding_retention_days: 0
     max_context_messages: 50
     summary_every_n_messages: 20
     vector_dim: 64

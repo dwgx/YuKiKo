@@ -67,9 +67,11 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "knowledge_block_speculative": True,
             "knowledge_block_tool_echo": True,
         },
+        "audit": {"enable": True},
         "memory": {
             "enable_daily_log": True,
             "enable_vector_memory": True,
+            "embedding_retention_days": 0,
             "max_context_messages": 50,
             "summary_every_n_messages": 20,
             "vector_dim": 64,

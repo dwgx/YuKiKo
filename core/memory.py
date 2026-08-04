@@ -74,6 +74,14 @@ class MemoryEngine:
         self.heuristic_rules_enable = bool(control_cfg.get("heuristic_rules_enable", False))
         self.enable_daily_log = bool(config.get("enable_daily_log", True))
         self.enable_vector_memory = bool(config.get("enable_vector_memory", True))
+        # embedding 保留天数。原先硬编码 7 天且静默删除，与「永久知识库」冲突。
+        # 0 / 负数 = 永不删除。
+        try:
+            self.embedding_retention_days = int(
+                config.get("embedding_retention_days", 0)
+            )
+        except (TypeError, ValueError):
+            self.embedding_retention_days = 0
         self.max_context_messages = int(config.get("max_context_messages", 50))
         self.summary_every_n_messages = max(1, int(config.get("summary_every_n_messages", 20)))
         self.vector_dim = max(16, int(config.get("vector_dim", 64)))
@@ -2654,17 +2662,34 @@ class MemoryEngine:
             for k in expired:
                 store.pop(k, None)
 
-        # 清理 SQLite 中超过 7 天的 embedding 数据
-        if self.enable_vector_memory:
-            embedding_cutoff = (current_date - timedelta(days=7)).isoformat()
+        # embedding 清理：默认永不删除（embedding_retention_days=0）。
+        # 原先是硬编码 7 天 + `except: pass`，由正常聊天间接触发，删了多少条无人知晓，
+        # 失败也完全静默 —— 与「永久知识库」直接冲突。现在保留期可配，且必然留下审计记录。
+        retention = int(getattr(self, "embedding_retention_days", 0) or 0)
+        if self.enable_vector_memory and retention > 0:
+            embedding_cutoff = (current_date - timedelta(days=retention)).isoformat()
             try:
                 with self._connect() as conn:
-                    conn.execute(
+                    cur = conn.execute(
                         "DELETE FROM embeddings WHERE created_at < ?;",
                         (embedding_cutoff,),
                     )
+                    deleted = int(cur.rowcount or 0)
+                if deleted:
+                    _log.info(
+                        "embeddings_pruned | removed=%d | cutoff=%s | retention_days=%d",
+                        deleted,
+                        embedding_cutoff,
+                        retention,
+                    )
             except Exception:
-                pass
+                # 不再静默：清理失败必须可见，否则数据库会无声膨胀。
+                _log.warning(
+                    "embeddings_prune_failed | cutoff=%s | retention_days=%d",
+                    embedding_cutoff,
+                    retention,
+                    exc_info=True,
+                )
 
     def generate_daily_report(self, day_key: str | None = None) -> str:
         """Generate a concise, human-readable daily report for group chat.
