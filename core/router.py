@@ -456,11 +456,23 @@ class RouterEngine:
                 reply_style="short",
             )
 
-        if passive_multimodal_followup_allowed and action in {
-            "ignore",
-            "reply",
-            "search",
-        }:
+        # 严格模式下不再由 router 决定「有图就去分析图」：PromptNavigator._preselect
+        # 读同一个 raw_segments 图片段，已经把起始分区落在 multimodal_media 并把
+        # analyze_image 放进可见工具，同时把 image_url / message_or_reply_media 作为
+        # 结构信号交给模型判断。在这里强制 action=search + method=media.analyze_image
+        # 等于把刚从 router prompt 里删掉的工具选择又加回来，且模型无法申诉。
+        strict_navigator = SystemPromptRelay._strict_navigator_enabled()
+
+        if (
+            not strict_navigator
+            and passive_multimodal_followup_allowed
+            and action
+            in {
+                "ignore",
+                "reply",
+                "search",
+            }
+        ):
             self._log.debug(
                 "router_override | passive_multimodal_followup | was=%s", action
             )
@@ -474,7 +486,8 @@ class RouterEngine:
                 tool_args["query"] = normalize_text(media_user_text) or "继续分析这张图"
 
         if (
-            has_image_media
+            not strict_navigator
+            and has_image_media
             and has_inline_multimodal_text
             and not self._contains_explicit_adult_intent(media_user_text)
             and action in {"ignore", "reply", "search"}
