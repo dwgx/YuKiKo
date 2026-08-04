@@ -99,7 +99,7 @@ class YukikoEngine:
         )
 
         # ── 管理员系统 ──
-        self.admin = AdminEngine(self.config, self.storage_dir)
+        self.admin = AdminEngine(self.config, self.storage_dir, self.audit)
         self._init_from_config()
         self.model_client = ModelClient(self.config.get("api", {}))
         PersonalityEngine.ensure_default_files(self.config_dir)
@@ -845,7 +845,8 @@ class YukikoEngine:
                 _pl.reload()
                 self.config = self.config_manager.raw
                 self._init_from_config()
-                self.admin = AdminEngine(self.config, self.storage_dir)
+                # 传同一个 AuditTrail：reload_config 不重建它，群操作审计流因此跨热重载连续。
+                self.admin = AdminEngine(self.config, self.storage_dir, self.audit)
                 self.safety = SafetyEngine(self.config.get("safety", {}))
                 self.emotion = EmotionEngine(self.config.get("emotion", {}))
                 PersonalityEngine.ensure_default_files(self.config_dir)

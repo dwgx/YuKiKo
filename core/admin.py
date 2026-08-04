@@ -11,7 +11,30 @@ from typing import Any
 
 from utils.text import normalize_text
 
+# ruff 的 isort 把 core.* 判成 first-party、utils.* 判成 third-party（src 含 "core"），
+# 所以这两行必须分组且 utils 在前。仓库里同类文件普遍是 core 在前、连成一块，因此都带着
+# 一条 I001；这里按 ruff 排以免 admin.py 的错误数从 10 涨到 11。
+from core.audit import STREAM_GROUP_OPS, AuditTrail
+
 _log = logging.getLogger("yukiko.admin")
+
+
+# ── group_ops 审计事件名 ──
+# 常量化而不是内联字符串：这些名字是 WebUI / 事后分析的查询键，
+# 拼写漂移会让某类事件从查询结果里静默消失。
+AUDIT_WHITELIST_ADD = "whitelist_add"
+AUDIT_WHITELIST_REMOVE = "whitelist_remove"
+AUDIT_IGNORE_ADD = "ignore_add"
+AUDIT_IGNORE_REMOVE = "ignore_remove"
+AUDIT_HIGH_RISK_CONFIRM_SET = "high_risk_confirm_set"
+AUDIT_BEHAVIOR_MODE_SET = "behavior_mode_set"
+AUDIT_BEHAVIOR_PARAM_SET = "behavior_param_set"
+
+# 被改动的子系统，用于按面查询（一个 subject 可能有多个 event）。
+AUDIT_SUBJECT_WHITELIST = "whitelist_groups"
+AUDIT_SUBJECT_IGNORED = "ignored_users"
+AUDIT_SUBJECT_HIGH_RISK = "high_risk_confirmation"
+AUDIT_SUBJECT_BEHAVIOR = "behavior_runtime"
 
 
 # ── 模糊匹配命令表 ──
@@ -145,10 +168,20 @@ class AdminEngine:
     _PUBLIC = {"help", "help_detail", "plugins"}
     _GROUP_ADMIN_ACTIONS = {"ignore_user", "unignore_user", "ignore_list", "high_risk_confirm"}
 
-    def __init__(self, config: dict[str, Any], storage_dir: Path):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        storage_dir: Path,
+        audit: AuditTrail | None = None,
+    ):
         self.config = config if isinstance(config, dict) else {}
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
+        # 审计流由 engine 注入而不是在这里自建：engine 的 AuditTrail 每条流各有一把
+        # threading.Lock，同一进程里两个实例写同一个文件会各自加锁、互不排斥。
+        # 注入 None 时所有埋点静默跳过（AdminEngine 可独立于 engine 构造，测试与
+        # scripts/ 都这么用），审计缺失不能变成功能缺失。
+        self.audit = audit
         self._started = time.time()
         self._count = 0
         self._update_lock = asyncio.Lock()
@@ -192,6 +225,44 @@ class AdminEngine:
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    def _audit_group_op(
+        self,
+        event: str,
+        *,
+        subject: str,
+        actor_id: str,
+        group_id: int = 0,
+        target_user_id: str = "",
+        scope: str = "",
+        state: dict[str, Any] | None = None,
+        change: dict[str, Any] | None = None,
+        persisted: bool | None = None,
+        irreversible: bool = False,
+    ) -> None:
+        """写一条 group_ops 审计记录。
+
+        字段是固定的：所有群状态变更都答同样五个问题（改了什么 / 哪个群 / 目标是谁 /
+        谁改的 / 改完是什么状态 + 是否不可逆），这样才能按字段查询而不是全文 grep。
+        AuditTrail.write 自身不抛异常，所以这里不需要 try。
+        """
+        if self.audit is None:
+            return
+        self.audit.write(
+            STREAM_GROUP_OPS,
+            event,
+            subject=subject,
+            actor_id=normalize_text(str(actor_id)) or "unknown",
+            group_id=int(group_id or 0),
+            target_user_id=normalize_text(str(target_user_id)),
+            scope=normalize_text(str(scope)),
+            state=state or {},
+            change=change or {},
+            # None 表示该变更只作用于运行时内存、没有落盘环节可言（行为参数）；
+            # True/False 是真实的写盘结果，用来事后区分「记录了但没存住」。
+            persisted=persisted,
+            irreversible=bool(irreversible),
+        )
 
     def is_admin_command(self, text: str) -> bool:
         t = normalize_text(text)
@@ -257,30 +328,70 @@ class AdminEngine:
             "global_count": len(global_items),
         }
 
-    def add_ignored_user(self, user_id: str, group_id: int = 0, scope: str = "group") -> tuple[bool, str]:
+    def add_ignored_user(
+        self,
+        user_id: str,
+        group_id: int = 0,
+        scope: str = "group",
+        actor_id: str = "",
+    ) -> tuple[bool, str]:
+        """忽略某用户。actor_id 只用于审计：埋点放在变更边界，
+        这样 webui / agent 工具等其他调用方也会被记录，而不只是 /yuki 命令。"""
         uid = normalize_text(str(user_id))
         if not uid:
             return False, "目标用户不能为空"
         scope_value = normalize_text(scope).lower() or "group"
         gid = int(group_id or 0)
         if scope_value in {"global", "all", "全局"}:
+            was_ignored = uid in self._ignored_global
             self._ignored_global.add(uid)
-            self._save_ignore()
+            persisted = self._save_ignore()
+            self._audit_group_op(
+                AUDIT_IGNORE_ADD,
+                subject=AUDIT_SUBJECT_IGNORED,
+                actor_id=actor_id,
+                group_id=gid,
+                target_user_id=uid,
+                scope="global",
+                change={"ignored": {"before": was_ignored, "after": True}},
+                state={"ignored": True, "global_count": len(self._ignored_global)},
+                persisted=persisted,
+            )
             return True, f"已忽略用户 {uid}（全局）"
         if gid <= 0:
             return False, "群聊内默认按本群忽略；私聊请使用全局 scope"
         bucket = self._ignored_group.setdefault(gid, set())
+        was_ignored = uid in bucket
         bucket.add(uid)
-        self._save_ignore()
+        persisted = self._save_ignore()
+        self._audit_group_op(
+            AUDIT_IGNORE_ADD,
+            subject=AUDIT_SUBJECT_IGNORED,
+            actor_id=actor_id,
+            group_id=gid,
+            target_user_id=uid,
+            scope="group",
+            change={"ignored": {"before": was_ignored, "after": True}},
+            state={"ignored": True, "group_count": len(bucket)},
+            persisted=persisted,
+        )
         return True, f"已忽略用户 {uid}（本群 {gid}）"
 
-    def remove_ignored_user(self, user_id: str, group_id: int = 0, scope: str = "group") -> tuple[bool, str]:
+    def remove_ignored_user(
+        self,
+        user_id: str,
+        group_id: int = 0,
+        scope: str = "group",
+        actor_id: str = "",
+    ) -> tuple[bool, str]:
         uid = normalize_text(str(user_id))
         if not uid:
             return False, "目标用户不能为空"
-        scope_value = normalize_text(scope).lower() or "group"
+        requested_scope = normalize_text(scope).lower() or "group"
+        scope_value = requested_scope
         gid = int(group_id or 0)
         changed = False
+        escalated_to_global = False
         if scope_value in {"global", "all", "全局"}:
             if uid in self._ignored_global:
                 self._ignored_global.discard(uid)
@@ -296,9 +407,35 @@ class AdminEngine:
                 self._ignored_global.discard(uid)
                 changed = True
                 scope_value = "global"
+                escalated_to_global = True
         if changed:
-            self._save_ignore()
-            if scope_value in {"global", "all", "全局"}:
+            persisted = self._save_ignore()
+            is_global = scope_value in {"global", "all", "全局"}
+            state: dict[str, Any] = {"ignored": False}
+            if is_global:
+                state["global_count"] = len(self._ignored_global)
+            else:
+                state["group_count"] = len(self._ignored_group.get(gid, set()))
+            self._audit_group_op(
+                AUDIT_IGNORE_REMOVE,
+                subject=AUDIT_SUBJECT_IGNORED,
+                actor_id=actor_id,
+                group_id=gid,
+                target_user_id=uid,
+                scope="global" if is_global else "group",
+                change={
+                    "ignored": {"before": True, "after": False},
+                    "requested_scope": requested_scope,
+                    "escalated_to_global": escalated_to_global,
+                },
+                state=state,
+                persisted=persisted,
+                # 实测（probe3）：群管理员用本群 scope 解忽略时，兜底分支会把「全局」
+                # 忽略也清掉，而他没有权限再设回全局（只有超管可以）。这一条对执行者
+                # 而言确实不可逆，必须能被按字段查出来。
+                irreversible=escalated_to_global and not self.is_super_admin(actor_id),
+            )
+            if is_global:
                 return True, f"已恢复用户 {uid}（全局）"
             return True, f"已恢复用户 {uid}（本群 {gid}）"
         return False, f"用户 {uid} 不在忽略列表"
@@ -342,13 +479,40 @@ class AdminEngine:
         required: bool | None,
         scope: str = "group",
         group_id: int = 0,
+        actor_id: str = "",
     ) -> tuple[bool, str, dict[str, Any]]:
         scope_value = normalize_text(scope).lower() or "group"
         gid = int(group_id or 0)
         payload: dict[str, Any] = {"scope": scope_value, "group_id": gid}
+        before_global = self._high_risk_confirm_global
+        before_group = self._high_risk_confirm_group.get(gid)
+
+        def _audit(before: bool | None, after: bool | None, persisted: bool) -> None:
+            # 记录「生效值」而不只是原始设置：把本群 override 删掉（default）之后
+            # 是变严还是变松，取决于全局值，只存 None 事后查不出来。
+            effective = self.get_high_risk_confirmation_policy(group_id=gid)
+            still_required = bool(effective.get("high_risk_confirmation_required", True))
+            self._audit_group_op(
+                AUDIT_HIGH_RISK_CONFIRM_SET,
+                subject=AUDIT_SUBJECT_HIGH_RISK,
+                actor_id=actor_id,
+                group_id=gid,
+                scope="global" if scope_value in {"global", "all", "全局"} else "group",
+                change={"high_risk_confirmation_required": {"before": before, "after": after}},
+                state={
+                    "high_risk_confirmation_required": after,
+                    "effective_required": still_required,
+                    "effective_source": effective.get("source", "default"),
+                    # 关掉二次确认等于放开高危操作的闸门，这是审计里最该能直接筛出来的一类。
+                    "disables_confirmation": not still_required,
+                },
+                persisted=persisted,
+            )
+
         if scope_value in {"global", "all", "全局"}:
             self._high_risk_confirm_global = None if required is None else bool(required)
-            self._save_runtime_policy()
+            persisted = self._save_runtime_policy()
+            _audit(before_global, self._high_risk_confirm_global, persisted)
             if required is None:
                 payload["high_risk_confirmation_required"] = None
                 return True, "已恢复全局高风险确认默认策略", payload
@@ -360,11 +524,13 @@ class AdminEngine:
             return False, "群聊内默认按本群设置；私聊请使用 global scope", payload
         if required is None:
             self._high_risk_confirm_group.pop(gid, None)
-            self._save_runtime_policy()
+            persisted = self._save_runtime_policy()
+            _audit(before_group, None, persisted)
             payload["high_risk_confirmation_required"] = None
             return True, f"已恢复本群 {gid} 的高风险确认默认策略", payload
         self._high_risk_confirm_group[gid] = bool(required)
-        self._save_runtime_policy()
+        persisted = self._save_runtime_policy()
+        _audit(before_group, bool(required), persisted)
         payload["high_risk_confirmation_required"] = bool(required)
         if required:
             return True, f"已开启本群 {gid} 的高风险二次确认", payload
@@ -816,16 +982,40 @@ class AdminEngine:
         gid = int(kwargs.get("group_id", 0) or 0)
         if not gid:
             return "仅可在群聊内执行"
+        was_present = gid in self._white
         self._white.add(gid)
-        self._save_white()
+        persisted = self._save_white()
+        self._audit_group_op(
+            AUDIT_WHITELIST_ADD,
+            subject=AUDIT_SUBJECT_WHITELIST,
+            actor_id=str(kwargs.get("user_id", "")),
+            group_id=gid,
+            change={"whitelisted": {"before": was_present, "after": True}},
+            state={"whitelisted": True, "whitelist_size": len(self._white)},
+            persisted=persisted,
+        )
         return f"已加白本群 {gid}"
 
     async def _act_white_rm(self, **kwargs: Any) -> str:
         gid = int(kwargs.get("group_id", 0) or 0)
         if not gid:
             return "仅可在群聊内执行"
+        was_present = gid in self._white
         self._white.discard(gid)
-        self._save_white()
+        persisted = self._save_white()
+        self._audit_group_op(
+            AUDIT_WHITELIST_REMOVE,
+            subject=AUDIT_SUBJECT_WHITELIST,
+            actor_id=str(kwargs.get("user_id", "")),
+            group_id=gid,
+            change={"whitelisted": {"before": was_present, "after": False}},
+            state={"whitelisted": False, "whitelist_size": len(self._white)},
+            persisted=persisted,
+            # 退白会连带取消本群管理员的 _GROUP_ADMIN_ACTIONS 权限
+            # （is_group_admin_user 要求 is_group_whitelisted），
+            # 于是执行者自己通常已经无法把本群加回来，只有超管能。
+            irreversible=not self.is_super_admin(str(kwargs.get("user_id", ""))),
+        )
         return f"已从白名单移除本群 {gid}"
 
     async def _act_white_list(self, **_: Any) -> str:
@@ -863,7 +1053,9 @@ class AdminEngine:
             return "用法: /yuki 忽略用户 <QQ号> [group|global]"
         if scope == "global" and not self.is_super_admin(user_id):
             return "权限不足，只有超级管理员可以设置全局忽略"
-        ok, message = self.add_ignored_user(target_user_id, group_id=gid, scope=scope)
+        ok, message = self.add_ignored_user(
+            target_user_id, group_id=gid, scope=scope, actor_id=user_id
+        )
         return message if ok else f"忽略失败: {message}"
 
     async def _act_unignore_user(self, **kwargs: Any) -> str:
@@ -876,7 +1068,9 @@ class AdminEngine:
             return "用法: /yuki 恢复用户 <QQ号> [group|global]"
         if scope == "global" and not self.is_super_admin(user_id):
             return "权限不足，只有超级管理员可以解除全局忽略"
-        ok, message = self.remove_ignored_user(target_user_id, group_id=gid, scope=scope)
+        ok, message = self.remove_ignored_user(
+            target_user_id, group_id=gid, scope=scope, actor_id=user_id
+        )
         return message if ok else f"恢复失败: {message}"
 
     async def _act_ignore_list(self, **kwargs: Any) -> str:
@@ -948,6 +1142,7 @@ class AdminEngine:
             required=required,
             scope=scope,
             group_id=gid,
+            actor_id=user_id,
         )
         return message if ok else f"设置失败: {message}"
 
@@ -1269,14 +1464,16 @@ class AdminEngine:
                 f"- min_confidence: {routing_cfg.get('min_confidence', 0.58)}\n"
                 f"- followup_min_confidence: {routing_cfg.get('followup_min_confidence', 0.75)}"
             )
+        actor_id = str(kwargs.get("user_id", ""))
+        gid = int(kwargs.get("group_id", 0) or 0)
         if arg in {"默认", "default"}:
-            return self._set_behavior_mode(engine, "default")
+            return self._set_behavior_mode(engine, "default", actor_id=actor_id, group_id=gid)
         if arg in {"冷漠", "cold"}:
-            return self._set_behavior_mode(engine, "cold")
+            return self._set_behavior_mode(engine, "cold", actor_id=actor_id, group_id=gid)
         if arg in {"安静", "quiet"}:
-            return self._set_behavior_mode(engine, "quiet")
+            return self._set_behavior_mode(engine, "quiet", actor_id=actor_id, group_id=gid)
         if arg in {"活跃", "active"}:
-            return self._set_behavior_mode(engine, "active")
+            return self._set_behavior_mode(engine, "active", actor_id=actor_id, group_id=gid)
 
         # ── 单参数精细调整: /yuki 行为 <参数名> <值> ──
         _PARAM_MAP: dict[str, tuple[str, str]] = {
@@ -1308,6 +1505,7 @@ class AdminEngine:
             if not isinstance(cfg, dict):
                 cfg = {}
                 engine.config[section] = cfg
+            before_val = cfg.get(key)
             # 类型推断
             if raw_val in {"true", "True", "1", "开", "on"}:
                 cfg[key] = True
@@ -1318,6 +1516,19 @@ class AdminEngine:
                     cfg[key] = int(raw_val) if raw_val.isdigit() else float(raw_val)
                 except ValueError:
                     return f"参数值无效，需要数字: {raw_val}"
+            self._audit_group_op(
+                AUDIT_BEHAVIOR_PARAM_SET,
+                subject=AUDIT_SUBJECT_BEHAVIOR,
+                actor_id=actor_id,
+                group_id=gid,
+                change={
+                    "config_section": section,
+                    "config_key": key,
+                    "value": {"before": before_val, "after": cfg[key]},
+                },
+                state={"config_section": section, "config_key": key, "value": cfg[key]},
+                persisted=None,
+            )
             return f"已设置 {key} = {cfg[key]}"
 
         return (
@@ -1330,19 +1541,34 @@ class AdminEngine:
         engine = kwargs.get("engine")
         if engine is None:
             return "行为系统未就绪"
-        return self._set_behavior_mode(engine, "cold")
+        return self._set_behavior_mode(
+            engine,
+            "cold",
+            actor_id=str(kwargs.get("user_id", "")),
+            group_id=int(kwargs.get("group_id", 0) or 0),
+        )
 
     async def _act_behavior_quiet(self, **kwargs: Any) -> str:
         engine = kwargs.get("engine")
         if engine is None:
             return "行为系统未就绪"
-        return self._set_behavior_mode(engine, "quiet")
+        return self._set_behavior_mode(
+            engine,
+            "quiet",
+            actor_id=str(kwargs.get("user_id", "")),
+            group_id=int(kwargs.get("group_id", 0) or 0),
+        )
 
     async def _act_behavior_active(self, **kwargs: Any) -> str:
         engine = kwargs.get("engine")
         if engine is None:
             return "行为系统未就绪"
-        return self._set_behavior_mode(engine, "active")
+        return self._set_behavior_mode(
+            engine,
+            "active",
+            actor_id=str(kwargs.get("user_id", "")),
+            group_id=int(kwargs.get("group_id", 0) or 0),
+        )
 
     def _refresh_behavior_runtime(self, engine: Any, mode: str) -> None:
         refresh = getattr(engine, "refresh_runtime_policy_components", None)
@@ -1355,7 +1581,9 @@ class AdminEngine:
         except Exception:
             _log.warning("behavior_runtime_refresh_fail | mode=%s", mode, exc_info=True)
 
-    def _set_behavior_mode(self, engine: Any, mode: str) -> str:
+    def _set_behavior_mode(
+        self, engine: Any, mode: str, *, actor_id: str = "", group_id: int = 0
+    ) -> str:
         trigger_cfg = engine.config.setdefault("trigger", {}) if isinstance(engine.config, dict) else {}
         routing_cfg = engine.config.setdefault("routing", {}) if isinstance(engine.config, dict) else {}
         if not isinstance(trigger_cfg, dict):
@@ -1364,6 +1592,29 @@ class AdminEngine:
         if not isinstance(routing_cfg, dict):
             routing_cfg = {}
             engine.config["routing"] = routing_cfg
+
+        # 快照必须在 update 之前取，且必须是拷贝：下面直接改的就是这两个 dict 本身。
+        before = {"trigger": dict(trigger_cfg), "routing": dict(routing_cfg)}
+
+        def _finish(applied_mode: str, message: str) -> str:
+            self._refresh_behavior_runtime(engine, applied_mode)
+            self._audit_group_op(
+                AUDIT_BEHAVIOR_MODE_SET,
+                subject=AUDIT_SUBJECT_BEHAVIOR,
+                actor_id=actor_id,
+                group_id=group_id,
+                change={
+                    # 没有 mode.before：模式不是被存下来的状态，是 trigger/routing 的
+                    # 派生结果，写一个恒为 None 的字段只会让查询误以为有历史。
+                    "trigger": {"before": before["trigger"], "after": dict(trigger_cfg)},
+                    "routing": {"before": before["routing"], "after": dict(routing_cfg)},
+                },
+                state={"mode": applied_mode, "trigger": dict(trigger_cfg), "routing": dict(routing_cfg)},
+                # 行为模式只改内存里的 engine.config，不落盘（重启即回到 config 文件的值），
+                # 所以这里没有「存住了没」可言 —— 用 None 而不是 False 表达这个区别。
+                persisted=None,
+            )
+            return message
 
         if mode == "cold":
             trigger_cfg.update({
@@ -1378,8 +1629,7 @@ class AdminEngine:
                 "non_directed_min_confidence": 0.90,
                 "ai_gate_min_confidence": 0.84,
             })
-            self._refresh_behavior_runtime(engine, mode)
-            return "已切换到冷漠模式"
+            return _finish(mode, "已切换到冷漠模式")
         if mode == "quiet":
             trigger_cfg.update({
                 "ai_listen_enable": True,
@@ -1395,8 +1645,7 @@ class AdminEngine:
                 "non_directed_min_confidence": 0.86,
                 "ai_gate_min_confidence": 0.80,
             })
-            self._refresh_behavior_runtime(engine, mode)
-            return "已切换到安静模式"
+            return _finish(mode, "已切换到安静模式")
         if mode == "active":
             trigger_cfg.update({
                 "ai_listen_enable": True,
@@ -1412,8 +1661,7 @@ class AdminEngine:
                 "non_directed_min_confidence": 0.64,
                 "ai_gate_min_confidence": 0.54,
             })
-            self._refresh_behavior_runtime(engine, mode)
-            return "已切换到活跃模式"
+            return _finish(mode, "已切换到活跃模式")
 
         trigger_cfg.update({
             "ai_listen_enable": True,
@@ -1429,8 +1677,9 @@ class AdminEngine:
             "non_directed_min_confidence": 0.72,
             "ai_gate_min_confidence": 0.66,
         })
-        self._refresh_behavior_runtime(engine, mode)
-        return "已恢复默认行为模式"
+        # 兜底分支：mode 不是 cold/quiet/active 时都按 default 处理，
+        # 审计里记 "default" 而不是原始 mode，因为生效的确实是默认档。
+        return _finish("default", "已恢复默认行为模式")
 
     async def _send_segment(self, kwargs: dict[str, Any], seg_type: str, data: dict[str, Any]) -> str | None:
         api_call = kwargs.get("api_call")
@@ -1463,12 +1712,15 @@ class AdminEngine:
         except Exception as exc:
             _log.debug("load_whitelist_fail | %s", exc)
 
-    def _save_white(self) -> None:
+    def _save_white(self) -> bool:
+        """返回是否真的写盘成功——审计要能区分「改了内存」和「存住了」。"""
         try:
             payload = {"groups": sorted(self._white)}
             self._white_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return True
         except Exception as exc:
             _log.debug("save_whitelist_fail | %s", exc)
+            return False
 
     def _load_ignore(self) -> None:
         if not self._ignore_path.exists():
@@ -1505,7 +1757,7 @@ class AdminEngine:
                     if uid:
                         bucket.add(uid)
 
-    def _save_ignore(self) -> None:
+    def _save_ignore(self) -> bool:
         payload = {
             "global": sorted(self._ignored_global),
             "groups": {
@@ -1517,8 +1769,10 @@ class AdminEngine:
         }
         try:
             self._ignore_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return True
         except Exception as exc:
             _log.debug("save_ignore_fail | %s", exc)
+            return False
 
     def _load_runtime_policy(self) -> None:
         if not self._policy_path.exists():
@@ -1545,7 +1799,7 @@ class AdminEngine:
                     continue
                 self._high_risk_confirm_group[gid] = raw_required
 
-    def _save_runtime_policy(self) -> None:
+    def _save_runtime_policy(self) -> bool:
         payload = {
             "high_risk_confirmation_global": self._high_risk_confirm_global,
             "high_risk_confirmation_groups": {
@@ -1555,8 +1809,10 @@ class AdminEngine:
         }
         try:
             self._policy_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return True
         except Exception as exc:
             _log.debug("save_runtime_policy_fail | %s", exc)
+            return False
 
     # ── 表情包管理 ──
 
