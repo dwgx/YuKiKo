@@ -14,8 +14,35 @@ import re
 from typing import Any
 
 
-from utils.learning_guard import assess_preferred_name_learning
 from utils.text import normalize_text, tokenize
+
+
+# 结构事实模式：显式输入的命令令牌、链接、视频号、文件扩展名。
+# 这些是"消息里客观存在什么"，不是"用户想干什么"，因此允许留在注意力门里。
+
+_TYPED_COMMAND_PATTERN = re.compile(r"^[!/][a-z0-9_.:-]+", flags=re.IGNORECASE)
+
+_QUESTION_MARKS = frozenset("?？")
+
+_URL_PATTERN = re.compile(r"https?://", flags=re.IGNORECASE)
+
+_VIDEO_ID_PATTERN = re.compile(r"\b(?:bv[a-z0-9]{10}|av\d{4,})\b", flags=re.IGNORECASE)
+
+_FILE_EXTENSION_PATTERN = re.compile(
+    r"\.(?:png|jpe?g|gif|webp|bmp|mp4|webm|mov|m4v|mp3|wav|flac|ogg|zip|7z|rar"
+    r"|exe|apk|ipa|msi|pdf|docx?|xlsx?|pptx?)\b",
+    flags=re.IGNORECASE,
+)
+
+_TYPED_COMMAND_SCORE = 1.3
+
+_STRUCTURAL_LOCATOR_SCORE = 0.7
+
+_STRUCTURAL_SIGNAL_CAP = 3.0
+
+# 两个以上结构定位符才够这个门（显式命令已在更早的分支短路掉）。
+
+_STRUCTURAL_PROBE_THRESHOLD = 1.35
 
 
 @dataclass(slots=True)
@@ -153,7 +180,6 @@ class TriggerEngine:
                 if normalize_text(str(item))
             ]
         self.ai_listen_keywords = list(dict.fromkeys(keywords))
-        self.explicit_request_cues: tuple[str, ...] = ()
         self.ai_listen_min_keyword_hits = max(
             1, int(trigger_config.get("ai_listen_min_keyword_hits", 1))
         )
@@ -397,21 +423,6 @@ class TriggerEngine:
                 priority=85,
             )
 
-        if self._looks_like_explicit_memory_declare(payload):
-
-            return TriggerResult(
-                should_handle=True,
-                reason="explicit_memory_fact",
-                active_session=active_session,
-                followup_candidate=True,
-                listen_probe=False,
-                overload_active=False,
-                busy_messages=busy_messages,
-                busy_users=busy_users,
-                ai_gate=True,
-                priority=84,
-            )
-
         if followup_candidate:
 
             # followup 回合的消费延迟到 engine 路由确认后再执行，
@@ -460,7 +471,7 @@ class TriggerEngine:
                 priority=20,
             )
 
-        delegate_signal = self._explicit_request_signal(payload.text)
+        delegate_signal = self._structural_request_signal(payload.text)
 
         if (
             self.delegate_undirected_to_ai
@@ -641,23 +652,6 @@ class TriggerEngine:
 
         return True
 
-    def _should_open_ai_probe(
-        self,
-        conversation_id: str,
-        now: datetime,
-        busy_messages: int,
-        busy_users: int,
-    ) -> bool:
-
-        return bool(
-            self._decide_ai_probe_reason_by_stats(
-                conversation_id=conversation_id,
-                now=now,
-                busy_messages=busy_messages,
-                busy_users=busy_users,
-            )
-        )
-
     def _decide_ai_probe_reason(
         self,
         payload: TriggerInput,
@@ -721,13 +715,13 @@ class TriggerEngine:
 
             return ""
 
-        # 明确向机器人提请求时，不走"监听探测"分支，避免被低置信拦截。
+        # 显式输入命令令牌（/xxx、!xxx）时，不走"监听探测"分支，避免被低置信拦截。
 
-        if self._looks_like_explicit_bot_request(clean_text):
+        if self._has_typed_command_token(clean_text):
 
             return ""
 
-        explicit_signal = self._explicit_request_signal(clean_text)
+        structural_signal = self._structural_request_signal(clean_text)
 
         heat_ok = (
             busy_messages >= self.ai_listen_min_messages
@@ -738,7 +732,7 @@ class TriggerEngine:
             clean_text,
             busy_messages,
             busy_users,
-            explicit_signal=explicit_signal,
+            structural_signal=structural_signal,
             keyword_hits=keyword_hits,
         )
 
@@ -754,9 +748,9 @@ class TriggerEngine:
 
         self._last_ai_probe_at[conversation_id] = now
 
-        if explicit_signal >= 1.35:
+        if structural_signal >= _STRUCTURAL_PROBE_THRESHOLD:
 
-            return "ai_listen_probe_task"
+            return "ai_listen_probe_structural"
 
         if heat_ok:
 
@@ -764,73 +758,39 @@ class TriggerEngine:
 
         return "ai_listen_probe_score"
 
-    def _looks_like_explicit_bot_request(self, text: str) -> bool:
+    @staticmethod
+    def _has_typed_command_token(text: str) -> bool:
+        """是否显式输入了命令令牌（/xxx、!xxx）。这是输入形式，不是语义猜测。"""
 
-        return self._explicit_request_signal(text) >= 1.0
+        return bool(_TYPED_COMMAND_PATTERN.search(normalize_text(text)))
 
-    def _looks_like_explicit_memory_declare(self, payload: TriggerInput) -> bool:
+    def _structural_request_signal(self, text: str) -> float:
+        """按消息里客观存在的结构定位符打分，供注意力门使用。
 
-        content = normalize_text(payload.text).lower()
-
-        if not content:
-
-            return False
-
-        # 过滤“我叫什么/你记得我叫什么吗”这类问句，避免误判成写入指令。
-
-        if any(
-            q in content
-            for q in ("我叫什么", "我叫啥", "你记得我叫什么", "记得我叫什么")
-        ):
-
-            return False
-
-        preferred_name_decision = assess_preferred_name_learning(
-            payload.text,
-            is_private=payload.is_private,
-            mentioned=payload.mentioned,
-            bot_aliases=self.bot_aliases,
-            at_other_user_ids=payload.at_other_user_ids,
-            reply_to_user_id=payload.reply_to_user_id,
-            bot_id=payload.bot_id,
-        )
-        if preferred_name_decision.allow:
-            return True
-        return False
-
-    @classmethod
-    def _explicit_request_signal_from_cues(
-        cls, text: str, cues: tuple[str, ...]
-    ) -> float:
-        _ = cues
-        if not text:
-            return 0.0
-        score = 0.0
-
-        if re.search(r"^[!/][a-z0-9_.:-]+", text, flags=re.IGNORECASE):
-            score += 1.3
-        if "?" in text or "\uff1f" in text:
-            score += 0.6
-        if re.search(r"https?://", text, flags=re.IGNORECASE):
-            score += 0.7
-        if re.search(r"\b(?:bv[a-z0-9]{10}|av\d{4,})\b", text, flags=re.IGNORECASE):
-            score += 0.7
-        if re.search(
-            r"\.(?:png|jpe?g|gif|webp|bmp|mp4|webm|mov|m4v|mp3|wav|flac|ogg|zip|7z|rar|exe|apk|ipa|msi|pdf|docx?|xlsx?|pptx?)\b",
-            text,
-            flags=re.IGNORECASE,
-        ):
-            score += 0.7
-        if len(text) >= 20:
-            score += 0.2
-
-        return min(score, 3.0)
-
-    def _explicit_request_signal(self, text: str) -> float:
+        只读四类结构事实：显式命令令牌、URL、视频号、文件扩展名。
+        不做任何"这句话像是在提需求"的语义判断 —— 意图由模型读 PromptNavigator
+        菜单后自己选分区，trigger 不参与。
+        """
 
         clean = normalize_text(text).lower()
 
-        return self._explicit_request_signal_from_cues(clean, ())
+        if not clean:
+
+            return 0.0
+
+        score = 0.0
+
+        if _TYPED_COMMAND_PATTERN.search(clean):
+
+            score += _TYPED_COMMAND_SCORE
+
+        for pattern in (_URL_PATTERN, _VIDEO_ID_PATTERN, _FILE_EXTENSION_PATTERN):
+
+            if pattern.search(clean):
+
+                score += _STRUCTURAL_LOCATOR_SCORE
+
+        return min(score, _STRUCTURAL_SIGNAL_CAP)
 
     def _build_listen_score(
         self,
@@ -838,18 +798,17 @@ class TriggerEngine:
         busy_messages: int,
         busy_users: int,
         *,
-        explicit_signal: float = 0.0,
+        structural_signal: float = 0.0,
         keyword_hits: int = 0,
     ) -> float:
         msg_ratio = busy_messages / max(1, self.ai_listen_min_messages)
         user_ratio = busy_users / max(1, self.ai_listen_min_unique_users)
         score = msg_ratio * 0.9 + user_ratio * 0.9
 
-        if ("?" in text or "\uff1f" in text) or re.search(
-            r"^[!/][a-z0-9_.:-]+", text, flags=re.IGNORECASE
-        ):
+        # \u6807\u70b9\u4e0e\u547d\u4ee4\u4ee4\u724c\u662f\u8f93\u5165\u5f62\u5f0f\u4e0a\u7684\u9632\u566a\u4fe1\u53f7\uff0c\u4e0d\u53c2\u4e0e\u4efb\u52a1/\u5de5\u5177\u9009\u62e9\u3002
+        if _QUESTION_MARKS.intersection(text) or _TYPED_COMMAND_PATTERN.search(text):
             score += 0.5
-        score += min(1.6, explicit_signal * 0.9)
+        score += min(1.6, structural_signal * 0.9)
         score += min(1.2, max(0, int(keyword_hits)) * 0.4)
         return score
 

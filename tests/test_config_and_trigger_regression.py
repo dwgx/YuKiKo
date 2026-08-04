@@ -62,6 +62,104 @@ class ConfigAndTriggerRegressionTests(unittest.TestCase):
         self.assertFalse(high_result.should_handle)
         self.assertEqual(high_result.reason, "ai_router_candidate")
 
+        # 单个裸结构定位符（文件名）+ 问句不再自己越过默认 1.0 门：
+        # 问号与句长这两个语义加分位已删除，只剩结构定位符本身的 0.7。
+        single_locator = TriggerInput(
+            conversation_id="group:1",
+            user_id="1001",
+            text="看看这个 报告.docx 里写了什么？",
+            mentioned=False,
+            is_private=False,
+            timestamp=ts,
+        )
+        single_result = trigger.evaluate(single_locator, recent_messages=[])
+        self.assertFalse(single_result.should_handle)
+        self.assertEqual(single_result.reason, "not_directed")
+
+    def test_trigger_no_longer_wakes_on_semantic_task_cues(self) -> None:
+        """trigger 只做注意力门：任何自由文本的语义线索都不得唤醒。"""
+        trigger = TriggerEngine(
+            trigger_config={
+                "delegate_undirected_to_ai": True,
+                "delegate_undirected_min_signal": 1.0,
+            },
+            bot_config={"name": "YuKiKo"},
+        )
+        ts = datetime.now(timezone.utc)
+
+        for index, text in enumerate(
+            [
+                "帮我查一下明天天气",
+                "点歌 热水澡",
+                "帮我下载这个安装包",
+                "以后叫我阿背",
+                "这个视频讲了啥？",
+                "你记得我叫什么吗",
+            ]
+        ):
+            with self.subTest(text=text):
+                result = trigger.evaluate(
+                    TriggerInput(
+                        conversation_id=f"group:semantic{index}",
+                        user_id="1001",
+                        text=text,
+                        mentioned=False,
+                        is_private=False,
+                        timestamp=ts,
+                    ),
+                    recent_messages=[],
+                )
+                self.assertFalse(result.should_handle)
+                self.assertEqual(result.reason, "not_directed")
+                self.assertEqual(trigger._structural_request_signal(text), 0.0)
+
+    def test_trigger_still_wakes_on_identity_and_attention_signals(self) -> None:
+        """@ / 私聊 / 叫名字 / followup / 活跃会话 这些注意力信号必须继续生效。"""
+        ts = datetime.now(timezone.utc)
+
+        directed = TriggerEngine(trigger_config={}, bot_config={"name": "YuKiKo"})
+        self.assertEqual(
+            directed.evaluate(
+                TriggerInput("group:1", "1001", "在吗", True, False, ts),
+                recent_messages=[],
+            ).reason,
+            "directed",
+        )
+        self.assertEqual(
+            directed.evaluate(
+                TriggerInput("private:1", "1001", "在吗", False, True, ts),
+                recent_messages=[],
+            ).reason,
+            "directed",
+        )
+
+        # 昵称/别名是身份判定，保留；但不能被"下雪"这类子串误触。
+        alias = TriggerEngine(trigger_config={}, bot_config={"name": "YuKiKo"})
+        self.assertEqual(
+            alias.evaluate(
+                TriggerInput("group:2", "1001", "雪 在吗", False, False, ts),
+                recent_messages=[],
+            ).reason,
+            "name_call",
+        )
+        self.assertEqual(
+            alias.evaluate(
+                TriggerInput("group:3", "1001", "下雪了好冷", False, False, ts),
+                recent_messages=[],
+            ).reason,
+            "not_directed",
+        )
+
+        followup = TriggerEngine(trigger_config={}, bot_config={"name": "YuKiKo"})
+        followup.mark_reply_target("group:4", "1001", now=ts)
+        self.assertEqual(
+            followup.evaluate(
+                TriggerInput("group:4", "1001", "继续", False, False, ts),
+                recent_messages=[],
+            ).reason,
+            "followup_window",
+        )
+
     def test_active_session_reaches_router_instead_of_not_directed_drop(self) -> None:
         trigger = TriggerEngine(
             trigger_config={
