@@ -383,11 +383,19 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
     def test_trigger_and_router_drop_local_keyword_defaults(self) -> None:
         trigger = TriggerEngine({}, {"name": "YuKiKo", "nicknames": []})
         self.assertEqual(trigger.ai_listen_keywords, [])
-        self.assertEqual(trigger.explicit_request_cues, ())
+        self.assertFalse(hasattr(trigger, "explicit_request_cues"))
         self.assertEqual(
-            trigger._explicit_request_signal("\u5e2e\u6211\u67e5\u4e00\u4e0b"), 0.0
+            trigger._structural_request_signal("\u5e2e\u6211\u67e5\u4e00\u4e0b"), 0.0
         )
-        self.assertGreater(trigger._explicit_request_signal("/lookup test"), 0.0)
+        self.assertGreater(trigger._structural_request_signal("/lookup test"), 0.0)
+        # \u95ee\u53f7\u4e0e\u53e5\u957f\u8fd9\u4e24\u4e2a\u8bed\u4e49\u52a0\u5206\u4f4d\u5df2\u5220\u9664\uff1a\u7eaf\u81ea\u7531\u6587\u672c\u5fc5\u987b\u6052\u4e3a 0\u3002
+        self.assertEqual(
+            trigger._structural_request_signal(
+                "\u8fd9\u4e2a\u89c6\u9891\u5230\u5e95\u8bb2\u4e86\u4ec0\u4e48"
+                "\u5185\u5bb9\u554a\u6709\u70b9\u770b\u4e0d\u61c2\uff1f"
+            ),
+            0.0,
+        )
         self.assertFalse(RouterEngine._contains_explicit_adult_intent("\u6da9\u56fe"))
         self.assertTrue(RouterEngine._contains_explicit_adult_intent("/nsfw"))
 
@@ -486,6 +494,111 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         self.assertIn("动画表情", animated_prompt)
         self.assertIn("多帧拼图", animated_prompt)
         self.assertFalse(executor._looks_like_weak_vision_answer("看不清"))
+
+    def test_vision_tools_take_explicit_args_instead_of_keyword_guessing(self) -> None:
+        """A9：core/tools_vision.py 的自由文本猜测已改成显式工具参数。
+
+        原来这三个函数从用户原话猜「要联网查出处」「要批量看所有图」「要走最近图兜底」，
+        现在这些决定由模型读 multimodal_media 分区说明后显式填 analyze_image 的参数。
+        """
+        executor = _DummyExecutor()
+
+        for gone in (
+            "_looks_like_vision_web_lookup_request",
+            "_looks_like_analyze_all_images_request",
+            "_analyze_image_from_message",
+        ):
+            self.assertFalse(hasattr(executor, gone), gone)
+
+        # 联网补查的门只认显式参数。原来「查一下这张图的出处」命中词表会自动联网。
+        for text in ("查一下这张图的出处", "这是谁啊", "帮我查一下这是哪部动漫"):
+            self.assertIsNone(
+                asyncio.run(
+                    executor._vision_uncertain_web_fallback(
+                        query=text,
+                        message_text="",
+                        web_lookup_requested=False,
+                    )
+                ),
+                text,
+            )
+
+        # 动图判断只吃 OneBot image 段的结构元数据，不吃用户原话。
+        self.assertTrue(
+            executor._has_animated_image_hint(
+                raw_segments=[
+                    {"type": "image", "data": {"sub_type": "1", "file": "a.png"}}
+                ]
+            )
+        )
+        self.assertTrue(
+            executor._has_animated_image_hint(
+                raw_segments=[{"type": "image", "data": {"file": "b.gif"}}]
+            )
+        )
+        self.assertTrue(
+            executor._has_animated_image_hint(
+                raw_segments=[
+                    {"type": "image", "data": {"summary": "[动画表情]", "file": "c.png"}}
+                ]
+            )
+        )
+        self.assertFalse(
+            executor._has_animated_image_hint(
+                raw_segments=[{"type": "image", "data": {"file": "d.png"}}]
+            )
+        )
+        self.assertFalse(
+            executor._has_animated_image_hint(
+                raw_segments=[{"type": "text", "data": {"text": "这个动图什么意思"}}]
+            )
+        )
+
+        # 视觉 prompt 不再按「软件/任务栏」词表追加桌面截图指令；
+        # 用户原话本来就逐字进 prompt，模型自己看得到。
+        prompt = executor._build_vision_prompt(
+            query="这截图里开着哪些软件", message_text="", animated_hint=False
+        )
+        self.assertNotIn("任务栏截图", prompt)
+        self.assertIn("开着哪些软件", prompt)
+
+    def test_vision_keyword_contracts_now_live_in_navigator_section(self) -> None:
+        """被删掉的词表所承载的契约，改由 multimodal_media 分区措辞 + 显式参数承担。"""
+        from core.prompt_navigator import (
+            PromptNavigator,
+            default_prompt_navigator_payload,
+        )
+
+        class _NavCtx:
+            message_text = ""
+            original_message_text = ""
+            reply_to_text = ""
+            media_summary: list[str] = []
+            reply_media_summary: list[str] = []
+            raw_segments: list[dict] = []
+            reply_media_segments: list[dict] = []
+            at_other_user_ids: list[str] = []
+            recent_media_artifact: dict = {}
+
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _NavCtx()
+        # 结构信号（消息里真有 image 段）才是起始分区的依据，不是「看看这张图」这句话。
+        ctx.raw_segments = [{"type": "image", "data": {"url": "file://demo.png"}}]
+        state = nav.initial_state(
+            ctx, ["think", "final_answer", "navigate_section", "analyze_image"]
+        )
+        self.assertEqual(state.active_section, "multimodal_media")
+        self.assertIn("analyze_image", nav.scoped_tools(state))
+
+        block = nav.render_system_block(state, nav.scoped_tools(state))
+        for arg in (
+            "analyze_all",
+            "max_images",
+            "is_animated",
+            "web_lookup_on_uncertain",
+            "target_message_id",
+        ):
+            self.assertIn(arg, block, arg)
 
     def test_tools_no_longer_local_match_vision_refusal_templates(self) -> None:
         executor = _DummyExecutor()

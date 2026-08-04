@@ -24,7 +24,6 @@ from urllib.parse import urlencode
 
 import httpx
 
-from core import prompt_loader as _pl
 from core.image import ImageEngine
 from core.music import MusicEngine, MusicPlayResult
 from core.prompt_policy import PromptPolicy
@@ -2490,41 +2489,6 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
         return scored[0][1] if scored else ""
 
     @staticmethod
-    def _looks_like_local_file_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = (
-            "本地",
-            "文件",
-            "路径",
-            "读一下",
-            "读取",
-            "打开",
-            "看看这个文件",
-            "分析这个文件",
-            "学习这个文件",
-            "local",
-            "read",
-            "path",
-        )
-        return any(cue in content for cue in cues)
-
-    @staticmethod
-    def _looks_like_local_media_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = [
-            normalize_text(cue).lower()
-            for cue in _pl.get_list("local_media_request_cues")
-            if normalize_text(cue)
-        ]
-        if not cues:
-            return False
-        return any(cue in content for cue in cues)
-
-    @staticmethod
     def _looks_like_media_file_path(path: str) -> bool:
         value = normalize_text(path).lower()
         if not value:
@@ -2778,93 +2742,6 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
             )
         return token in content
 
-
-    @staticmethod
-    def _looks_like_media_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        media_cues = (
-            "图",
-            "图片",
-            "壁纸",
-            "头像",
-            "视频",
-            "发图",
-            "发视频",
-            "搜图",
-            "找图",
-            "pixiv",
-            "b站",
-            "bilibili",
-            "抖音",
-            "快手",
-            "image",
-            "video",
-        )
-        return any(cue in content for cue in media_cues)
-
-    @staticmethod
-    def _looks_like_deep_web_analysis_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = (
-            "根据",
-            "总结",
-            "概括",
-            "分段",
-            "详细",
-            "来历",
-            "是谁",
-            "什么来历",
-            "这人是谁",
-            "文章说了什么",
-            "网页说了什么",
-            "原文",
-            "知乎",
-            "上网搜",
-            "去网上搜",
-            "搜一下",
-            "查一下",
-            "分析",
-        )
-        if any(cue in content for cue in cues):
-            return True
-        return bool(re.search(r"https?://[^\s]+", content))
-
-    @staticmethod
-    def _should_auto_web_analysis(
-        query: str, query_type: str, intent_text: str
-    ) -> bool:
-        if query_type in {"video", "image"}:
-            return False
-
-        content = normalize_text(f"{query}\n{intent_text}").lower()
-        if not content:
-            return False
-
-        if query_type in {"person", "work", "tech"}:
-            return True
-
-        cues = (
-            "是谁",
-            "来历",
-            "什么人",
-            "叫什么",
-            "哪里人",
-            "总结",
-            "概括",
-            "分段",
-            "详细",
-            "深度",
-            "证据",
-            "根据",
-            "原文",
-            "来源",
-        )
-        return any(cue in content for cue in cues)
-
     @staticmethod
     def _normalize_multimodal_query(text: str) -> str:
         content = normalize_text(text)
@@ -2935,13 +2812,19 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
 
     @staticmethod
     def _contains_self_avatar_cue(text: str) -> bool:
-        content = normalize_text(text)
-        cues = _prompt_cues(
-            "self_avatar_cues",
-            ("我的头像", "我头像", "my avatar", "我的qq头像", "我qq头像"),
-            lowercase=False,
-        )
-        return any(cue in content for cue in cues)
+        """是否显式声明「取我自己的头像」。
+
+        只认 `/avatar target=self|me` 这一条 typed-command 令牌，与
+        `_looks_like_qq_avatar_request` 用的是同一份契约。原先的
+        `self_avatar_cues` 词表已删：`_prompt_cues` 全局停用后它恒为空，
+        导致带令牌的 `/avatar target=self` 解析不出调用者 QQ，只能掉进
+        「你给我一个 QQ 号」兜底。「我的头像」这类自由文本由模型读
+        Prompt Navigator 分区说明后自己带上 target 参数，不在这里猜。
+        """
+        plain = re.sub(r"\s+", "", normalize_text(text).lower())
+        if not plain or "/avatar" not in plain:
+            return False
+        return "target=self" in plain or "target=me" in plain
 
     @staticmethod
     def _extract_qq_number(text: str) -> str:
