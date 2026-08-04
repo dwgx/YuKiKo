@@ -838,8 +838,6 @@ class AgentLoop:
         t0 = time.monotonic()
         steps: list[dict[str, Any]] = []
         strict_tool_routing = self._strict_tool_routing_enabled()
-        forced_media_tool = None
-        force_tool_first = False
         model_client = getattr(self, "model_client", None)
         native_tool_calling = bool(
             getattr(model_client, "supports_native_tool_calling", lambda: False)()
@@ -864,7 +862,6 @@ class AgentLoop:
         has_media = bool(ctx.media_summary) or bool(ctx.reply_media_summary)
         total_timeout = self._resolve_total_timeout_seconds(ctx, has_media)
         deadline_ts = t0 + total_timeout
-        forced_media_tool_consumed = False
         strict_tool_policy_blocked = False
 
         # 工具超时不计入步骤预算（最多 3 次免费），避免慢工具浪费推理机会
@@ -929,24 +926,6 @@ class AgentLoop:
                     step_idx,
                     preflight_section[0],
                     clip_text(preflight_section[1], 120),
-                )
-            elif (
-                forced_media_tool
-                and not forced_media_tool_consumed
-                and tool_calls_made == 0
-                and self.tool_registry.has_tool(forced_media_tool[0])
-            ):
-                forced_media_tool_consumed = True
-                forced_name, forced_args = forced_media_tool
-                parsed = {"tool": forced_name, "args": dict(forced_args)}
-                response_text = json.dumps(parsed, ensure_ascii=False)
-                assistant_msg = {"role": "assistant", "content": response_text}
-                synthetic_tool_call = True
-                _log.info(
-                    "agent_legacy_media_tool_pre_llm | trace=%s | step=%d | tool=%s",
-                    ctx.trace_id,
-                    step_idx,
-                    forced_name,
                 )
             else:
                 # 调用 LLM（带重试，agent loop 是关键路径）
@@ -1295,26 +1274,6 @@ class AgentLoop:
                         },
                     )
                     continue
-                if force_tool_first and tool_calls_made == 0:
-                    _log.info(
-                        "agent_legacy_tool_first_direct_text_block | trace=%s | step=%d | text=%s",
-                        ctx.trace_id,
-                        step_idx,
-                        clip_text(response_text, 160),
-                    )
-                    steps.append(
-                        {
-                            "step": step_idx,
-                            "tool": "policy_guard",
-                            "error": "tool_required_before_direct_reply",
-                        }
-                    )
-                    self._append_tool_result(messages, parsed, assistant_msg, response_text, {
-                                        "tool": "policy_guard",
-                                        "ok": False,
-                                        "error": "这是工具型请求，不能直接自然语言作答，必须先调用最合适的工具。",
-                                    })
-                    continue
                 _log.info(
                     "agent_direct_reply | trace=%s | step=%d", ctx.trace_id, step_idx
                 )
@@ -1354,21 +1313,6 @@ class AgentLoop:
                     nav_result,
                 )
                 continue
-            if (
-                forced_media_tool
-                and tool_calls_made == 0
-                and tool_name not in {forced_media_tool[0], "think"}
-            ):
-                forced_name, forced_args = forced_media_tool
-                _log.info(
-                    "agent_legacy_media_tool_first | trace=%s | step=%d | from=%s | to=%s",
-                    ctx.trace_id,
-                    step_idx,
-                    tool_name or "unknown",
-                    forced_name,
-                )
-                tool_name = forced_name
-                tool_args = dict(forced_args)
             missing_args = self._missing_required_tool_args(tool_name, tool_args)
             log_tool_args = tool_args
             if tool_name == "final_answer" and isinstance(tool_args, dict):
@@ -1615,48 +1559,6 @@ class AgentLoop:
                     and not ctx.is_private
                     and len(user_msg_clean) <= 4
                 )
-                if (
-                    force_tool_first
-                    and tool_calls_made == 0
-                    and not intentional_silence
-                ):
-                    if forced_media_tool:
-                        forced_name, forced_args = forced_media_tool
-                        _log.info(
-                            "agent_legacy_media_tool_first | trace=%s | step=%d | from=final_answer | to=%s",
-                            ctx.trace_id,
-                            step_idx,
-                            forced_name,
-                        )
-                        tool_name = forced_name
-                        tool_args = self._normalize_tool_args(
-                            forced_name, dict(forced_args), ctx
-                        )
-                        text = ""
-                        image_url = ""
-                        image_urls = []
-                        video_url = ""
-                        audio_file = ""
-                    else:
-                        _log.info(
-                            "agent_legacy_tool_first | trace=%s | step=%d | text=%s",
-                            ctx.trace_id,
-                            step_idx,
-                            clip_text(ctx.message_text, 120),
-                        )
-                        steps.append(
-                            {
-                                "step": step_idx,
-                                "tool": "policy_guard",
-                                "error": "tool_required_before_final",
-                            }
-                        )
-                        self._append_tool_result(messages, parsed, assistant_msg, response_text, {
-                                            "tool": "policy_guard",
-                                            "ok": False,
-                                            "error": "这是工具型请求，必须先调用最合适的工具，再输出 final_answer。",
-                                        })
-                        continue
                 if tool_name == "final_answer":
                     # 某些模型会把真正的工具调用 JSON 包在 final_answer.text 里，尝试恢复。
                     recovered = None
