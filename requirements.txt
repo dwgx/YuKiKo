@@ -2,7 +2,11 @@ nonebot2[fastapi]==2.4.4
 nonebot-adapter-onebot==2.4.6
 httpx==0.27.2
 python-multipart==0.0.32
-PyYAML==6.0.3
+# f2 0.0.1.7（本行下方，抖音解析用）死钉 pyyaml==6.0.2，且 0.0.1.7 已是 f2 最新版。
+# 钉 6.0.3 会让 pip 直接 ResolutionImpossible，任何人 clone 后都装不上依赖。
+# 仓库只用 yaml.safe_load / safe_dump 两个 6.0.x 内稳定的 API，降到 6.0.2 无影响。
+# f2 出新版放开 pyyaml 上限后可再抬。
+PyYAML==6.0.2
 python-dotenv==1.2.2
 cryptography==44.0.0
 yt-dlp==2026.6.9
