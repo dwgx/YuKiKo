@@ -27,6 +27,49 @@ from utils.text import clip_text, normalize_matching_text, normalize_text, token
 _log = logging.getLogger("yukiko.agent_tools")
 
 
+# 百科抓取结果的置信度：是可核查的外部来源，但不是用户亲口说的，
+# 所以低于 learn_knowledge 的默认 0.7 —— 用户明确纠正时能压过它。
+_WIKI_CONFIDENCE = 0.6
+
+# 模型自己声明的安全判定取值。判据归 prompt 措辞，不归本文件的词表。
+_SAFETY_REVIEW_REJECT = frozenset({"unsafe", "harmful", "abusive", "reject", "block", "unsafe_content"})
+_SAFETY_REVIEW_PASS = frozenset({"safe", "ok", "clean", "benign"})
+
+
+def _kb_record_audit(kb: Any, event: str, **fields: Any) -> None:
+    """把知识库写入决策记进 knowledge 审计流。
+
+    kb 可能是测试里的 stub 或未注入 AuditTrail 的实例 —— 两种情况都静默跳过。
+    KnowledgeBase.record_audit 自身不抛异常（AuditTrail.write 不抛）。
+    """
+    recorder = getattr(kb, "record_audit", None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(event, **fields)
+    except Exception:
+        _log.warning("knowledge_audit_record_failed | event=%s", event, exc_info=True)
+
+
+def _resolve_safety_review(args: dict[str, Any]) -> str:
+    """读取模型声明的 safety_review。
+
+    这里刻意**不做任何内容判断**：原先 _looks_like_harmful_knowledge_payload 用一张
+    8 词脏词表 + 「以后你叫」/「叫他」组合来猜有害意图，实测把
+    「大便颜色异常可能提示消化道问题」「智障儿童的正式称呼已改为智力障碍」
+    「我不喜欢被叫废物」这类正常知识全部误判为有害（12 条样本里 11 条命中，
+    连「滚石唱片」「鼠标滚轮」都因为含「滚」被拦）。
+    判据交给模型读分区措辞后自己声明；拒绝**机制**保留，见调用点。
+    """
+    raw = normalize_text(str(args.get("safety_review", ""))).lower()
+    if raw in _SAFETY_REVIEW_REJECT:
+        return "unsafe"
+    if raw in _SAFETY_REVIEW_PASS:
+        return "safe"
+    # 没声明不等于放行成功：写入照做，但审计流里明确记成 unreviewed，可事后追。
+    return "unreviewed"
+
+
 def _has_cross_user_profile_access(context: dict[str, Any]) -> bool:
     level = normalize_text(str(context.get("permission_level", ""))).lower()
     return level == "super_admin"
@@ -158,6 +201,18 @@ def _register_crawler_tools(registry: AgentToolRegistry) -> None:
                     "content": {"type": "string", "description": "知识内容"},
                     "category": {"type": "string", "description": "分类: fact/meme/learned"},
                     "tags": {"type": "string", "description": "标签(逗号分隔)"},
+                    "confidence": {
+                        "type": "number",
+                        "description": "你对这条知识的把握程度 0..1。写入时参与去重与矛盾裁决：同标题已有更高把握的旧值时不会被低把握的新值覆盖。不填按 0.7 计。",
+                    },
+                    "safety_review": {
+                        "type": "string",
+                        "description": "你对这条内容的安全判定: safe 或 unsafe。判定为 unsafe 时本次写入被拒绝。不填会作为 unreviewed 记入审计流。",
+                    },
+                    "is_correction": {
+                        "type": "boolean",
+                        "description": "这是对同标题旧值的明确更正吗。为 true 时允许低把握覆盖高把握旧值。",
+                    },
                 },
                 "required": ["title", "content"],
             },
@@ -435,11 +490,25 @@ async def _handle_lookup_wiki(args: dict[str, Any], context: dict[str, Any]) -> 
                 lines.append(f"来源: {r.url}")
             lines.append("")
 
-        # 存入知识库
+        # 存入知识库。原来是裸 kb.add：无置信度、无去重、无矛盾比对，
+        # 抓到几条写几条。改走同一个带质量门的写入入口。
         kb = context.get("knowledge_base")
         if kb:
             for r in results:
-                kb.add("wiki", r.title, r.snippet, source=r.source, tags=[keyword])
+                title = normalize_text(str(r.title or ""))
+                snippet = normalize_text(str(r.snippet or ""))
+                if not title or not snippet:
+                    continue
+                _write_knowledge_entry(
+                    kb,
+                    category="wiki",
+                    title=title,
+                    content=snippet,
+                    tags=[keyword],
+                    confidence=_WIKI_CONFIDENCE,
+                    source=str(r.source or ""),
+                    update_mode="wiki_lookup",
+                )
 
         return ToolCallResult(ok=True, data={"results": len(results)}, display="\n".join(lines))
     except Exception as e:
@@ -726,9 +795,22 @@ async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any])
             data=payload or {},
             display=f"已更新用户偏好称呼: {preferred_name or decision.candidate}",
         )
-    merged_text = normalize_text(f"{title} {content}")
-    if _looks_like_harmful_knowledge_payload(merged_text):
-        return ToolCallResult(ok=False, error="unsafe_knowledge_content")
+    # 安全门：拒绝机制保留，判据换成模型声明的 safety_review（原来是硬编码脏词表）。
+    safety_review = _resolve_safety_review(args)
+    if safety_review == "unsafe":
+        _kb_record_audit(
+            kb,
+            "knowledge_write_rejected",
+            title=title,
+            category=category,
+            reason="safety_review_unsafe",
+            declared_by="model",
+        )
+        return ToolCallResult(
+            ok=False,
+            error="unsafe_knowledge_content",
+            display="按你自己的安全判定，这条内容不写入知识库。",
+        )
     if category not in ("fact", "meme", "learned"):
         category = "learned"
 
@@ -759,11 +841,50 @@ async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any])
     normalized_tags = normalized_tags[:20]
 
     try:
-        entry_id = kb.add(category=category, title=title, content=content,
-                        source="chat", tags=normalized_tags)
+        confidence = _parse_declared_confidence(args.get("confidence"))
+        # 走 upsert_conflict_checked 而不是裸 kb.add：后者不写 confidence / update_mode /
+        # is_correction，导致 Agent 主动学到的知识在检索重排里永远垫底，
+        # 而且完全绕过去重与矛盾裁决（vision-knowledge-base.md G4.1）。
+        result = _write_knowledge_entry(
+            kb,
+            category=category,
+            title=title,
+            content=content,
+            tags=normalized_tags,
+            confidence=confidence,
+            is_correction=bool(args.get("is_correction", False)),
+        )
+        action = result.get("action") if isinstance(result, dict) else None
+        entry_id = result.get("id") if isinstance(result, dict) else None
+        _kb_record_audit(
+            kb,
+            "knowledge_write_accepted",
+            knowledge_id=entry_id,
+            title=title,
+            category=category,
+            action=str(action or "unknown"),
+            confidence=confidence,
+            safety_review=safety_review,
+            tags=normalized_tags,
+        )
+        if action == "disputed":
+            return ToolCallResult(
+                ok=True,
+                data={"id": entry_id, "category": category, "action": action, "tags": normalized_tags},
+                display=(
+                    f"[{category}] {title} 已存在把握更高的旧值，这次的新值记为待裁决而没有覆盖。"
+                    "确定要改的话把 is_correction 设为 true 再写一次。"
+                ),
+            )
+        if action == "duplicate":
+            return ToolCallResult(
+                ok=True,
+                data={"id": entry_id, "category": category, "action": action, "tags": normalized_tags},
+                display=f"[{category}] 库里已有同样内容的条目，这次只把「{title}」记成它的别名。",
+            )
         return ToolCallResult(
             ok=True,
-            data={"id": entry_id, "category": category, "tags": normalized_tags},
+            data={"id": entry_id, "category": category, "action": action, "tags": normalized_tags},
             display=f"已学习: [{category}] {title}",
         )
     except Exception as e:
@@ -771,26 +892,49 @@ async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any])
         return ToolCallResult(ok=False, error=f"learn_error: {e}")
 
 
-def _looks_like_harmful_knowledge_payload(text: str) -> bool:
-    content = normalize_text(text).lower()
-    if not content:
-        return True
-    abusive_tokens = (
-        "大便",
-        "傻逼",
-        "弱智",
-        "智障",
-        "脑残",
-        "废物",
-        "狗东西",
-        "滚",
+def _parse_declared_confidence(raw: Any, default: float = 0.7) -> float:
+    """模型声明的把握程度。非法值回落到默认，不猜。"""
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if value != value:  # NaN
+        return default
+    return max(0.0, min(1.0, value))
+
+
+def _write_knowledge_entry(
+    kb: Any,
+    *,
+    category: str,
+    title: str,
+    content: str,
+    tags: list[str],
+    confidence: float,
+    source: str = "chat",
+    update_mode: str = "agent",
+    is_correction: bool = False,
+) -> dict[str, Any]:
+    """统一的知识写入入口：带质量门的 upsert，kb 不支持时回落到裸 add。
+
+    回落分支是为 stub / 老 kb 实现留的兼容路径，不是双写。
+    """
+    upsert = getattr(kb, "upsert_conflict_checked", None)
+    if not callable(upsert):
+        return {"ok": True, "action": "inserted", "id": kb.add(
+            category=category, title=title, content=content, source=source, tags=tags
+        )}
+    result = upsert(
+        category=category,
+        title=title,
+        content=content,
+        source=source,
+        tags=tags,
+        confidence=confidence,
+        update_mode=update_mode,
+        mark_correction=is_correction,
     )
-    if any(token in content for token in abusive_tokens):
-        return True
-    # 阻断“以后你叫XX叫YY”这类强制羞辱称呼写入。
-    if "以后你叫" in content and "叫他" in content:
-        return True
-    return False
+    return result if isinstance(result, dict) else {"ok": True, "action": "inserted", "id": None}
 
 
 # ─────────────────────────────────────────────

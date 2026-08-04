@@ -11,6 +11,13 @@ from typing import Any
 from utils.learning_guard import assess_preferred_name_learning, is_safe_user_profile_learning_context
 from utils.text import clip_text, normalize_text
 
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _empty_result() -> dict[str, int]:
+    """零结果的统一形状。质量门的各个出口都要能被调用方数出来。"""
+    return {"candidates": 0, "saved": 0, "updated": 0, "duplicate": 0, "disputed": 0, "rejected": 0}
+
 
 @dataclass(slots=True)
 class KnowledgeCandidate:
@@ -23,7 +30,11 @@ class KnowledgeCandidate:
 class KnowledgeUpdater:
     """LLM-first chat-to-knowledge updater."""
 
-    _TOOL_ECHO_CUES = ("[cq:", '"tool"', '"tool_result"', "http://", "https://")
+    # 只保留结构标记：OneBot 消息段语法 + 本仓工具协议的 JSON 键名。
+    # 曾经在这里的 "http://" / "https://" 已删除：那是语义判断（"链接堆砌不该抽取"），
+    # 会让任何含链接的正常陈述句整条被跳过（实测「我的博客是 https://… 平时写点技术笔记」
+    # 被误拦）。该语义规则归 _extract_candidates_llm 的 system prompt 第 1 条。
+    _TOOL_ECHO_CUES = ("[cq:", '"tool"', '"tool_result"')
 
     def __init__(self, knowledge_base: Any, config: dict[str, Any], logger: Any, model_client: Any = None):
         self.knowledge_base = knowledge_base
@@ -116,10 +127,23 @@ class KnowledgeUpdater:
         return tuple(patterns)
 
     def _looks_like_tool_echo(self, text: str) -> bool:
+        """判定这段文本是不是机器产物 —— 纯结构判据，不含语义意图词。
+
+        三条判据都是结构事实：JSON 形状、工具协议键名、OneBot 段语法。
+        第四条（剥掉 URL 后无剩余正文）替代了原先的 http:// 字面匹配：
+        「整条消息只有链接」是可判定的结构事实，「含链接的句子不该学」不是。
+        """
         low = normalize_text(text).lower()
+        if not low:
+            return False
         if "{" in low and "}" in low and ":" in low and '"' in low:
             return True
-        return any(cue in low for cue in self._TOOL_ECHO_CUES)
+        if any(cue in low for cue in self._TOOL_ECHO_CUES):
+            return True
+        # 纯链接投递：剥掉 URL 后没有正文，抽取器没有可学的内容。
+        if _URL_RE.search(low) and not normalize_text(_URL_RE.sub(" ", low)):
+            return True
+        return False
 
     def _contains_speculative_cue(self, text: str) -> bool:
         if not self.heuristic_rules_enable:
@@ -359,12 +383,16 @@ class KnowledgeUpdater:
         timestamp: datetime | None = None,
     ) -> dict[str, int]:
         if not candidates:
-            return {"candidates": 0, "saved": 0, "updated": 0}
+            return _empty_result()
         now = (timestamp or datetime.now(timezone.utc)).timestamp()
         saved = 0
         updated = 0
+        duplicate = 0
+        disputed = 0
+        rejected = 0
         for item in candidates:
             if item.confidence < self.min_confidence:
+                rejected += 1
                 continue
             source = "user_correction" if item.is_correction else "chat_auto"
             extra = {
@@ -390,21 +418,39 @@ class KnowledgeUpdater:
                 update_mode="auto",
                 mark_correction=item.is_correction,
             )
-            if res.get("action") == "updated":
+            action = res.get("action") if isinstance(res, dict) else None
+            if action == "updated":
                 updated += 1
-            elif res.get("action") == "inserted":
+            elif action == "inserted":
                 saved += 1
+            elif action == "duplicate":
+                # 库里已有同内容条目，只记了别名。不算新增也不算失败。
+                duplicate += 1
+            elif action == "disputed":
+                # 同标题已有把握更高的旧值，新值挂待裁决而没有覆盖。
+                disputed += 1
 
-        if (saved or updated) and self.logger is not None:
+        if (saved or updated or duplicate or disputed) and self.logger is not None:
             self.logger.info(
-                "knowledge_auto_update | conversation=%s | user=%s | candidates=%d | inserted=%d | updated=%d",
+                "knowledge_auto_update | conversation=%s | user=%s | candidates=%d | inserted=%d | "
+                "updated=%d | duplicate=%d | disputed=%d | below_confidence=%d",
                 conversation_id,
                 user_id,
                 len(candidates),
                 saved,
                 updated,
+                duplicate,
+                disputed,
+                rejected,
             )
-        return {"candidates": len(candidates), "saved": saved, "updated": updated}
+        return {
+            "candidates": len(candidates),
+            "saved": saved,
+            "updated": updated,
+            "duplicate": duplicate,
+            "disputed": disputed,
+            "rejected": rejected,
+        }
 
     async def update_from_turn_async(
         self,
@@ -416,7 +462,7 @@ class KnowledgeUpdater:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, int]:
         if not self.enable or self.knowledge_base is None:
-            return {"candidates": 0, "saved": 0, "updated": 0}
+            return _empty_result()
 
         llm_candidates = await self._extract_candidates_llm(
             user_text=user_text,
@@ -457,7 +503,7 @@ class KnowledgeUpdater:
                 # 避免在已运行事件循环中阻塞。主链路应使用 update_from_turn_async。
                 if self.logger is not None:
                     self.logger.debug("knowledge_update_sync_called_in_event_loop")
-                return {"candidates": 0, "saved": 0, "updated": 0}
+                return _empty_result()
         except RuntimeError:
             pass
         return asyncio.run(
