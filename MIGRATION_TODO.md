@@ -144,9 +144,28 @@ YuKiKo 要成为一个**由模型判断驱动的 QQ 群聊/私聊机器人**，�
 
 ## C. 已知 bug（与关键词迁移无关，但已确认存在）
 
-- [ ] **C1. `get_cookies` 凭证外泄** — `core/agent_tools_napcat.py:2204` 把 QQ Cookie 经
-      `_compact_data()`（`core/agent.py:5341`，调用点 `:2001`，喂回 LLM `:2023-2034`）放进 `tool_result.data` 喂回 LLM
-      （`:2126`），再可能被 `final_answer` 复述到群里。已排除在菜单外，但工具本身仍注册可调。
+- [x] **C1. `get_cookies` 凭证外泄** — 已修（`db81dc9`），本条此前漏勾。
+      三个凭证工具（`get_cookies` / `get_credentials` / `get_csrf_token`）**全部**指向
+      `_handle_napcat_credential_probe`（`core/agent_tools_napcat.py:916`），只有一条注册路径，
+      无绕过。`data` 只含白名单构造的存在性摘要。
+      *一个并行 codegraph 会话报告此处与我的清单冲突 —— 冲突源是我的记账过期，不是代码。
+      已复验注册路径确认无第二条通路。*
+
+- [x] **C6. `update check` 会真的执行更新** — 已修（`6d9be55`）。
+      `_act_update` 把 `check`/`status`/`查看` 解析成 `check_only`，但该变量**只用于决定超时和标题**，
+      从不进 `cmd_args` —— 脚本收到裸 `update`，跑完整 git pull + 装依赖 + 建 webui + 热重载。
+      `restart_mode` / `allow_dirty` 同样被丢弃。
+      不对称之处最容易漏看：`--check-only` 在白名单里，所以直接写 flag 是真检查，
+      而友好别名反而执行真更新。**用户以为在查看状态，实际在生产环境升级。**
+      *实测 argv：`check`/`status`/`查看` → `["update","--check-only"]` @120s；
+      `restart` → `--restart`；`force` → `--allow-dirty`；显式 flag 不重复追加。*
+
+- [x] **C7. `_handle_get_group_file_url` 重复定义** — 已修（`9e81cce`）。
+      `core/agent_tools_napcat.py` 里 `:1942` 与 `:4105` 两份同名定义，Python 取后者，
+      **前者是静默死代码：改它无任何效果，测试也不报错。** 两处注册都解析到 `:4105`。
+      死的那份反而更严谨，已把它的 `file_id.strip()` 和「url 缺失不覆盖 display」搬进存活版本。
+      *该文件 ~4300 行同形 handler，同名遮蔽是这里的真实风险面。*
+
 - [ ] **C2. `mode` 是死配置** — `PromptNavigatorConfig.mode` 被解析并打印给模型
       （`模式: local_prefilter_llm_review`），但全仓无任何代码分支读它。要么删，要么给它真实含义。
 - [ ] **C3. `_strip_heuristic_prompt_lists` 有绕过路径** — 见 A10，需在
