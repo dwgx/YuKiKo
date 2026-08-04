@@ -142,10 +142,14 @@ class GroupOpsAuditRecordTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row["scope"], "global")
             self.assertEqual(row["state"]["global_count"], 1)
 
-    async def test_group_scoped_unignore_that_clears_global_is_flagged_irreversible(self) -> None:
-        """群管理员用本群 scope 解忽略时，兜底分支会把全局忽略也清掉
+    async def test_group_scoped_unignore_cannot_clear_global_for_group_admin(self) -> None:
+        """群管理员用本群 scope 解忽略时，兜底分支原本会把全局忽略也清掉
         （core/admin.py remove_ignored_user 的 elif 分支），而他无权再设回全局。
-        对执行者而言这确实不可逆，必须能按字段筛出来。"""
+
+        这个测试原先断言该升级被标记为 irreversible —— 那是在如实记录一个漏洞。
+        漏洞已在 E0-5 堵上：非超管走不到升级分支，所以现在断言的是「拦住了」，
+        场景与执行者身份保持不变。
+        """
         with tempfile.TemporaryDirectory() as tmp:
             fx = _AuditFixture(tmp)
             fx.admin.add_ignored_user(_TARGET_USER, group_id=0, scope="global", actor_id=_SUPER_USER)
@@ -157,13 +161,14 @@ class GroupOpsAuditRecordTests(unittest.IsolatedAsyncioTestCase):
                 sender_role="admin",
             )
 
-            self.assertIn("全局", reply or "")
-            row = fx.only(AUDIT_IGNORE_REMOVE)
-            self.assertEqual(row["actor_id"], _GROUP_ADMIN)
-            self.assertEqual(row["scope"], "global")
-            self.assertEqual(row["change"]["requested_scope"], "group")
-            self.assertTrue(row["change"]["escalated_to_global"])
-            self.assertTrue(row["irreversible"])
+            self.assertIn("超级管理员", reply or "")
+            # 状态未被改动，不只是回复被拒。
+            self.assertIn(_TARGET_USER, fx.admin._ignored_global)
+            self.assertEqual(
+                [r for r in fx.rows() if r.get("event") == AUDIT_IGNORE_REMOVE],
+                [],
+                "被拒的操作不该留下变更记录",
+            )
 
     async def test_same_escalation_by_super_admin_is_reversible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -456,6 +461,100 @@ class GroupOpsAuditStreamRoutingTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(row["group_id"], _GROUP_ID)
                 self.assertEqual(row["actor_id"], _SUPER_USER)
+
+
+class GlobalIgnoreEscalationPermissionTests(unittest.IsolatedAsyncioTestCase):
+    """MIGRATION_TODO E0-5：群管理员不得清除自己无法恢复的全局忽略。
+
+    群 scope 解忽略解不到时会兜底去清全局忽略。设置全局忽略需要超管，所以放行
+    群管理员做这件事，等于让他删掉一条只有超管能恢复的规则。
+    """
+
+    def test_group_admin_cannot_clear_global_ignore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _AuditFixture(tmp)
+            fx.admin.add_ignored_user("999", scope="global", actor_id=_SUPER_USER)
+
+            ok, message = fx.admin.remove_ignored_user(
+                "999", group_id=_GROUP_ID, actor_id="20002"
+            )
+
+            self.assertFalse(ok)
+            self.assertIn("超级管理员", message)
+            # 关键断言：状态没被改动，不只是回复被拒。
+            self.assertIn("999", fx.admin._ignored_global)
+            self.assertEqual(
+                [r for r in fx.rows() if r.get("event") == AUDIT_IGNORE_REMOVE],
+                [],
+                "被拒的操作不该留下变更记录",
+            )
+
+    def test_super_admin_may_still_escalate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _AuditFixture(tmp)
+            fx.admin.add_ignored_user("999", scope="global", actor_id=_SUPER_USER)
+
+            ok, _ = fx.admin.remove_ignored_user(
+                "999", group_id=_GROUP_ID, actor_id=_SUPER_USER
+            )
+
+            self.assertTrue(ok)
+            self.assertNotIn("999", fx.admin._ignored_global)
+            row = fx.only(AUDIT_IGNORE_REMOVE)
+            self.assertTrue(row["change"]["escalated_to_global"])
+            # 超管有权恢复，所以对执行者不构成不可逆。
+            self.assertFalse(row["irreversible"])
+
+
+class PersistFailureReplyTests(unittest.IsolatedAsyncioTestCase):
+    """MIGRATION_TODO E0-4：写盘失败不得谎报成功。
+
+    内存状态确实改了，所以不能说失败；但没落盘、重启即回滚，用户必须知道。
+    """
+
+    @staticmethod
+    def _break_writes(fx: _AuditFixture, filename: str) -> None:
+        # 用目录占位使 json 写入必然失败。
+        (fx.dir / filename).mkdir(parents=True, exist_ok=True)
+
+    async def test_whitelist_add_warns_when_not_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _AuditFixture(tmp)
+            self._break_writes(fx, "whitelist_groups.json")
+
+            reply = await fx.admin._dispatch(
+                "white_add", "", _SUPER_USER, 777, "owner", fx.engine, None
+            )
+
+            self.assertIn("777", reply)
+            self.assertIn("没能写入磁盘", reply)
+            self.assertFalse(fx.only(AUDIT_WHITELIST_ADD)["persisted"])
+
+    async def test_successful_write_has_no_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _AuditFixture(tmp)
+
+            reply = await fx.admin._dispatch(
+                "white_add", "", _SUPER_USER, 777, "owner", fx.engine, None
+            )
+
+            self.assertIn("777", reply)
+            self.assertNotIn("没能写入磁盘", reply)
+            self.assertTrue(fx.only(AUDIT_WHITELIST_ADD)["persisted"])
+
+    def test_ignore_add_warns_when_not_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _AuditFixture(tmp)
+            self._break_writes(fx, "ignored_users.json")
+
+            ok, message = fx.admin.add_ignored_user(
+                "999", group_id=_GROUP_ID, actor_id=_SUPER_USER
+            )
+
+            # 内存已改，所以仍是成功；但必须带上会丢失的提示。
+            self.assertTrue(ok)
+            self.assertIn("没能写入磁盘", message)
+            self.assertFalse(fx.only(AUDIT_IGNORE_ADD)["persisted"])
 
 
 if __name__ == "__main__":

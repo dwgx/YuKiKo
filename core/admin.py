@@ -226,6 +226,17 @@ class AdminEngine:
     def enabled(self) -> bool:
         return self._enabled
 
+    @staticmethod
+    def _with_persist_warning(message: str, persisted: bool) -> str:
+        """写盘失败时在回复里说明「本次生效但重启会丢」，不要谎报成功。
+
+        内存状态确实已经改了，所以不能说失败；但 JSON 没落盘，重启即回滚。
+        用户必须知道这件事，否则会以为配置已经固化。
+        """
+        if persisted:
+            return message
+        return f"{message}\n注意：本次改动没能写入磁盘，重启后会丢失，请检查 storage 目录权限。"
+
     def _audit_group_op(
         self,
         event: str,
@@ -357,7 +368,7 @@ class AdminEngine:
                 state={"ignored": True, "global_count": len(self._ignored_global)},
                 persisted=persisted,
             )
-            return True, f"已忽略用户 {uid}（全局）"
+            return True, self._with_persist_warning(f"已忽略用户 {uid}（全局）", persisted)
         if gid <= 0:
             return False, "群聊内默认按本群忽略；私聊请使用全局 scope"
         bucket = self._ignored_group.setdefault(gid, set())
@@ -375,7 +386,7 @@ class AdminEngine:
             state={"ignored": True, "group_count": len(bucket)},
             persisted=persisted,
         )
-        return True, f"已忽略用户 {uid}（本群 {gid}）"
+        return True, self._with_persist_warning(f"已忽略用户 {uid}（本群 {gid}）", persisted)
 
     def remove_ignored_user(
         self,
@@ -403,7 +414,16 @@ class AdminEngine:
                     self._ignored_group.pop(gid, None)
                 changed = True
             elif uid in self._ignored_global:
-                # 兜底：群聊解封时允许自动解除全局忽略，避免误操作后难恢复。
+                # 兜底：群 scope 解不到时顺带解除全局忽略。原实现无条件放行，
+                # 但设置全局忽略需要超管，于是群管理员能清掉一条自己无法恢复的规则
+                # ——「避免误操作难恢复」的注释与实际效果正好相反。现在只有超管可以升级
+                # 到全局；群管理员会收到明确提示去找超管，而不是静默改掉全局状态。
+                if not self.is_super_admin(actor_id):
+                    return (
+                        False,
+                        f"用户 {uid} 不在本群忽略列表，只在全局忽略列表里。"
+                        f"解除全局忽略需要超级管理员权限（设置它也需要），请联系超管处理。",
+                    )
                 self._ignored_global.discard(uid)
                 changed = True
                 scope_value = "global"
@@ -436,8 +456,8 @@ class AdminEngine:
                 irreversible=escalated_to_global and not self.is_super_admin(actor_id),
             )
             if is_global:
-                return True, f"已恢复用户 {uid}（全局）"
-            return True, f"已恢复用户 {uid}（本群 {gid}）"
+                return True, self._with_persist_warning(f"已恢复用户 {uid}（全局）", persisted)
+            return True, self._with_persist_warning(f"已恢复用户 {uid}（本群 {gid}）", persisted)
         return False, f"用户 {uid} 不在忽略列表"
 
     def increment_message_count(self) -> None:
@@ -994,7 +1014,7 @@ class AdminEngine:
             state={"whitelisted": True, "whitelist_size": len(self._white)},
             persisted=persisted,
         )
-        return f"已加白本群 {gid}"
+        return self._with_persist_warning(f"已加白本群 {gid}", persisted)
 
     async def _act_white_rm(self, **kwargs: Any) -> str:
         gid = int(kwargs.get("group_id", 0) or 0)
@@ -1016,7 +1036,7 @@ class AdminEngine:
             # 于是执行者自己通常已经无法把本群加回来，只有超管能。
             irreversible=not self.is_super_admin(str(kwargs.get("user_id", ""))),
         )
-        return f"已从白名单移除本群 {gid}"
+        return self._with_persist_warning(f"已从白名单移除本群 {gid}", persisted)
 
     async def _act_white_list(self, **_: Any) -> str:
         if not self._white:
