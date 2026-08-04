@@ -1939,25 +1939,6 @@ async def _handle_get_group_files(args: dict[str, Any], context: dict[str, Any])
     return result
 
 
-async def _handle_get_group_file_url(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    """获取群文件下载链接。"""
-    group_id = int(args.get("group_id", 0))
-    file_id = str(args.get("file_id", "")).strip()
-    busid = int(args.get("busid", 0))
-    if not group_id or not file_id:
-        return ToolCallResult(ok=False, error="missing group_id or file_id")
-    result = await _napcat_api_call(
-        context, "get_group_file_url",
-        f"获取群文件下载链接成功",
-        group_id=group_id, file_id=file_id, busid=busid,
-    )
-    if result.ok and result.data:
-        url = result.data.get("url", "")
-        if url:
-            result.display = f"下载链接: {url}"
-    return result
-
-
 async def _handle_get_muted_list(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     """获取群禁言列表。"""
     group_id = int(args.get("group_id", 0))
@@ -4103,8 +4084,15 @@ async def _handle_get_group_root_files(args: dict[str, Any], context: dict[str, 
 
 
 async def _handle_get_group_file_url(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """获取群文件下载链接。
+
+    本文件曾有两份同名定义（原 :1942 与本处），Python 取后定义者，
+    前者是静默死代码 —— 改它不会有任何效果，测试也不会报错。
+    已删除前者，并把它那两处更严的处理搬到这里：file_id 去空白、
+    url 缺失时不覆盖 display（原来会显示「下载链接: ?」）。
+    """
     group_id = int(args.get("group_id", 0))
-    file_id = str(args.get("file_id", ""))
+    file_id = str(args.get("file_id", "")).strip()
     busid = int(args.get("busid", 0))
     if not group_id or not file_id:
         return ToolCallResult(ok=False, error="missing group_id or file_id")
@@ -4113,7 +4101,9 @@ async def _handle_get_group_file_url(args: dict[str, Any], context: dict[str, An
         group_id=group_id, file_id=file_id, busid=busid,
     )
     if result.ok and result.data:
-        result.display = f"下载链接: {result.data.get('url', '?')}"
+        url = str(result.data.get("url", "") or "").strip()
+        if url:
+            result.display = f"下载链接: {url}"
     return result
 
 
