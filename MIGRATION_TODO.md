@@ -42,10 +42,18 @@ YuKiKo 要成为一个**由模型判断驱动的 QQ 群聊/私聊机器人**，�
 - [ ] **A5. `core/trigger.py`（4 个符号）** — `_looks_like_explicit_bot_request`、
       `_looks_like_explicit_memory_declare`、`_explicit_request_signal_from_cues`、
       `_explicit_request_signal`。trigger 只保留注意力/防噪门控（@、私聊、回复、活跃会话、白名单、限流）。
-- [ ] **A6. `core/agent.py` 已死的强制工具子树（白送的删除）** — `run()` 在 `:841-842` 声明
-      `forced_media_tool` / `force_tool_first` 但**全文件无任何赋值**，导致 `:934`、`:1298`、
-      `:1358`、`:1619` 四处消费分支永远为假。`_should_force_image_tool_first:4846`、
-      `_select_forced_video_tool` 等整族主链路零入口，只有测试当纯函数调。
+- [ ] **A6. `core/agent.py` 强制工具子树** — 已删 4 处死分支共 **98 行**（`e89086e`）：
+      pre-LLM 合成工具调用、direct-text 拦截、改写模型选中的工具、final_answer 强制路径，
+      以及孤立的 `forced_media_tool_consumed`。*验证：零残留引用；全量 680 passed 与删前逐字一致。*
+      **剩余**：7 个辅助函数仍在（`_select_forced_media_tool`、`_should_force_tool_first`、
+      `_select_forced_video_tool`、`_should_force_voice_tool_first`、`_select_forced_web_tool`、
+      `_should_force_image_tool_first`、`_should_force_local_video_tool_first`），
+      因为 `tests/test_tool_call_leak_regression.py`（16 个测试里 7 个）、`tests/test_agent_smoke.py`
+      和 `scripts/agent_deep_selfcheck.py` 仍当纯函数直接调。
+      这 7 个测试断言的契约是「有媒体 + 短问句 → 必须先调工具，不能纯文本作答」——
+      **契约要保留，但实现须改由 navigator 承担**（断言改成 `_preselect` 命中
+      `multimodal_media` 且该区 tools 含分析工具），改完才能删函数。
+
 - [ ] **A7. `core/agent.py` 仍活着的 4 条关键词路径** — 这几条是真迁移，不是清理：
       `_rewrite_download_tool_if_needed:4658`（模型选完工具后本地改工具名）、
       `_normalize_tool_args:3726`（语义猜参数默认值）、`_fallback_tool_on_failure:4415`、
@@ -86,10 +94,20 @@ YuKiKo 要成为一个**由模型判断驱动的 QQ 群聊/私聊机器人**，�
       （`模式: local_prefilter_llm_review`），但全仓无任何代码分支读它。要么删，要么给它真实含义。
 - [ ] **C3. `_strip_heuristic_prompt_lists` 有绕过路径** — 见 A10，需在
       `load_prompts_template()` 和 `prompt_loader.reload()` 也调用。
-- [ ] **C4. `.venv` 是 Python 3.14，与项目声明不符** — `pyproject.toml` 写 `>=3.11`、ruff 目标
+- [x] **C4. `.venv` 已重建为 Python 3.11.15** — 原 3.14 装不上 nonebot，大部分测试无法 import。
+      现在全量测试可跑：**680 passed / 10 skipped / 1 failed**（那 1 个是 D3 的沙箱 DNS 问题）。
+      *注：本机无 3.12，用 3.11.15 满足 `requires-python = ">=3.11"`；ruff 的 `target-version = py312`
+      只影响 lint 规则，与运行时无关。*
+- [ ] ~~**C4-old. `.venv` 是 Python 3.14，与项目声明不符**~~ — `pyproject.toml` 写 `>=3.11`、ruff 目标
       `py312`。`requirements.txt` 的 `pilk` / `bilix` / `f2` 在 3.14 无 wheel，
       `scripts/deploy.py` 装不上，只能手装 `pytest`+`httpx`+`PyYAML`。
       **导致大部分测试套件无法 import（缺 nonebot），全量验证做不了。** 建议改用 3.12 建 venv。
+
+- [ ] **C5. `requirements.txt` 存在真实依赖冲突，全新安装必然失败** —
+      第 5 行钉死 `PyYAML==6.0.3`，而第 12 行 `f2==0.0.1.7` 要求 `pyyaml==6.0.2`，
+      pip 直接 `ResolutionImpossible`。当前测试环境是跳过 `f2` 装起来的，
+      因此抖音解析相关代码路径未覆盖。**这会让任何人 clone 后装不上依赖。**
+      需要你定：升 `f2`、松开 `PyYAML` 钉版、还是移除 `f2`。
 
 ## D. 测试（A 组的验收标准）
 
