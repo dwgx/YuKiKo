@@ -26,8 +26,18 @@ from utils.text import clip_text, normalize_matching_text, normalize_text, token
 
 _log = logging.getLogger("yukiko.agent_tools")
 
-def _register_ai_method_tools(registry: AgentToolRegistry) -> None:
-    """注册 tools.py AI method 的 Agent 桥接工具。"""
+def _register_ai_method_tools(
+    registry: AgentToolRegistry, config: dict[str, Any] | None = None
+) -> None:
+    """注册 tools.py AI method 的 Agent 桥接工具。
+
+    被配置关掉的工具不注册 —— 注册了模型就看得见、就会调，然后必然拿到
+    「GitHub 方法已关闭。」白烧一整轮推理。实测 `github 上搜一下 nonebot`
+    正是这么失败的：`search.tool_interface.github_enable` 两处真相源都是 false。
+    """
+
+    tool_iface_cfg = ((config or {}).get("search") or {}).get("tool_interface") or {}
+    github_enable = bool(tool_iface_cfg.get("github_enable", False))
 
     registry.register(
         ToolSchema(
@@ -49,44 +59,45 @@ def _register_ai_method_tools(registry: AgentToolRegistry) -> None:
         _handle_fetch_webpage,
     )
 
-    registry.register(
-        ToolSchema(
-            name="github_search",
-            description=(
-                "在GitHub搜索开源仓库，返回仓库名、星标数、简介和链接。\n"
-                "使用场景: 用户问'有什么好用的XX库'、'搜一下GitHub上的XX'时使用"
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "搜索关键词"},
-                    "language": {"type": "string", "description": "编程语言过滤(可选，如python/rust/go)"},
+    if github_enable:
+        registry.register(
+            ToolSchema(
+                name="github_search",
+                description=(
+                    "在GitHub搜索开源仓库，返回仓库名、星标数、简介和链接。\n"
+                    "使用场景: 用户问'有什么好用的XX库'、'搜一下GitHub上的XX'时使用"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "搜索关键词"},
+                        "language": {"type": "string", "description": "编程语言过滤(可选，如python/rust/go)"},
+                    },
+                    "required": ["query"],
                 },
-                "required": ["query"],
-            },
-            category="search",
-        ),
-        _handle_github_search,
-    )
-    registry.register(
-        ToolSchema(
-            name="github_readme",
-            description=(
-                "读取指定GitHub仓库的README摘要。\n"
-                "使用场景: 用户说'看看这个仓库'、'这个项目是干什么的'时使用。\n"
-                "支持 owner/repo 格式或完整GitHub URL"
+                category="search",
             ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string", "description": "仓库，格式: owner/repo 或 GitHub URL"},
+            _handle_github_search,
+        )
+        registry.register(
+            ToolSchema(
+                name="github_readme",
+                description=(
+                    "读取指定GitHub仓库的README摘要。\n"
+                    "使用场景: 用户说'看看这个仓库'、'这个项目是干什么的'时使用。\n"
+                    "支持 owner/repo 格式或完整GitHub URL"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "repo": {"type": "string", "description": "仓库，格式: owner/repo 或 GitHub URL"},
+                    },
+                    "required": ["repo"],
                 },
-                "required": ["repo"],
-            },
-            category="search",
-        ),
-        _handle_github_readme,
-    )
+                category="search",
+            ),
+            _handle_github_readme,
+        )
 
     registry.register(
         ToolSchema(

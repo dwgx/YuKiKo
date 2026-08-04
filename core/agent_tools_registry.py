@@ -587,6 +587,6 @@ def register_builtin_tools(
     _register_crawler_tools(registry)
     _register_memory_tools(registry)
     _register_daily_report_tools(registry)
-    _register_ai_method_tools(registry)
+    _register_ai_method_tools(registry, config)
     _register_qzone_tools(registry, config)
     _register_scrapy_llm_tools(registry, model_client)
