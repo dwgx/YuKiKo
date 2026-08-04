@@ -56,7 +56,6 @@ _ytdlp_log = _logging.getLogger("yukiko.ytdlp")
 _tool_log = _logging.getLogger("yukiko.tools")
 _tool_trace_id_ctx: ContextVar[str] = ContextVar("yukiko_tool_trace_id", default="")
 _ytdlp_error_dedupe: set[tuple[str, str]] = set()
-_TOOLS_HEURISTIC_CUES_ENABLED = False
 _HTTP_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
 
@@ -110,11 +109,6 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
         control_cfg = raw_cfg.get("control", {}) if isinstance(raw_cfg, dict) else {}
         if not isinstance(control_cfg, dict):
             control_cfg = {}
-        global _TOOLS_HEURISTIC_CUES_ENABLED
-        _TOOLS_HEURISTIC_CUES_ENABLED = bool(
-            control_cfg.get("heuristic_rules_enable", False)
-        )
-
         self.search_engine = search_engine
         self.image_engine = image_engine
         self.plugin_runner = plugin_runner
