@@ -831,6 +831,128 @@ async def _handle_generic_napcat_api(args: dict[str, Any], context: dict[str, An
         return ToolCallResult(ok=False, error=f"{tool_name}: {exc}")
 
 
+# ── QQ 凭证通道：只报存在性，不返回值 ──
+#
+# get_cookies / get_credentials / get_csrf_token 的上游响应带明文 cookie 与 CSRF 令牌。
+# ToolCallResult.data 会被 core/agent.py 的 _compact_data() 原样喂回 LLM，模型随后可能用
+# final_answer 把它复述进群聊。所以这条通道**不允许任何凭证值离开 handler**，
+# 只允许输出"配置好了没有 / 缺哪个键 / 什么时候过期"这类排障事实。
+
+_CREDENTIAL_VALUE_KEY_PATTERN = re.compile(
+    r"(?i)\b(p_?skey|skey|p_?uin|uin|cookies?|csrf[_-]?token|token|rkey|bkn|g_?tk|superkey|sessionid)\s*[=:]\s*\S+"
+)
+
+# 上游可能给出的 cookie 字段名，用于在 payload 里定位 cookie 串本身。
+_COOKIE_PAYLOAD_KEYS = ("cookies", "cookie")
+# 上游可能给出的 CSRF 字段名。
+_CSRF_PAYLOAD_KEYS = ("token", "csrf_token", "csrfToken", "bkn")
+# 摘要里最多列出多少个 cookie 键名，避免键名本身撑爆 token。
+_MAX_REPORTED_COOKIE_KEYS = 24
+
+
+def _mask_credential_text(text: str) -> str:
+    """把 `键=值` 形式的凭证片段替换成 `键=[已脱敏]`。
+
+    用于 error 字符串：某些 OneBot 实现会把整个响应体塞进异常消息，
+    而 error 同样会被喂回 LLM。
+    """
+    if not text:
+        return ""
+    return _CREDENTIAL_VALUE_KEY_PATTERN.sub(
+        lambda m: f"{m.group(1)}=[已脱敏]", text
+    )
+
+
+def _cookie_keys_from_payload(payload: Any) -> list[str]:
+    """从 cookie 串或 dict 里只取键名，丢弃全部值。"""
+    keys: list[str] = []
+    if isinstance(payload, dict):
+        keys = [normalize_text(str(k)) for k in payload]
+    elif isinstance(payload, str):
+        for part in payload.split(";"):
+            name = normalize_text(part.split("=", 1)[0]) if "=" in part else ""
+            if name:
+                keys.append(name)
+    return [k for k in dict.fromkeys(keys) if k]
+
+
+def _summarize_credential_payload(payload: Any, domain: str) -> dict[str, Any]:
+    """从零构造存在性摘要。
+
+    刻意不做"拷贝再删敏感键"——那样上游新增字段会默认外泄。
+    这里每个输出键都是显式写出来的，payload 里的值一律不进结果。
+    """
+    body = payload if isinstance(payload, dict) else {}
+    inner = body.get("data")
+    if isinstance(inner, dict):
+        body = inner
+
+    cookie_raw: Any = None
+    for key in _COOKIE_PAYLOAD_KEYS:
+        if body.get(key):
+            cookie_raw = body[key]
+            break
+    cookie_keys = _cookie_keys_from_payload(cookie_raw)
+
+    has_csrf = any(body.get(key) not in (None, "", 0) for key in _CSRF_PAYLOAD_KEYS)
+
+    summary: dict[str, Any] = {
+        "redacted": True,
+        "cookies_present": bool(cookie_keys),
+        "cookie_key_count": len(cookie_keys),
+        "cookie_keys": cookie_keys[:_MAX_REPORTED_COOKIE_KEYS],
+        "csrf_token_present": has_csrf,
+        # QZone 等接口签名依赖 p_skey/skey，缺它就是"凭证没配好"，这是排障要的事实。
+        "has_qzone_signing_key": any(k in {"p_skey", "skey"} for k in cookie_keys),
+    }
+    if domain:
+        summary["domain"] = domain
+    expires_at = normalize_text(str(body.get("expires_at", "") or body.get("expiry", "")))
+    if expires_at:
+        summary["expires_at"] = expires_at
+    return summary
+
+
+async def _handle_napcat_credential_probe(
+    args: dict[str, Any], context: dict[str, Any]
+) -> ToolCallResult:
+    """QQ 凭证类 NapCat API 的脱敏 handler。
+
+    仍然真实调用上游（凭证通道是否可用本身就是要排查的事实），
+    但只把存在性摘要放进 data。凭证值不出这个函数。
+    """
+    api_call = context.get("api_call")
+    if not callable(api_call):
+        return ToolCallResult(ok=False, error="no_api_call_available")
+    tool_name = normalize_text(str(context.get("_tool_name", "")))
+    if not tool_name:
+        return ToolCallResult(ok=False, error="cannot_determine_api_name")
+
+    domain = normalize_text(str(args.get("domain", "")))
+    clean_args = {k: v for k, v in args.items() if v is not None and v != ""}
+    try:
+        raw = await call_napcat_api(api_call, tool_name, **clean_args)
+    except Exception as exc:
+        return ToolCallResult(
+            ok=False, error=_mask_credential_text(f"{tool_name}: {exc}")
+        )
+
+    summary = _summarize_credential_payload(raw, domain)
+    if summary["cookies_present"] or summary["csrf_token_present"]:
+        display = "QQ 凭证通道可用（已脱敏，仅返回存在性；凭证值不对外提供）"
+    else:
+        display = "QQ 凭证未配置或已失效：上游没有返回可用凭证"
+    _log.info(
+        "napcat_credential_probe | tool=%s | domain=%s | cookies=%s | keys=%d | csrf=%s",
+        tool_name,
+        domain or "-",
+        summary["cookies_present"],
+        summary["cookie_key_count"],
+        summary["csrf_token_present"],
+    )
+    return ToolCallResult(ok=True, data=summary, display=display)
+
+
 _QQ_ID_SAFE_PATTERN = re.compile(r"^[1-9]\d{5,11}$")
 
 
@@ -2201,16 +2323,17 @@ def _register_napcat_extended_tools(registry: AgentToolRegistry) -> None:
         {"file_id": ("string", "文件ID")},
         ["file_id"], _handle_generic_napcat_api),
 
-        ("get_cookies", "获取QQ Cookies。\n使用场景: 需要获取QQ平台的Cookie用于第三方接口时使用",
+        # 凭证通道三件套：只报存在性，不返回凭证值。见 _handle_napcat_credential_probe。
+        ("get_cookies", "检查QQ Cookie配置状态，只返回存在性摘要(有没有、包含哪些键名、是否过期)，不返回Cookie值。",
         {"domain": ("string", "域名，如 qzone.qq.com")},
-        ["domain"], _handle_generic_napcat_api),
+        ["domain"], _handle_napcat_credential_probe),
 
-        ("get_csrf_token", "获取CSRF Token。\n使用场景: 需要QQ平台的CSRF令牌时使用",
-        {}, [], _handle_generic_napcat_api),
+        ("get_csrf_token", "检查QQ CSRF令牌是否可用，只返回存在性，不返回令牌值。",
+        {}, [], _handle_napcat_credential_probe),
 
-        ("get_credentials", "获取QQ凭证(Cookies + CSRF Token)。\n使用场景: 需要完整QQ凭证时使用",
+        ("get_credentials", "检查QQ凭证(Cookie + CSRF)整体配置状态，只返回存在性摘要，不返回凭证值。",
         {"domain": ("string", "域名")},
-        [], _handle_generic_napcat_api),
+        [], _handle_napcat_credential_probe),
 
         ("can_send_image", "检查是否可以发送图片",
         {}, [], _handle_generic_napcat_api),
