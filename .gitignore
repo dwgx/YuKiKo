@@ -68,3 +68,6 @@ webui/*.tsbuildinfo
 # coverage
 htmlcov/
 .coverage
+
+# 迁移工作草稿（生成物，可删）
+.migration/
