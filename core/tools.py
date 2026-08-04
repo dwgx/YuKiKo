@@ -2899,36 +2899,6 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
         return " ".join(parts).strip()
 
     @staticmethod
-    def _looks_like_image_request(text: str) -> bool:
-        content = _normalize_multimodal_query(text).lower()
-        if not content:
-            return False
-        cues = [
-            normalize_text(cue).lower()
-            for cue in _pl.get_list("image_request_cues")
-            if normalize_text(cue)
-        ]
-        if not cues:
-            return False
-        return any(cue in content for cue in cues)
-
-    @staticmethod
-    def _looks_like_image_send_request(text: str) -> bool:
-        content = _normalize_multimodal_query(text).lower()
-        if not content:
-            return False
-        send_cues = [
-            normalize_text(cue).lower()
-            for cue in _pl.get_list("image_send_cues")
-            if normalize_text(cue)
-        ]
-        if not send_cues:
-            return False
-        return ToolExecutor._looks_like_image_request(content) and any(
-            cue in content for cue in send_cues
-        )
-
-    @staticmethod
     def _is_passive_multimodal_text(text: str) -> bool:
         content = normalize_text(text)
         if not content:
@@ -2958,21 +2928,10 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
         plain = re.sub(r"\s+", "", content)
         if "/avatar" in plain and ("target=self" in plain or "target=me" in plain):
             return True
-        avatar_cues = _prompt_cues(
-            "qq_avatar_request_cues", ("头像", "avatar", "profile")
-        )
-        qq_cues = _prompt_cues("qq_identity_cues", ("qq", "q号", "企鹅号", "uin"))
-        self_avatar_cues = _prompt_cues(
-            "self_avatar_cues",
-            ("我的头像", "我头像", "my avatar", "我的qq头像", "我qq头像"),
-        )
-        other_avatar_cues = _prompt_cues("other_avatar_cues", ("他的头像", "她的头像"))
-        return any(cue in content for cue in avatar_cues) and (
-            any(cue in content for cue in qq_cues)
-            or any(cue in content for cue in self_avatar_cues)
-            or any(cue in content for cue in other_avatar_cues)
-            or bool(re.search(r"[\u4e00-\u9fffa-z0-9_.-]{2,20}的头像", content))
-        )
+        # 只认显式控制令牌。头像意图交给模型读 Prompt Navigator 分区说明后直接调
+        # get_qq_avatar，不再由本地词表猜 —— _prompt_cues 已全局停用（恒返回空元组），
+        # 下面原有的词表判断本就永假。
+        return False
 
     @staticmethod
     def _contains_self_avatar_cue(text: str) -> bool:
