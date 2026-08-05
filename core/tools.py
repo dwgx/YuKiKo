@@ -57,6 +57,16 @@ _tool_trace_id_ctx: ContextVar[str] = ContextVar("yukiko_tool_trace_id", default
 _ytdlp_error_dedupe: set[tuple[str, str]] = set()
 _HTTP_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
+# RFC 2544 基准测试段。它不是可路由的真实主机地址，正因如此被 Clash 等透明代理
+# 选作 fake-IP 池：DNS 返回段内地址，TUN 层拦下该流量再按域名转发到真实目的地。
+# 所以主机名解析落进这个段时，解析结果不携带任何目的地信息 —— 既不能证明目标
+# 是私网，也不能证明是公网。真实的私网 SSRF 会解析到 10/8、192.168/16、127/8、
+# 169.254/16，都不在这里。
+_BENCHMARK_FAKE_IP_NETWORKS = (
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("2001:2::/48"),  # RFC 5180 的 IPv6 对应段
+)
+
 
 class _UnsafeToolUrlError(RuntimeError):
     """Raised when a tool-side HTTP fetch crosses into a blocked target."""
@@ -2154,7 +2164,56 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
             self._url_host_safety_cache[host] = False
             return False
 
+        return self._verdict_from_resolution(host, infos)
+
+    @staticmethod
+    def _is_benchmark_fake_ip(
+        ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    ) -> bool:
+        """判断地址是否落在 RFC 2544 基准测试段（含 IPv4-in-IPv6 包裹形式）。
+
+        实测 getaddrinfo 对同一个 fake-IP 主机会同时返回 `198.18.0.106` 和
+        `::ffff:0:c612:6a`。后者不是标准 ipv4_mapped（多一段 :0:），
+        `.ipv4_mapped` 返回 None，所以必须手工取低 32 位再判一次 ——
+        否则包裹形式会被当成"非 fake-IP"，整个放行分支失效。
+        """
+
+        if any(ip_obj in net for net in _BENCHMARK_FAKE_IP_NETWORKS):
+            return True
+
+        if not isinstance(ip_obj, ipaddress.IPv6Address):
+            return False
+
+        mapped = ip_obj.ipv4_mapped
+        if mapped is not None:
+            return any(mapped in net for net in _BENCHMARK_FAKE_IP_NETWORKS)
+
+        # 非标准包裹：高 96 位只含 ffff 标记位、低 32 位是一个 IPv4。
+        # 实测两种形状：`::ffff:0:c612:6a` → 0xffff0000，
+        # 标准 `::ffff:c612:6a` → 0xffff（已被上面的 ipv4_mapped 分支接住）。
+        packed = int(ip_obj)
+        if (packed >> 32) not in {0xFFFF_0000, 0xFFFF}:
+            return False
+        try:
+            candidate = ipaddress.ip_address(packed & 0xFFFF_FFFF)
+        except ValueError:
+            return False
+        return any(candidate in net for net in _BENCHMARK_FAKE_IP_NETWORKS)
+
+    def _verdict_from_resolution(self, host: str, infos: list) -> bool:
+        """按 getaddrinfo 结果判定主机是否放行，并写入缓存。
+
+        同步与异步两条路径共用 —— 它们此前是两份逐字重复的实现。
+
+        解析结果全部落在 fake-IP 段时放行：那说明透明代理接管了 DNS，本地解析
+        不携带目的地信息（既不证明私网也不证明公网）。此时依据的是上面已经通过
+        的主机名检查（localhost / 内网 TLD / 字面私网 IP 都已被拒）。
+        """
+
         saw_ip = False
+        fake_ip_only = True
+        blocked: list[str] = []
+
         for info in infos:
             sockaddr = info[4] if len(info) >= 5 else None
             if not sockaddr:
@@ -2167,9 +2226,30 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
                 resolved_ip = ipaddress.ip_address(address)
             except ValueError:
                 continue
+            if self._is_benchmark_fake_ip(resolved_ip):
+                continue
+            fake_ip_only = False
             if not self._is_public_ip_obj(resolved_ip):
-                self._url_host_safety_cache[host] = False
-                return False
+                blocked.append(address)
+
+        if blocked:
+            _tool_log.info(
+                "url_safety_rejected_private_target | host=%s | ips=%s",
+                host,
+                ",".join(blocked[:3]),
+            )
+            self._url_host_safety_cache[host] = False
+            return False
+
+        if saw_ip and fake_ip_only:
+            _tool_log.debug(
+                "url_safety_fake_ip_resolution | host=%s | 解析全部落在基准测试段，"
+                "按主机名判定放行",
+                host,
+            )
+            self._url_host_safety_cache[host] = True
+            return True
+
         self._url_host_safety_cache[host] = saw_ip
         return saw_ip
 
@@ -2300,24 +2380,7 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
             self._url_host_safety_cache[host] = False
             return False
 
-        saw_ip = False
-        for info in infos:
-            sockaddr = info[4] if len(info) >= 5 else None
-            if not sockaddr:
-                continue
-            address = normalize_text(str(sockaddr[0])).split("%", 1)[0]
-            if not address:
-                continue
-            saw_ip = True
-            try:
-                resolved_ip = ipaddress.ip_address(address)
-            except ValueError:
-                continue
-            if not self._is_public_ip_obj(resolved_ip):
-                self._url_host_safety_cache[host] = False
-                return False
-        self._url_host_safety_cache[host] = saw_ip
-        return saw_ip
+        return self._verdict_from_resolution(host, infos)
 
     @staticmethod
     def _is_known_image_signature(head: bytes) -> bool:
