@@ -217,6 +217,24 @@ def _register_crawler_tools(registry: AgentToolRegistry) -> None:
                 "required": ["title", "content"],
             },
             category="search",
+            # 两个枚举 + confidence 浮点范围 + tags 逗号格式，示例把它们一次演示齐。
+            input_examples=[
+                {
+                    "title": "群主生日",
+                    "content": "群主生日是 3 月 5 日",
+                    "category": "fact",
+                    "tags": "群主,生日",
+                    "confidence": 0.9,
+                    "safety_review": "safe",
+                },
+                {
+                    "title": "顶不住了",
+                    "content": "群里的梗，表示扛不住",
+                    "category": "meme",
+                    "safety_review": "safe",
+                    "is_correction": True,
+                },
+            ],
         ),
         _handle_learn_knowledge,
     )

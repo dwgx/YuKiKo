@@ -188,6 +188,16 @@ def _register_napcat_tools(registry: AgentToolRegistry) -> None:
                 "required": ["group_id", "user_id", "within_minutes"],
             },
             category="napcat",
+            # 三个必填都是裸整数、单位各不相同，示例明确哪个是分钟哪个是条数。
+            input_examples=[
+                {"group_id": 123456789, "user_id": 987654321, "within_minutes": 10},
+                {
+                    "group_id": 123456789,
+                    "user_id": 987654321,
+                    "within_minutes": 30,
+                    "limit": 50,
+                },
+            ],
         ),
         _handle_recall_recent_messages,
     )
@@ -2066,7 +2076,10 @@ def _register_napcat_extended_tools(registry: AgentToolRegistry) -> None:
         {"user_id": ("integer", "目标用户QQ号"), "event_type": ("integer", "1=正在输入")},
         ["user_id", "event_type"], _handle_set_input_status),
 
-        ("download_file", "下载URL文件到本地缓存，返回本地路径。\n兼容入口：内部会自动走智能下载链路（视频解析/网页提取下载链接）。\n使用场景: 需要先下载文件再上传到群文件时使用",
+        ("download_file", "下载URL文件到本地缓存，返回本地路径。\n兼容入口：内部会自动走智能下载链路（视频解析/网页提取下载链接）。\n使用场景: 需要先下载文件再上传到群文件时使用\n"
+            "调用示例:\n"
+            '- {"url": "https://example.com/a.mp4", "kind": "video"}\n'
+            '- {"url": "https://example.com/a.apk", "upload": true, "group_id": 123456789, "file_name": "app.apk"}',
         {"url": ("string", "文件下载URL"), "thread_count": ("integer", "下载线程数，默认1"),
             "kind": ("string", "auto/video/audio/file，默认auto"),
             "prefer_ext": ("string", "优先扩展名，如 apk/mp4/mp3"),
@@ -2077,7 +2090,10 @@ def _register_napcat_extended_tools(registry: AgentToolRegistry) -> None:
             "file_name": ("string", "下载后/上传时文件名(可选)")},
         ["url"], _handle_download_file),
 
-        ("smart_download", "母下载方法(统一下载入口)。\n会自动执行：媒体解析 -> 网页提取直链 -> 下载到可上传目录。\n可直接 upload=true 上传群文件。\n使用场景: 用户要你'直接发安装包/视频/音频文件'时优先用这个。",
+        ("smart_download", "母下载方法(统一下载入口)。\n会自动执行：媒体解析 -> 网页提取直链 -> 下载到可上传目录。\n可直接 upload=true 上传群文件。\n使用场景: 用户要你'直接发安装包/视频/音频文件'时优先用这个。\n"
+            "调用示例:\n"
+            '- {"url": "https://example.com/app", "kind": "file", "prefer_ext": "apk"}\n'
+            '- {"url": "https://v.douyin.com/xxxx", "kind": "video", "upload": true, "group_id": 123456789}',
         {"url": ("string", "资源链接(网页/视频链接/直链)"),
             "kind": ("string", "auto/video/audio/file，默认auto"),
             "prefer_ext": ("string", "优先扩展名，如 apk/mp4/mp3"),

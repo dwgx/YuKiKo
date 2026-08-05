@@ -165,6 +165,12 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
                 "required": [],
             },
             category="media",
+            # 六个布尔参数容易混，示例给出常见三种搭配。
+            input_examples=[
+                {"question": "图里的文字是什么"},
+                {"question": "这是哪部番", "web_lookup_on_uncertain": True},
+                {"analyze_all": True, "max_images": 4},
+            ],
         ),
         _handle_analyze_image,
     )
@@ -265,6 +271,12 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
                 "required": [],
             },
             category="media",
+            # mode 决定用哪一组参数，四种模式各用不同子集 —— 单看参数表看不出搭配。
+            input_examples=[
+                {"mode": "clip", "start_seconds": 10, "duration_seconds": 15},
+                {"mode": "audio", "max_audio_seconds": 180},
+                {"mode": "frames", "max_frames": 6, "interval_seconds": 5},
+            ],
         ),
         _handle_split_video,
     )

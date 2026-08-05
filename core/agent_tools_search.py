@@ -67,6 +67,10 @@ def _register_search_tools(registry: AgentToolRegistry, search_engine: Any) -> N
                 "required": ["query", "media_type"],
             },
             category="search",
+            input_examples=[
+                {"query": "赛博朋克 城市 壁纸", "media_type": "image", "limit": 5},
+                {"query": "柯基 表情包", "media_type": "gif"},
+            ],
         ),
         _make_search_web_media_handler(search_engine),
     )
@@ -93,6 +97,10 @@ def _register_search_tools(registry: AgentToolRegistry, search_engine: Any) -> N
                 "required": ["query", "media_type"],
             },
             category="search",
+            input_examples=[
+                {"query": "初音未来 壁纸", "media_type": "image"},
+                {"query": "猫咪 打呼", "media_type": "video", "limit": 3},
+            ],
         ),
         _make_search_media_handler(search_engine),
     )

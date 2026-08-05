@@ -323,6 +323,10 @@ def _register_memory_tools(registry: AgentToolRegistry) -> None:
                 "required": [],
             },
             category="search",
+            input_examples=[
+                {"keyword": "考研", "limit": 20},
+                {"role": "assistant", "page": 2},
+            ],
         ),
         _handle_memory_list,
     )
@@ -344,6 +348,10 @@ def _register_memory_tools(registry: AgentToolRegistry) -> None:
                 "required": ["content"],
             },
             category="utility",
+            input_examples=[
+                {"content": "用户喜欢喝冰美式"},
+                {"content": "用户在准备考研", "role": "user", "note": "长期偏好"},
+            ],
         ),
         _handle_memory_add,
     )
@@ -421,6 +429,11 @@ def _register_memory_tools(registry: AgentToolRegistry) -> None:
                 "required": [],
             },
             category="utility",
+            # dry_run=false 时 note 变成必填 —— 这个条件依赖单看参数表看不出来。
+            input_examples=[
+                {"dry_run": True},
+                {"dry_run": False, "note": "清理重复问候", "keep_latest": 1},
+            ],
         ),
         _handle_memory_compact,
     )

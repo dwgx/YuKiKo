@@ -165,6 +165,41 @@ class AgentToolRegistry:
         results.sort(key=lambda x: x[0])
         return [text for _, text in results]
 
+    # 单个工具最多渲染几条示例 — schema 预算有限，示例只是样板不是文档
+    _MAX_INPUT_EXAMPLES = 3
+
+    @classmethod
+    def _render_input_examples(cls, schema: ToolSchema) -> str:
+        """把 input_examples 渲染成紧凑的 JSON 行。
+
+        走 description 文本而不是 JSON Schema 的 examples 关键字：
+        原生 payload 直接透传 description，纯文本 prompt 渲染器也只读
+        description + 每个参数的 type/description，examples 关键字在文本路会被丢掉。
+        """
+        examples = getattr(schema, "input_examples", ()) or ()
+        lines: list[str] = []
+        for item in examples[: cls._MAX_INPUT_EXAMPLES]:
+            if not isinstance(item, dict) or not item:
+                continue
+            try:
+                lines.append(json.dumps(item, ensure_ascii=False, sort_keys=False))
+            except (TypeError, ValueError):
+                _log.warning(
+                    "tool_input_example_unserializable | tool=%s", schema.name
+                )
+        if not lines:
+            return ""
+        body = "\n".join(f"- {line}" for line in lines)
+        return f"调用示例:\n{body}"
+
+    @classmethod
+    def _describe_with_examples(cls, schema: ToolSchema) -> str:
+        """description 加上示例块；没有示例时原样返回，保证老注册导出不变。"""
+        examples_block = cls._render_input_examples(schema)
+        if not examples_block:
+            return schema.description
+        return f"{schema.description}\n{examples_block}"
+
     def get_schemas(self, categories: list[str] | None = None) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for name, schema in self._schemas.items():
@@ -172,7 +207,7 @@ class AgentToolRegistry:
                 continue
             out.append({
                 "name": schema.name,
-                "description": schema.description,
+                "description": self._describe_with_examples(schema),
                 "parameters": schema.parameters,
             })
         return out
@@ -295,7 +330,8 @@ class AgentToolRegistry:
                 pdesc = pinfo.get("description", "")
                 param_parts.append(f"  - {pname}{req_mark} ({ptype}): {pdesc}")
             param_block = "\n".join(param_parts) if param_parts else "  (无参数)"
-            lines.append(f"### {schema.name}\n{schema.description}\n参数:\n{param_block}")
+            description = self._describe_with_examples(schema)
+            lines.append(f"### {schema.name}\n{description}\n参数:\n{param_block}")
         return "\n\n".join(lines)
 
     def get_schemas_for_native_tools(self, tool_names: list[str]) -> list[dict[str, Any]]:
@@ -310,7 +346,7 @@ class AgentToolRegistry:
                 "type": "function",
                 "function": {
                     "name": schema.name,
-                    "description": schema.description,
+                    "description": self._describe_with_examples(schema),
                     "parameters": self._normalize_native_parameters(schema.parameters),
                 }
             })

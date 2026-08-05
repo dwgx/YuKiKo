@@ -46,6 +46,18 @@ def _register_utility_tools(registry: AgentToolRegistry) -> None:
                 "required": ["text"],
             },
             category="general",
+            # image_url（单张）与 image_urls（数组）最容易混，示例把两者分开演示。
+            input_examples=[
+                {"text": "查到了，明天多云转晴。"},
+                {"text": "这是解析好的视频", "video_url": "https://example.com/a.mp4"},
+                {
+                    "text": "这是这组图",
+                    "image_urls": [
+                        "https://example.com/1.jpg",
+                        "https://example.com/2.jpg",
+                    ],
+                },
+            ],
         ),
         _handle_final_answer,
     )
@@ -53,7 +65,15 @@ def _register_utility_tools(registry: AgentToolRegistry) -> None:
     registry.register(
         ToolSchema(
             name="think",
-            description="内部思考工具。当你需要分析复杂问题、规划多步操作、或整理信息时使用。不会产生任何外部效果",
+            description=(
+                "内部思考工具。分析复杂问题、规划多步操作、整理信息时使用，不产生任何外部效果。\n"
+                "刚拿到工具结果、或准备换工具/换分区时，用它先想一遍最有价值：\n"
+                "- 用户要的最终结果是什么，我手上已经有哪一部分\n"
+                "- 上一个工具的返回是真拿到了东西，还是只回了一句状态\n"
+                "- 我下一步要调的工具，必填参数是否都齐了；不齐就先补，不要空着调\n"
+                "- 同样的工具带同样的参数是不是已经调过了；调过就换思路，别重来\n"
+                "怎么想、想多少由你定，这只是建议的检查角度，不是要填的表格。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {

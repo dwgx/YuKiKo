@@ -170,7 +170,23 @@ def _check_agent_parse_and_prompt() -> list[_Check]:
             ok=("analyze_image" in user_msg) or ("附带媒体" in user_msg and "image:" in user_msg),
         )
     )
-    checks.append(_Check("agent.force_tool_first_image", ok=loop._should_force_image_tool_first(ctx)))
+    # 这里原本调 `_should_force_image_tool_first` —— 那是 A6 删掉的七个 forced-tool
+    # helper 之一（`tests/test_agent_smoke.py:598` 专门断言它们不复存在，防止有人把
+    # 词表接回来）。脚本没跟着改，于是整个 selfcheck 一直崩在 AttributeError，
+    # 而 CLAUDE.md 恰恰要求改 prompt / routing / agent 前先跑它。
+    #
+    # 承接同一意图的现在是 navigator：带图片段时它把 analyze_image 放进可见工具面，
+    # 并把 image_url 作为**可被模型否决**的证据，而不是代码强制先调某个工具。
+    checks.append(
+        _Check(
+            "agent.image_evidence_reaches_navigator",
+            ok=bool(
+                getattr(ctx, "navigator_state", None) is None
+                or "analyze_image" in (ctx.navigator_state.visible_tools or [])
+                or "image_url" in (ctx.navigator_state.evidence or [])
+            ),
+        )
+    )
 
     return checks
 
