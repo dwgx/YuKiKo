@@ -244,6 +244,14 @@ class AgentLoop:
             "scrape_structured",
             "scrape_follow_links",
             "fetch_webpage",
+            # 发现/清单类工具：它们的 display 是给模型看的能力目录，永远不是给用户的
+            # 答案。实测「画一只戴宇航员头盔的柴犬」→ generate_image_enhanced 失败、
+            # 模型接着调 list_image_models 诊断，兜底却把后者的 "可用模型: 1 个"
+            # 当成回复发给了用户 —— 用户既没拿到图，也不知道生成失败了。
+            "list_image_models",
+            "list_faces",
+            "list_emojis",
+            "browse_sticker_categories",
         }
     )
     _DOWNLOAD_LLM_EXTRACT_TOOLS = frozenset(
