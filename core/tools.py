@@ -146,8 +146,11 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
         self._video_download_timeout_seconds = max(
             10, int(video_cfg.get("download_timeout_seconds", 50))
         )
+        # 默认从 12 提到 30：yt-dlp 探元数据（含字幕轨）实测 8.3~12.6 秒，
+        # 12 秒是擦边值，网络稍抖就超时。超时后 `_inspect_platform_video_metadata_safe`
+        # 静默返回 {}，于是字幕提取间歇性失败且日志无痕。
         self._video_metadata_timeout_seconds = max(
-            6, int(video_cfg.get("metadata_timeout_seconds", 12))
+            6, int(video_cfg.get("metadata_timeout_seconds", 30))
         )
         self._video_resolve_total_timeout_seconds = max(
             12,

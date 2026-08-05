@@ -271,6 +271,10 @@ def _built_in_config_defaults() -> dict[str, Any]:
                 "enable": True,
                 "download_max_mb": 128,
                 "download_timeout_seconds": 120,
+                # core/tools.py:149 读它，但此前两处真相源都没有 —— 升级安装拿不到
+                # 这个键，字幕/元数据探测的超时无法从 WebUI 调。
+                # 实测 yt-dlp 探一次 8.3~12.6 秒，原默认 12 秒是擦边值。
+                "metadata_timeout_seconds": 30,
                 "resolve_total_timeout_seconds": 240,
                 "require_audio_for_send": True,
                 "validate_direct_url": True,

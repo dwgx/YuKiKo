@@ -1194,12 +1194,32 @@ class ToolVideoMixin:
     async def _inspect_platform_video_metadata_safe(
         self, source_url: str
     ) -> dict[str, Any]:
+        """探视频元数据，失败返回 {} —— 但必须留日志。
+
+        原实现 `except Exception: return {}` 零日志。实测 yt-dlp 探一次要 8.3~12.6 秒，
+        而超时默认值曾是 12 秒，于是字幕提取间歇性失败、排查时完全看不出原因
+        （sync 层其实每次都成功拿到了字幕）。
+        """
+
         try:
             return await asyncio.wait_for(
                 self._inspect_platform_video_metadata(source_url),
                 timeout=float(self._video_metadata_timeout_seconds),
             )
-        except Exception:
+        except asyncio.TimeoutError:
+            _ytdlp_log.warning(
+                "video_metadata_timeout | url=%s | timeout=%ss",
+                source_url[:100],
+                self._video_metadata_timeout_seconds,
+            )
+            return {}
+        except Exception as exc:
+            _ytdlp_log.warning(
+                "video_metadata_error | url=%s | %s: %s",
+                source_url[:100],
+                type(exc).__name__,
+                str(exc)[:200],
+            )
             return {}
 
     def _pick_video_duration_limit(self, duration_scene: str = "") -> tuple[int, str]:

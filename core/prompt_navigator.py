@@ -388,7 +388,9 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                     '- 用户贴了抖音 / 快手 / B站 / AcFun / 腾讯视频 / 爱奇艺 / YouTube / 优酷的视频页链接，\n'
                     '  或一条以 .mp4 .mov .m4v .webm .mkv .avi .flv .wmv .m3u8 结尾的直链。\n'
                     '- 用户想拿到能直接发出来的视频（发我、下载、转存、搬运、去水印后发群里）。\n'
-                    '- 用户想知道这个链接里的视频讲了什么：总结、评价、解说、字幕、弹幕热词、热评。\n'
+                    '- 用户想知道这个链接里的视频讲了什么：总结、评价、解说、弹幕热词、热评。\n'
+                    '- 用户要的是字幕文字本身（拿来看、引用、翻译、据此回答）：用 extract_subtitle\n'
+                    '  取原文；要的是整体理解和结论时才用 analyze_video。\n'
                     '- 用户只想要视频的一部分：某个时间段的片段、一张封面、几张关键帧、单独的音轨。\n'
                     '- 本地结构信号出现 video_url 或 recent_media_artifact（本会话刚解析过一个视频）而\n'
                     '  用户这句话是在追问那个视频。\n'
@@ -403,6 +405,7 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                 'tools': [
                     'parse_video',
                     'analyze_video',
+                    'extract_subtitle',
                     'split_video',
                     'fetch_webpage',
                     'think',

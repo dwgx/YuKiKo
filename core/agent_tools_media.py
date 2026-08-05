@@ -80,6 +80,32 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
 
     registry.register(
         ToolSchema(
+            name="extract_subtitle",
+            description=(
+                "取视频的字幕文本本身，返回可直接引用的字幕内容。\n"
+                "支持平台同 parse_video（B站/抖音/快手/AcFun/腾讯/爱奇艺/YouTube/优酷）。\n"
+                "用户要的是字幕文字（要看、要引用、要翻译、要据此回答问题）时用这个；\n"
+                "要的是对视频内容的整体理解和总结时用 analyze_video。\n"
+                "没有字幕轨时会明确告知，不会编造。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "视频链接"},
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "返回字幕的最大字符数（默认 3000，上限 12000）",
+                    },
+                },
+                "required": ["url"],
+            },
+            category="media",
+        ),
+        _handle_extract_subtitle,
+    )
+
+    registry.register(
+        ToolSchema(
             name="analyze_video",
             description=(
                 "深度分析视频内容: 提取标题、作者、时长、标签、弹幕热词、热评、字幕等。\n"
@@ -394,6 +420,96 @@ def _estimate_qq_safety(
 
 
 # ── 视频解析 handler ──
+
+async def _handle_extract_subtitle(
+    args: dict[str, Any], context: dict[str, Any]
+) -> ToolCallResult:
+    """取视频字幕文本。
+
+    提取链路本来就存在（`_inspect_platform_video_metadata` 返回 subtitle_text /
+    subtitle_lang / subtitle_source），但此前只被 analyze_video 当作内部证据用，
+    agent 侧零出口 —— 字幕被抓出来、拼进证据、然后丢掉。实测「提取这个视频的字幕」
+    模型只能回「没拿到字幕」。这里把已有结果直接还给模型。
+    """
+
+    url = normalize_text(str(args.get("url", "")))
+    if not url:
+        return ToolCallResult(ok=False, error="missing url", display="需要视频链接")
+
+    tool_executor = context.get("tool_executor")
+    if not tool_executor:
+        return ToolCallResult(
+            ok=False, error="video_parser_unavailable", display="视频解析模块未初始化"
+        )
+
+    getter = getattr(tool_executor, "_inspect_platform_video_metadata_safe", None)
+    if not callable(getter):
+        getter = getattr(tool_executor, "_inspect_platform_video_metadata", None)
+    if not callable(getter):
+        return ToolCallResult(
+            ok=False, error="subtitle_extractor_unavailable", display="字幕提取链路不可用"
+        )
+
+    try:
+        info = await getter(url)
+    except Exception as exc:
+        _log.warning("extract_subtitle_error | url=%s | %s", url[:80], exc)
+        return ToolCallResult(ok=False, error=f"extract_subtitle_error: {exc}")
+
+    if not isinstance(info, dict) or not info:
+        return ToolCallResult(
+            ok=False,
+            error="metadata_unavailable",
+            display="没读到这个视频的元数据，可能平台不支持或链接失效",
+        )
+
+    subtitle_text = normalize_text(str(info.get("subtitle_text", "")))
+    if not subtitle_text:
+        title = normalize_text(str(info.get("title", "")))
+        return ToolCallResult(
+            ok=False,
+            error="no_subtitle_available",
+            display=(
+                f"这个视频没有可取的字幕轨{f'（{title}）' if title else ''}。"
+                "作者没上传字幕、平台也没生成自动字幕时会这样。"
+            ),
+            data={"title": title, "has_subtitle": False},
+        )
+
+    lang = normalize_text(str(info.get("subtitle_lang", "")))
+    # subtitle_source 实测是带签名的完整 timedtext URL（数百字符）。原样进 display
+    # 就是把一串签名 URL 发进群、还白烧 token。只保留域名当来源标签。
+    raw_source = normalize_text(str(info.get("subtitle_source", "")))
+    source = raw_source
+    if raw_source.startswith(("http://", "https://")):
+        try:
+            from urllib.parse import urlparse as _urlparse
+
+            source = normalize_text(_urlparse(raw_source).hostname or "") or "远端字幕轨"
+        except Exception:
+            source = "远端字幕轨"
+    try:
+        max_chars = int(args.get("max_chars") or 3000)
+    except (TypeError, ValueError):
+        max_chars = 3000
+    max_chars = max(200, min(12000, max_chars))
+    clipped = clip_text(subtitle_text, max_chars)
+
+    meta_bits = [f"语言 {lang}" if lang else "", f"来源 {source}" if source else ""]
+    header = "、".join([bit for bit in meta_bits if bit])
+    return ToolCallResult(
+        ok=True,
+        data={
+            "subtitle_text": clipped,
+            "subtitle_lang": lang,
+            "subtitle_source": source,
+            "title": normalize_text(str(info.get("title", ""))),
+            "total_chars": len(subtitle_text),
+            "truncated": len(subtitle_text) > len(clipped),
+        },
+        display=f"字幕（{header}）：\n{clipped}" if header else f"字幕：\n{clipped}",
+    )
+
 
 async def _handle_parse_video(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     """解析短视频链接，返回可发送的 video_url + 安全度评估。"""
