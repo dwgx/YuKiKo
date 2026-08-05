@@ -221,7 +221,12 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "tool_timeout_seconds_media": 45,
             "llm_step_timeout_seconds": 30,
             "llm_step_timeout_seconds_after_tool": 36,
-            "navigator_obvious_tool_timeout_seconds": 5,
+            # 0 = 关闭。见 core/agent.py:392 的注释：5 秒低于本项目 provider 的
+            # 物理延迟下限（实测最快 6.7s），开着等于每回合白烧 5 秒换一个更差的决策。
+            "navigator_obvious_tool_timeout_seconds": 0,
+            # core/agent.py:400 读它，此前只在模板里有、内置默认值缺失 ——
+            # 升级安装会拿到 False，与模板的 true 不一致。
+            "navigator_preflight_plain_text": True,
             "total_timeout_seconds": 0,
             "queue_timeout_margin_seconds": 8,
             "high_risk_control": {

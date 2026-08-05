@@ -388,12 +388,19 @@ class AgentLoop:
                 ),
             ),
         )
+        # 默认 0（关闭）。这个 cap 的作用是「分区已有明确证据时故意早超时，
+        # 落进小 prompt 重试」，前提是 LLM 能在 cap 内答完。实测本项目的 provider
+        # （skiapi）小 prompt 延迟 6.7 / 8.6 / 10.5 / 10.7 秒 —— 最快 6.7 秒，
+        # 原默认 5 秒低于物理下限，于是主调用 100% 超时（日志 68 次），
+        # 而它落进的那条小 prompt 重试自己也超时（41 次里 39 次失败，95%）。
+        # 净效果是每回合白烧 5 秒、再拿一个上下文更少的决策，比不做这个优化更慢更笨。
+        # 机制保留：provider 确实能快速响应时把它配成正数即可。
         try:
             navigator_obvious_tool_timeout = float(
-                agent_cfg.get("navigator_obvious_tool_timeout_seconds", 5.0)
+                agent_cfg.get("navigator_obvious_tool_timeout_seconds", 0.0)
             )
         except (TypeError, ValueError):
-            navigator_obvious_tool_timeout = 5.0
+            navigator_obvious_tool_timeout = 0.0
         self.navigator_obvious_tool_timeout_seconds = max(
             0.0, min(30.0, navigator_obvious_tool_timeout)
         )
