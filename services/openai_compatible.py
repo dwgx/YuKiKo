@@ -47,6 +47,12 @@ class OpenAICompatibleClient(BaseLLMClient):
         )
         self._http_client: httpx.AsyncClient | None = None
         self.supports_multimodal_messages = True
+        # 降级可观测性：记录「实际为上一次成功请求服务的模型」及其在候选链中的深度。
+        # depth=0 表示主模型，>0 表示已降级。上层（agent 循环）据此自适应收窄工具面，
+        # 否则弱模型会被要求输出它撑不住的大 schema tool_call，静默吐坏 JSON。
+        self._served_model: str = ""
+        self._served_depth: int = 0
+        self._served_at: float = 0.0
 
     def _get_client(self) -> httpx.AsyncClient:
         """获取或创建持久化 httpx 客户端 (连接池复用)。"""
@@ -87,7 +93,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         last_exc: Exception | None = None
         for index, candidate_model in enumerate(model_candidates):
             try:
-                return await self._chat_completion_with_model(
+                result = await self._chat_completion_with_model(
                     messages=messages,
                     response_format=response_format,
                     max_tokens=resolved_max_tokens,
@@ -95,6 +101,8 @@ class OpenAICompatibleClient(BaseLLMClient):
                     tools=tools,
                     tool_choice=tool_choice,
                 )
+                self._record_served_model(candidate_model, index, bool(tools))
+                return result
             except Exception as exc:
                 last_exc = exc
                 if index >= len(model_candidates) - 1 or not self._is_model_fallback_worthy(exc):
@@ -221,6 +229,42 @@ class OpenAICompatibleClient(BaseLLMClient):
                 seen.add(key)
                 result.append(text)
         return result
+
+    def _record_served_model(self, served: str, depth: int, with_tools: bool) -> None:
+        """记录实际服务的模型。depth>0 即已降级，需要让上层可见。
+
+        只在「降级状态发生变化」时打日志，避免每回合刷屏；但状态本身随时可查。
+        """
+        changed = served != self._served_model
+        self._served_model = served
+        self._served_depth = depth
+        self._served_at = time.monotonic()
+        if not changed:
+            return
+        if depth > 0:
+            _log.warning(
+                "model_degraded_serving | provider=%s | served=%s | depth=%d | with_tools=%s",
+                self.provider,
+                served,
+                depth,
+                with_tools,
+            )
+        else:
+            _log.info("model_primary_serving | provider=%s | served=%s", self.provider, served)
+
+    def served_model_state(self) -> dict[str, Any]:
+        """暴露当前实际服务的模型状态，供上层按模型能力自适应。
+
+        返回 depth=0 表示主模型；depth>0 表示正跑在 fallback 上，
+        上层应据此收窄工具面 / 简化 schema，而不是继续按主模型的规格发请求。
+        """
+        return {
+            "provider": self.provider,
+            "model": self._served_model or self.model,
+            "depth": self._served_depth,
+            "degraded": self._served_depth > 0,
+            "age_seconds": max(0.0, time.monotonic() - self._served_at) if self._served_at else -1.0,
+        }
 
     def _candidate_models(self, primary: str) -> list[str]:
         candidates = [primary, *self.fallback_models]

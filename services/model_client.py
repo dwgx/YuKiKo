@@ -437,6 +437,34 @@ class ModelClient:
         active = self._get_active_client()
         return bool(getattr(active, "supports_native_tools", False))
 
+    def served_model_state(self) -> dict[str, Any]:
+        """当前实际服务的模型状态（含是否已降级）。
+
+        provider 级 failover 与 model 级 fallback 是两条独立的降级链：
+        前者换 provider（``_active_provider``），后者在同一 provider 内换模型
+        （``fallback_models``）。二者都会让实际服务的模型偏离配置的主模型，
+        而调用方若不知情，就会继续按主模型的能力发送大 schema 工具集 ——
+        弱模型撑不住时表现为静默吐坏 JSON，而不是报错。
+
+        调用方应据此收窄工具面或简化 schema。返回 ``degraded=False`` 时按主模型规格即可。
+        """
+        active = self._get_active_client()
+        getter = getattr(active, "served_model_state", None)
+        if callable(getter):
+            state = dict(getter() or {})
+        else:
+            state = {
+                "provider": self._active_provider,
+                "model": str(getattr(active, "model", "") or self.model),
+                "depth": 0,
+                "degraded": False,
+                "age_seconds": -1.0,
+            }
+        # provider 已 failover 本身就是一种降级，即便该 provider 内部仍在用它的主模型。
+        state["provider_failover"] = self._active_provider != self._primary_provider
+        state["degraded"] = bool(state.get("degraded")) or state["provider_failover"]
+        return state
+
     def supports_vision_input(self, model: str | None = None) -> bool:
         """判断当前模型是否支持图片输入（自动启发式，可被配置覆盖）。"""
         active = self._get_active_client()
