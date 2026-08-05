@@ -609,6 +609,25 @@ class AgentLoop:
             return str(args or {})
 
     @staticmethod
+    def _rewrite_tool_call_arguments(
+        tool_call: dict[str, Any], args: dict[str, Any]
+    ) -> None:
+        """用解码后的参数覆盖 tool_call 里的原始 arguments 串。
+
+        `assistant_msg` 会被原样追加进 messages 回送 provider，所以历史里必须是
+        合法 JSON。否则下一轮 provider 解析自己吐出的畸形串得到空参数，模型看到
+        「上一轮我没带参数」，就会重复调用同一个工具直到重复守卫熔断。
+        """
+
+        func = tool_call.get("function")
+        if not isinstance(func, dict):
+            return
+        try:
+            func["arguments"] = json.dumps(args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            func["arguments"] = "{}"
+
+    @staticmethod
     def _decode_tool_call_arguments(
         raw: Any,
         *,
@@ -1257,6 +1276,12 @@ class AgentLoop:
                                 trace_id=ctx.trace_id,
                                 step_idx=step_idx,
                             )
+                            # 把修正后的参数写回 assistant_msg —— 它会原样追加进
+                            # messages 送回 provider。留着畸形串（实测 skiapi 返回
+                            # `{}{"url": ...}`）会让下一轮解析成空参数，模型于是认为
+                            # 「我上一轮没带参数」并重复调用同一工具，直到熔断。
+                            # 实测：畸形串 → 模型重复调 parse_video；修正后 → final_answer。
+                            self._rewrite_tool_call_arguments(tc, args)
                             parsed = {
                                 "tool": func.get("name"),
                                 "args": args,
@@ -2248,7 +2273,48 @@ class AgentLoop:
             return None
         if tool_name in {"think", "final_answer", NAVIGATE_SECTION_TOOL}:
             return None
+
+        # 必填参数校验：这次调用的参数是超时兜底那个小 prompt 合成的，不是模型在
+        # 完整上下文里给的。缺必填字段就丢掉这次调用，只保留分区切换 —— 让模型自己
+        # 在目标分区里重新调，它有完整 schema，比小 prompt 猜得准。
+        # 实测：`知乎上搜一下 rust 值不值得学` 合成出 {"query": ...} 漏了 mode，
+        # 工具直接报 invalid_args，白烧一步预算。
+        missing = self._missing_required_args_from_schema(tool_name, tool_args)
+        if missing:
+            _log.info(
+                "navigator_pending_tool_retry_missing_args | trace=%s | tool=%s | missing=%s",
+                ctx.trace_id,
+                tool_name,
+                ",".join(missing),
+            )
+            return None
+
         return tool_name, dict(tool_args)
+
+    def _missing_required_args_from_schema(
+        self, tool_name: str, args: dict[str, Any]
+    ) -> list[str]:
+        """按注册表里的 ToolSchema 校验必填参数。
+
+        与 `_missing_required_tool_args` 的硬编码白名单不同，这里读的是工具自己
+        声明的 `parameters.required`，所以新增工具自动受益，不需要同步两处。
+        """
+
+        getter = getattr(self.tool_registry, "get_schema", None)
+        if not callable(getter):
+            return []
+        schema = getter(tool_name)
+        params = getattr(schema, "parameters", None)
+        if not isinstance(params, dict):
+            return []
+        required = params.get("required")
+        if not isinstance(required, list):
+            return []
+        return [
+            str(name)
+            for name in required
+            if not normalize_text(str(args.get(str(name), "") or ""))
+        ]
 
     async def _navigator_timeout_tool_retry(
         self,
