@@ -110,11 +110,16 @@ class ScrapyLLM:
         timeout: float = 30.0,
         max_text_len: int = 10000,
         llm_max_tokens: int = 2000,
+        verify_tls: bool = True,
     ):
         self.model_client = model_client
         self.timeout = timeout
         self.max_text_len = max_text_len
         self.llm_max_tokens = llm_max_tokens
+        # 默认开 TLS 校验。原实现硬编码 verify=False，抓回来的内容会被 LLM
+        # 摘要进群，等于给中间人一条注入通道。留开关是为了自签证书站点，
+        # 关掉时会留 WARNING。
+        self._verify_tls = bool(verify_tls)
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -122,10 +127,78 @@ class ScrapyLLM:
             self._client = httpx.AsyncClient(
                 headers=_DEFAULT_HEADERS,
                 timeout=httpx.Timeout(self.timeout),
-                follow_redirects=True,
-                verify=False,
+                # 手动跟跳转：每一跳都要过 SSRF 校验。
+                # follow_redirects=True 时 httpx 在内部跟完，一个指向
+                # 169.254.169.254 的跳转会在我们有机会检查之前就已经发出去了。
+                follow_redirects=False,
+                # TLS 校验默认开。原来是 verify=False —— 抓回来的网页会被 LLM
+                # 摘要进群，关掉校验等于任何网络中间人都能替换那段内容。
+                # 需要抓自签证书站点的部署可以显式关掉，但会留一条 WARNING。
+                verify=self._verify_tls,
             )
+            if not self._verify_tls:
+                _log.warning(
+                    "scrapy_tls_verification_disabled | 抓取内容可被中间人替换，"
+                    "而它会被 LLM 摘要进群"
+                )
         return self._client
+
+    @staticmethod
+    def _reject_internal_target(url: str) -> str:
+        """指向内网/环回/链路本地时返回拒绝原因，否则返回空串。
+
+        复用 `core/webui_chat_helpers.py::_is_private_ip` —— 那个实现已经在
+        webui 路径上用着（`core/webui.py:2955`），会解析 DNS 后检查
+        private/loopback/link-local/reserved，且解析失败按拒绝处理。
+        `link_local` 覆盖了 169.254.169.254 这个云元数据端点。
+
+        2026-08-06 两个独立 workflow 都报了这里：防护存在但**只接在 webui 上**，
+        四个 scrape_* 工具和 fetch_webpage 都没接 —— 和出站过滤那次同一类
+        guard bypass（同一个 sink 有多条路，只有一条设了防护）。
+        """
+
+        # 局部 import 避免 utils -> core 的模块级依赖（utils 是被 core 依赖的下层）。
+        from core.webui_chat_helpers import _is_private_ip
+
+        try:
+            hostname = urlparse(url).hostname or ""
+        except Exception:
+            return "url_unparseable"
+        if not hostname:
+            return "url_without_host"
+        if _is_private_ip(hostname):
+            return f"internal_target:{hostname}"
+        return ""
+
+    async def _get_following_redirects(
+        self, client: httpx.AsyncClient, url: str, *, max_hops: int = 5
+    ) -> httpx.Response | None:
+        """逐跳跟随跳转，每一跳都先过 SSRF 校验。None = 被拦。
+
+        必须自己跟跳转：交给 httpx 的 follow_redirects 时，指向内网的那一跳
+        在我们能检查之前就已经发出去了，而对云元数据端点来说**请求本身就是危害**。
+        """
+
+        current = url
+        for hop in range(max_hops):
+            reason = self._reject_internal_target(current)
+            if reason:
+                _log.warning(
+                    "scrapy_blocked_internal_target | hop=%d | reason=%s | url=%s",
+                    hop,
+                    reason,
+                    current[:120],
+                )
+                return None
+            resp = await client.get(current)
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                return resp
+            location = resp.headers.get("location", "")
+            if not location:
+                return resp
+            current = str(httpx.URL(current).join(location))
+        _log.warning("scrapy_too_many_redirects | url=%s", url[:120])
+        return None
 
     async def close(self) -> None:
         if self._client and not self._client.is_closed:
@@ -137,7 +210,11 @@ class ScrapyLLM:
         """抓取单个网页，返回清洗后的纯文本。"""
         try:
             client = await self._get_client()
-            resp = await client.get(url)
+            resp = await self._get_following_redirects(client, url)
+            if resp is None:
+                return ScrapeResult(
+                    url=url, ok=False, error="blocked_internal_target"
+                )
             html = resp.text
             title = ""
             title_m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)

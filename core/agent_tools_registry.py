@@ -83,6 +83,22 @@ class AgentToolRegistry:
         "delete_group_file",
         "create_group_file_folder",
         "del_group_notice",
+        # 以下六个 2026-08-06 补入。子 agent 扫描发现它们是**状态变更类工具却没有
+        # 任何权限门**，而更弱的同族（delete_group_file / create_group_file_folder）
+        # 早就有门 —— 这种不对称是清单手维护的必然结果。
+        #
+        # delete_group_folder  : 描述自己写着「需要管理员权限」，registry 从不执行
+        # set_group_add_request: 批准入群申请 —— 普通成员能靠它把任何人放进群
+        # set_friend_add_request: 接受/拒绝好友申请，而 delete_friend 是 super_admin
+        # set_qq_profile       : 改机器人自己的资料（身份）
+        # upload_group_file / upload_private_file: 即使加了路径白名单，
+        #                        往群里/私聊塞文件也该是管理操作
+        "delete_group_folder",
+        "set_group_add_request",
+        "set_friend_add_request",
+        "set_qq_profile",
+        "upload_group_file",
+        "upload_private_file",
     }
 
     # 向后兼容: 合并集合

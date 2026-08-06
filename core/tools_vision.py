@@ -40,6 +40,65 @@ _ANIMATED_SEGMENT_MARKERS = (
     "gif",
 )
 
+# 下载失败原因中「把 URL 直接甩给外部 vision API 也一定失败」的那几个。
+# 依据：QQ CDN（gchat.qpic.cn / multimedia.nt.qq.com.cn）实测有**两种**失效形态，
+# 都是 HTTP 400，换任何客户端、任何 IP、任何 header 都是同一个响应：
+#   {"retcode":-5503007,"retmsg":"download url has expired"}   —— rkey 过期
+#   {"retcode":-5503022,"retmsg":"appid is not supported"}     —— 2026-08-05 curl 实测
+# 两者都归进 http_400（前者另有更精确的 url_expired），所以回退直传纯属把失败往后挪。
+# 403 / 429 / 5xx / 超时不在此列：那些可能只是本机被挡，外部 API 仍有机会。
+#
+# 顺带记一条实测事实，避免下一个窗口重复排查：这条死路并不是「图片识别失败」的主因。
+# 61 次 vision_analyze_start 里图片解析成功 59 次 —— 直连 CDN 失败后会回退
+# NapCat 的 get_image（日志 source=onebot_get_image，45 次全部成功）。
+# analyze_image 真正的 20 次失败里 14 次是 tool_timeout_seconds_media（45s）超时，
+# 只有 4 次是真的拿不到图。要提识别成功率，先看那个超时，不是看这里。
+_FATAL_DOWNLOAD_REASONS = frozenset(
+    {
+        "ssrf_blocked",
+        "http_400",
+        "http_404",
+        "http_410",
+        "url_expired",
+    }
+)
+
+# 非 200 响应体里截取多少字符进日志。QQ CDN 的错误 JSON 只有 70 字节，够用；
+# 上限存在是因为响应体可能是整页 HTML。
+_DOWNLOAD_ERROR_BODY_CLIP = 200
+
+# ---------------------------------------------------------------------------
+# 「模型原生看图」用的 image_url 块 —— 代码侧兜底默认值。
+#
+# 这三个值同名键要落到 config.search.vision 下（见 build_native_vision_blocks
+# 的 docstring）；这里的常量只是配置缺失时的兜底，两边必须同值。
+#
+# 张数上限 4：一次对话里同时要看的图很少超过 4 张，且直接决定请求体大小。
+# 单图上限 512 KiB：不是拍的，是从 storage/logs/yukiko.log 里 92 条
+# `vision_image_ref | bytes=N` 实测分布算出来的 ——
+#   min 9174 / median 42543 / mean 123925 / p90 396875 / max 986302 字节
+#   256 KiB 覆盖 76/92 (83%)、512 KiB 覆盖 90/92 (98%)、1 MiB 覆盖 92/92
+# 512 KiB 是「几乎不漏图」和「请求体不爆」的折中：4 张 × 512 KiB 的 base64
+# 约 2.8 MB 请求体，还在多数中转站的 body 上限内；1 MiB 会到 5.6 MB。
+#
+# token 量级（算法：base64 长度 = ceil(bytes/3)*4，BPE 对 base64 这种
+# 无空格随机串大致 4 字符 1 token，所以 token ≈ base64_len/4 ≈ bytes/3）：
+#   median 42 KB 图 → b64 56724 字符 → ~14181 token
+#   p90   387 KB 图 → b64 529168 字符 → ~132292 token
+#   512 KiB 封顶图  → b64 682 KB     → ~174763 token
+# 这是**上界**，只在中转站把 data URI 当纯文本 token 化时才成立。正常 vision
+# API（OpenAI/Anthropic）会解码图片按图块计费，单图约 1.1k~1.6k token。
+# 差三个数量级，所以这个上界必须当成「中转站行为未知时的风险敞口」来看，
+# 而不是账单预测 —— 这也正是张数和单图字节都要有硬上限的原因。
+_NATIVE_VISION_BLOCKS_ENABLE_DEFAULT = True
+_NATIVE_VISION_MAX_IMAGES_DEFAULT = 4
+_NATIVE_VISION_MAX_IMAGE_BYTES_DEFAULT = 512 * 1024
+
+# 张数与单图字节的夹取区间，防止配置里写出 0 张或 200 MB 这种值。
+_NATIVE_VISION_MAX_IMAGES_CEILING = 8
+_NATIVE_VISION_MIN_IMAGE_BYTES_FLOOR = 64 * 1024
+_NATIVE_VISION_MAX_IMAGE_BYTES_CEILING = 4 * 1024 * 1024
+
 
 class ToolVisionMixin:
     """Mixin — 从 tools.py ToolExecutor 拆分。"""
@@ -836,14 +895,38 @@ class ToolVisionMixin:
         allow_gif_keyframes: bool = True,
     ) -> str:
         if not data:
+            _tool_log.warning(
+                "vision_image_encode_reject%s | source=%s | reason=empty_bytes",
+                _tool_trace_tag(),
+                source,
+            )
             return ""
         if (
             len(data) < self._vision_min_image_bytes
             or len(data) > self._vision_max_image_bytes
         ):
+            # 注意：调用方的 small_image_warning 写着「继续处理」，但这里仍会拒 ——
+            # 该矛盾此前完全静默，只有把它记下来才看得见。
+            _tool_log.warning(
+                "vision_image_encode_reject%s | source=%s | reason=size_out_of_range | bytes=%d | min=%d | max=%d",
+                _tool_trace_tag(),
+                source,
+                len(data),
+                self._vision_min_image_bytes,
+                self._vision_max_image_bytes,
+            )
             return ""
         head = data[:16]
         if not _is_known_image_signature(head):
+            # CDN 用 HTTP 200 返回 JSON/HTML 错误页时就落在这里。
+            _tool_log.warning(
+                "vision_image_encode_reject%s | source=%s | reason=not_image_signature | bytes=%d | mime=%s | head=%s",
+                _tool_trace_tag(),
+                source,
+                len(data),
+                clip_text(mime, 40) or "-",
+                head.hex(),
+            )
             return ""
         mime_norm = normalize_text(mime).lower()
         if not mime_norm.startswith("image/"):
@@ -1017,6 +1100,16 @@ class ToolVisionMixin:
                     data = local_path.read_bytes()
                 except Exception:
                     continue
+                # 同 _prepare_vision_image_ref：这条路径也没有包含性检查，
+                # 必须靠内容判定挡住非图片文件。见那里的完整说明。
+                if not _is_known_image_signature(data[:16]):
+                    _tool_log.warning(
+                        "vision_image_ref%s | source=onebot_local_file | "
+                        "rejected_not_an_image | path=%s",
+                        _tool_trace_tag(),
+                        clip_text(str(local_path), 120),
+                    )
+                    continue
                 mime = mimetypes.guess_type(str(local_path))[0] or "image/png"
                 data_uri = self._to_data_uri_from_image_bytes(
                     data,
@@ -1084,7 +1177,9 @@ class ToolVisionMixin:
             if not self._is_safe_public_http_url(value):
                 return ""
             # QQ CDN 等内网图片外部 API 无法访问，统一下载转 base64
-            downloaded = await self._download_image_as_data_uri(value)
+            downloaded, fail_reason = await self._download_image_as_data_uri_detailed(
+                value
+            )
             if downloaded:
                 _tool_log.info(
                     "vision_image_ref%s | source=http_url | converted=data_uri",
@@ -1094,15 +1189,27 @@ class ToolVisionMixin:
             provider_hint = self._resolve_vision_provider_hint()
             if provider_hint in {"anthropic", "gemini", "skiapi"}:
                 _tool_log.warning(
-                    "vision_image_ref_empty%s | source=http_url | reason=download_failed_for_provider_%s",
+                    "vision_image_ref_empty%s | source=http_url | reason=download_failed_for_provider_%s | cause=%s",
                     _tool_trace_tag(),
                     provider_hint,
+                    fail_reason or "unknown",
+                )
+                return ""
+            if fail_reason in _FATAL_DOWNLOAD_REASONS:
+                # 链接本身已经死了（实测 QQ CDN 失效 rkey → 400 url_expired）。
+                # 回退直传只是让外部 API 去撞同一面墙，还会把「拿不到图」伪装成
+                # 「模型看不懂图」。返回空，让调用方走 OneBot get_image 那条能走通的路。
+                _tool_log.warning(
+                    "vision_image_ref_empty%s | source=http_url | reason=%s | direct_url_fallback=skipped",
+                    _tool_trace_tag(),
+                    fail_reason,
                 )
                 return ""
             # 下载失败则回退直传 URL（公网图片 API 可能能访问）
             _tool_log.info(
-                "vision_image_ref%s | source=http_url | converted=direct_url",
+                "vision_image_ref%s | source=http_url | converted=direct_url | cause=%s",
                 _tool_trace_tag(),
+                fail_reason or "unknown",
             )
             return value
         if value.startswith("file://"):
@@ -1131,6 +1238,26 @@ class ToolVisionMixin:
             return ""
         if not data:
             return ""
+        # 必须真的是图片，不能只是「扩展名像图片」。
+        #
+        # 这里的 path 来自模型给的 `url` 参数（analyze_image 的 schema 里它是
+        # 无格式约束的自由字符串），而上面对路径**没有任何包含性检查**：
+        # 相对路径 `../../../etc/hosts` 会解析到项目外，绝对路径 `/etc/hosts`
+        # 更是原样使用。实测两者都能落到这里，然后被 base64 发给第三方 vision API
+        # —— 等于把任意进程可读文件外传。2026-08-06 两个独立 workflow 都报了这里。
+        #
+        # 不用目录白名单是因为合法路径本来就在项目外：NapCat 的本地文件在
+        # QQ 容器里（实测 /Users/<u>/Library/Containers/com.tencent.qq/Data/tmp/...），
+        # 按目录拦会打断 analyze_image（线上第二热的工具，288 次调用）。
+        # 改判「内容是不是图片」既堵掉文本类机密（passwd / .env / id_rsa / config.yml
+        # 都没有图片 magic bytes），又不挑目录。
+        if not _is_known_image_signature(data[:16]):
+            _tool_log.warning(
+                "vision_image_ref%s | source=local_file | rejected_not_an_image | path=%s",
+                _tool_trace_tag(),
+                clip_text(str(path), 120),
+            )
+            return ""
         if len(data) < self._vision_min_image_bytes:
             _tool_log.warning(
                 "vision_image_ref%s | source=local_file | small_image_warning | bytes=%d | will_try_anyway",
@@ -1147,6 +1274,333 @@ class ToolVisionMixin:
             source="local_file",
         )
 
+    @staticmethod
+    def _native_vision_segment_candidates(
+        seg: dict[str, Any]
+    ) -> tuple[str, list[tuple[str, str]]]:
+        """把一个 OneBot image 段拆成 `(去重键, [(取法, 值), ...])`。
+
+        取法顺序就是成功率顺序，实测（storage/logs/yukiko.log）：
+        `source=onebot_local_file` 61/61 成功、`source=onebot_get_image` 45/45 成功、
+        `source=http_url` 直连 QQ CDN 50/50 **全败**。所以 URL 排最后 ——
+        它不是主路，只是给「用户贴的外站公网图链」留的口子。
+        """
+
+        if not isinstance(seg, dict):
+            return "", []
+        if normalize_text(str(seg.get("type", ""))).lower() != "image":
+            return "", []
+        data = seg.get("data")
+        if not isinstance(data, dict):
+            return "", []
+
+        memory_data_uri = normalize_text(str(data.get("memory_data_uri", "")))
+        file_field = normalize_text(
+            str(data.get("file", "") or data.get("file_id", ""))
+        )
+        path_field = normalize_text(str(data.get("path", "")))
+        url_field = normalize_text(str(data.get("url", "")))
+
+        def _looks_like_path(value: str) -> bool:
+            return bool(
+                value.startswith(("file://", "/"))
+                or re.match(r"^[A-Za-z]:[\\/]", value)
+            )
+
+        candidates: list[tuple[str, str]] = []
+        if memory_data_uri.startswith("data:image"):
+            candidates.append(("memory_data_uri", memory_data_uri))
+        for value in (path_field, file_field):
+            if value and _looks_like_path(value):
+                candidates.append(("local_file", value))
+        if file_field and not _looks_like_path(file_field):
+            candidates.append(("onebot_get_image", file_field))
+        if url_field:
+            candidates.append(("http_url", url_field))
+
+        dedup_key = file_field or url_field or path_field or memory_data_uri[:96]
+        return dedup_key, candidates
+
+    async def _native_vision_data_uri_for_segment(
+        self,
+        seg: dict[str, Any],
+        api_call: Any,
+        max_bytes: int,
+    ) -> tuple[str, str]:
+        """把一个 image 段转成 data URI，返回 `(data_uri, reason)`。
+
+        失败时 data_uri 为空、reason 说明卡在哪一步；成功时 reason 是命中的取法
+        （`memory_data_uri` / `local_file` / `onebot_get_image` / `http_url`）。
+        """
+
+        _, candidates = self._native_vision_segment_candidates(seg)
+        if not candidates:
+            return "", "no_usable_field"
+
+        attempts: list[str] = []
+        for kind, value in candidates:
+            if kind == "onebot_get_image":
+                if api_call is None:
+                    attempts.append(f"{kind}:no_api_call")
+                    continue
+                data_uri = await self._data_uri_from_onebot_image_file(
+                    image_file=value,
+                    api_call=api_call,
+                )
+            else:
+                data_uri = await self._prepare_vision_image_ref(value)
+
+            if not data_uri:
+                attempts.append(f"{kind}:empty")
+                continue
+            if not data_uri.startswith("data:image"):
+                # `_prepare_vision_image_ref` 在非致命下载失败时会回退直传原 URL。
+                # 原生看图这条路**不能**要那个回退：塞进 image_url 块的 QQ CDN 链接
+                # 外部 API 一定打不开（实测 HTTP 400 appid is not supported /
+                # download url has expired），只会让模型收到死链后瞎猜。
+                attempts.append(f"{kind}:not_data_uri")
+                _tool_log.warning(
+                    "native_vision_block_reject%s | source=%s | reason=direct_url_not_accepted | ref=%s",
+                    _tool_trace_tag(),
+                    kind,
+                    clip_text(data_uri, 100),
+                )
+                continue
+            payload_bytes = self._data_uri_payload_bytes(data_uri)
+            if payload_bytes > max_bytes:
+                # 超限的图不塞进上下文，但模型仍可以显式调 analyze_image ——
+                # 那条路自己有 6 MB 上限，不受这里的 512 KiB 约束。
+                attempts.append(f"{kind}:too_large")
+                _tool_log.warning(
+                    "native_vision_block_reject%s | source=%s | reason=too_large_for_native | bytes=%d | limit=%d",
+                    _tool_trace_tag(),
+                    kind,
+                    payload_bytes,
+                    max_bytes,
+                )
+                continue
+            return data_uri, kind
+
+        return "", "|".join(attempts) or "no_usable_field"
+
+    async def build_native_vision_blocks(
+        self,
+        raw_segments: list[dict[str, Any]] | None = None,
+        reply_media_segments: list[dict[str, Any]] | None = None,
+        api_call: Any = None,
+        max_images: int = 0,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """把消息里的图片段转成外部 vision API 真能吃的 image_url 块列表。
+
+        调用方（agent 侧）约定：
+
+        ```python
+        blocks, reason = await ctx.tool_executor.build_native_vision_blocks(
+            raw_segments=ctx.raw_segments,
+            reply_media_segments=ctx.reply_media_segments,
+            api_call=ctx.api_call,          # async fn(action, **kwargs)，用于 get_image
+        )
+        if blocks:
+            content = [{"type": "text", "text": text_content}, *blocks]
+        else:
+            content = text_content          # reason 已在本方法内打过日志
+        ```
+
+        - 返回 `(blocks, reason)`。`blocks` 里每项形如
+          `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`,
+          **url 一定是 data URI，绝不会是 http 链接**。
+        - 成功时 `reason` 为 `""`；`blocks` 为空时 `reason` 是原因码：
+          `vision_disabled` / `native_blocks_disabled` / `no_image_segments` /
+          `all_conversions_failed`。空列表时调用方退回纯文本即可，不要自己拼 URL。
+        - `api_call` 可为 None（私聊/无 NapCat 场景），此时 `onebot_get_image`
+          这一取法跳过，其余取法照走。
+
+        配置键（`config.search.vision` 下，代码侧有同值兜底）：
+        `native_blocks_enable` / `native_max_images` / `native_max_image_bytes`。
+        """
+
+        if not self._vision_enable:
+            _tool_log.info(
+                "native_vision_blocks_skip%s | reason=vision_disabled", _tool_trace_tag()
+            )
+            return [], "vision_disabled"
+        enabled, cfg_max_images, max_bytes = self._native_vision_limits()
+        if not enabled:
+            _tool_log.info(
+                "native_vision_blocks_skip%s | reason=native_blocks_disabled",
+                _tool_trace_tag(),
+            )
+            return [], "native_blocks_disabled"
+
+        limit = cfg_max_images
+        if max_images > 0:
+            limit = max(1, min(cfg_max_images, max_images))
+
+        segments: list[dict[str, Any]] = []
+        for group in (raw_segments or [], reply_media_segments or []):
+            for seg in group:
+                if not isinstance(seg, dict):
+                    continue
+                if normalize_text(str(seg.get("type", ""))).lower() == "image":
+                    segments.append(seg)
+        if not segments:
+            return [], "no_image_segments"
+
+        blocks: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        seen_data_uris: set[str] = set()
+        skipped = 0
+        for seg in segments:
+            if len(blocks) >= limit:
+                # 达到上限就停，剩下的不下载 —— 省的是网络往返，不只是 token。
+                _tool_log.info(
+                    "native_vision_blocks_truncated%s | kept=%d | segments=%d | max_images=%d",
+                    _tool_trace_tag(),
+                    len(blocks),
+                    len(segments),
+                    limit,
+                )
+                break
+            dedup_key, _ = self._native_vision_segment_candidates(seg)
+            if dedup_key and dedup_key in seen_keys:
+                continue
+            if dedup_key:
+                seen_keys.add(dedup_key)
+
+            data_uri, reason = await self._native_vision_data_uri_for_segment(
+                seg=seg,
+                api_call=api_call,
+                max_bytes=max_bytes,
+            )
+            if not data_uri:
+                skipped += 1
+                _tool_log.warning(
+                    "native_vision_block_failed%s | key=%s | attempts=%s",
+                    _tool_trace_tag(),
+                    clip_text(dedup_key, 80) or "-",
+                    reason,
+                )
+                continue
+            if data_uri in seen_data_uris:
+                # 同一张图在原消息和被引用消息里各出现一次是常态，
+                # dedup_key 不同但内容相同，这里再兜一层。
+                continue
+            seen_data_uris.add(data_uri)
+            blocks.append({"type": "image_url", "image_url": {"url": data_uri}})
+            _tool_log.info(
+                "native_vision_block_ok%s | source=%s | bytes=%d",
+                _tool_trace_tag(),
+                reason,
+                self._data_uri_payload_bytes(data_uri),
+            )
+
+        if not blocks:
+            _tool_log.warning(
+                "native_vision_blocks_empty%s | segments=%d | skipped=%d | reason=all_conversions_failed",
+                _tool_trace_tag(),
+                len(segments),
+                skipped,
+            )
+            return [], "all_conversions_failed"
+
+        _tool_log.info(
+            "native_vision_blocks_ready%s | blocks=%d | segments=%d | skipped=%d | est_tokens=%d | max_images=%d | max_image_bytes=%d",
+            _tool_trace_tag(),
+            len(blocks),
+            len(segments),
+            skipped,
+            self.estimate_native_vision_tokens(blocks),
+            limit,
+            max_bytes,
+        )
+        return blocks, ""
+
+    def _native_vision_limits(self) -> tuple[bool, int, int]:
+        """读 `config.search.vision` 下的原生看图三个键，返回 `(启用, 张数, 单图字节)`。
+
+        不在 `ToolExecutor.__init__` 里读是有意的：那份 `__init__` 不在本车道，
+        而这里每次调用读一遍 `self._raw_config` 的成本可以忽略，还顺带让
+        `/yukibot` 热加载后的新值立即生效（`reload_config` 会重建 tools）。
+        """
+
+        raw_cfg = getattr(self, "_raw_config", None)
+        if not isinstance(raw_cfg, dict):
+            raw_cfg = {}
+        search_cfg = raw_cfg.get("search")
+        if not isinstance(search_cfg, dict):
+            search_cfg = {}
+        vision_cfg = search_cfg.get("vision", raw_cfg.get("vision", {}))
+        if not isinstance(vision_cfg, dict):
+            vision_cfg = {}
+
+        enabled = bool(
+            vision_cfg.get(
+                "native_blocks_enable", _NATIVE_VISION_BLOCKS_ENABLE_DEFAULT
+            )
+        )
+        try:
+            max_images = int(
+                vision_cfg.get("native_max_images", _NATIVE_VISION_MAX_IMAGES_DEFAULT)
+            )
+        except (TypeError, ValueError):
+            max_images = _NATIVE_VISION_MAX_IMAGES_DEFAULT
+        max_images = max(1, min(_NATIVE_VISION_MAX_IMAGES_CEILING, max_images))
+        try:
+            max_bytes = int(
+                vision_cfg.get(
+                    "native_max_image_bytes", _NATIVE_VISION_MAX_IMAGE_BYTES_DEFAULT
+                )
+            )
+        except (TypeError, ValueError):
+            max_bytes = _NATIVE_VISION_MAX_IMAGE_BYTES_DEFAULT
+        max_bytes = max(
+            _NATIVE_VISION_MIN_IMAGE_BYTES_FLOOR,
+            min(_NATIVE_VISION_MAX_IMAGE_BYTES_CEILING, max_bytes),
+        )
+        return enabled, max_images, max_bytes
+
+    @staticmethod
+    def _data_uri_payload_bytes(data_uri: str) -> int:
+        """从 data URI 反推解码后的字节数，不真的解码。
+
+        base64 每 4 字符还原 3 字节，末尾 `=` 各占位 1 字节，所以
+        `(len - padding) * 3 // 4` 就是精确值。用它是为了避免为了量个大小
+        再 b64decode 一份几百 KB 的 bytes。
+        """
+
+        _, b64 = ToolVisionMixin._decode_data_image_ref(data_uri)
+        if not b64:
+            return 0
+        padding = len(b64) - len(b64.rstrip("="))
+        return max(0, (len(b64) * 3) // 4 - padding)
+
+    @staticmethod
+    def estimate_native_vision_tokens(blocks: list[dict[str, Any]]) -> int:
+        """估算一组 image_url 块**按纯文本 token 化**时的 token 数（上界）。
+
+        算法：token ≈ base64 字符数 / 4。依据是 BPE 对 base64 这种无空格
+        随机串大致 4 字符合成 1 token。这是**风险上界**，不是账单预测 ——
+        正常 vision API 会解码图片按图块计费（单图约 1.1k~1.6k token），
+        只有中转站把 data URI 当普通文本转发时才会真的按这个量级计。
+
+        实测量级（storage/logs/yukiko.log 92 张真实 QQ 图）：
+        median 42 KB → ~14k token；p90 387 KB → ~132k token；
+        512 KiB 封顶 → ~175k token。所以张数上限不是洁癖，是必需品。
+        """
+
+        total = 0
+        for block in blocks or []:
+            if not isinstance(block, dict):
+                continue
+            image_url = block.get("image_url")
+            if not isinstance(image_url, dict):
+                continue
+            _, b64 = ToolVisionMixin._decode_data_image_ref(
+                normalize_text(str(image_url.get("url", "")))
+            )
+            total += len(b64) // 4
+        return total
+
     def _resolve_vision_provider_hint(self) -> str:
         provider_hint = normalize_text(self._vision_provider).lower()
         if provider_hint:
@@ -1156,10 +1610,41 @@ class ToolVisionMixin:
             return ""
         return normalize_text(str(getattr(model_client, "provider", ""))).lower()
 
-    async def _download_image_as_data_uri(self, url: str) -> str:
-        """下载远程图片并转为 data URI（base64），用于 vision API。"""
+    @staticmethod
+    def _classify_download_error_body(status_code: int, body: bytes) -> str:
+        """把非 200 响应归类成一个稳定的 reason 串。
+
+        QQ CDN 的失效链接是 HTTP 400 + retcode -5503007，单独给一个
+        `url_expired` 而不是笼统的 `http_400` —— 这是目前唯一已实测的失效形态，
+        日志里必须一眼能认出来，否则又要重新做一遍抓包才知道图为什么没识别。
+        """
+
+        snippet = ""
+        try:
+            snippet = body[:_DOWNLOAD_ERROR_BODY_CLIP].decode("utf-8", "replace").lower()
+        except Exception:  # pragma: no cover - decode 已经带 errors="replace"
+            snippet = ""
+        if "download url has expired" in snippet or "-5503007" in snippet:
+            return "url_expired"
+        return f"http_{int(status_code)}"
+
+    async def _download_image_as_data_uri_detailed(self, url: str) -> tuple[str, str]:
+        """下载远程图片并转为 data URI，返回 `(data_uri, reason)`。
+
+        失败时 data_uri 为空、reason 说明原因；成功时 reason 为空。
+        每条失败路径都必须留一条 WARNING —— 之前四条 `return ""` 全部静默，
+        线上只能看到最外层的 `vision_image_ref_empty`，根本无法区分是被 SSRF
+        护栏拦了、CDN 返回了 4xx、响应体为空，还是图片超限。
+        """
+
+        clipped = clip_text(url, 100)
         if not self._is_safe_public_http_url(url):
-            return ""
+            _tool_log.warning(
+                "vision_image_download_fail%s | reason=ssrf_blocked | url=%s",
+                _tool_trace_tag(),
+                clipped,
+            )
+            return "", "ssrf_blocked"
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(15.0, connect=8.0),
@@ -1167,11 +1652,32 @@ class ToolVisionMixin:
                 headers={"User-Agent": "Mozilla/5.0"},
             ) as client:
                 resp = await client.get(url)
-            if resp.status_code != 200:
-                return ""
+            content_type = str(resp.headers.get("content-type", "")).lower()
             data = resp.content
+            if resp.status_code != 200:
+                reason = self._classify_download_error_body(resp.status_code, data)
+                _tool_log.warning(
+                    "vision_image_download_fail%s | reason=%s | status=%d | ctype=%s | body=%s | url=%s",
+                    _tool_trace_tag(),
+                    reason,
+                    resp.status_code,
+                    content_type or "-",
+                    clip_text(
+                        data[:_DOWNLOAD_ERROR_BODY_CLIP].decode("utf-8", "replace"),
+                        _DOWNLOAD_ERROR_BODY_CLIP,
+                    )
+                    or "-",
+                    clipped,
+                )
+                return "", reason
             if not data:
-                return ""
+                _tool_log.warning(
+                    "vision_image_download_fail%s | reason=empty_body | status=200 | ctype=%s | url=%s",
+                    _tool_trace_tag(),
+                    content_type or "-",
+                    clipped,
+                )
+                return "", "empty_body"
             if len(data) < self._vision_min_image_bytes:
                 _tool_log.warning(
                     "vision_image_ref%s | source=http_url | small_image_warning | bytes=%d | will_try_anyway",
@@ -1180,19 +1686,48 @@ class ToolVisionMixin:
                 )
                 # 不要拒绝小图片，继续处理
             if len(data) > self._vision_max_image_bytes:
-                return ""
-            content_type = str(resp.headers.get("content-type", "")).lower()
+                _tool_log.warning(
+                    "vision_image_download_fail%s | reason=too_large | bytes=%d | limit=%d | ctype=%s | url=%s",
+                    _tool_trace_tag(),
+                    len(data),
+                    self._vision_max_image_bytes,
+                    content_type or "-",
+                    clipped,
+                )
+                return "", "too_large"
             if "image/" in content_type:
                 mime = content_type.split(";")[0].strip()
             else:
                 mime = "image/png"
-            return self._to_data_uri_from_image_bytes(
+            data_uri = self._to_data_uri_from_image_bytes(
                 data,
                 mime=mime,
                 source="http_url_download",
             )
-        except Exception:
-            return ""
+            if not data_uri:
+                _tool_log.warning(
+                    "vision_image_download_fail%s | reason=encode_rejected | bytes=%d | ctype=%s | url=%s",
+                    _tool_trace_tag(),
+                    len(data),
+                    content_type or "-",
+                    clipped,
+                )
+                return "", "encode_rejected"
+            return data_uri, ""
+        except Exception as exc:
+            _tool_log.warning(
+                "vision_image_download_fail%s | reason=exception | exc=%s | err=%s | url=%s",
+                _tool_trace_tag(),
+                type(exc).__name__,
+                clip_text(str(exc), 160) or "-",
+                clipped,
+            )
+            return "", f"exception_{type(exc).__name__}"
+
+    async def _download_image_as_data_uri(self, url: str) -> str:
+        """下载远程图片并转为 data URI（base64），用于 vision API。"""
+        data_uri, _reason = await self._download_image_as_data_uri_detailed(url)
+        return data_uri
 
     async def _vision_describe(self, image_ref: str, prompt: str) -> str:
         model_client = getattr(self.image_engine, "model_client", None)

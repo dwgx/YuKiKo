@@ -711,12 +711,65 @@ def _build_onebot_message_segments(
     return segments
 
 
+def sanitize_outbound_text(text: str, context: dict[str, Any]) -> str:
+    """出站文本的敏感词过滤卡点。**所有直发文字的工具都必须过这里。**
+
+    为什么需要它：`final_answer` 的文本会在 `core/engine.py` 的
+    `_try_agent_path` 后处理里过一遍 `SafetyEngine.filter_output`，但
+    `send_group_message` / `send_private_message` / `send_group_ai_record`
+    这类工具是**直接调 NapCat API**，完全绕开那段后处理 —— 漏了这里，
+    模型经工具发出去的文字就是零过滤出群，而时政 / 露骨内容是封群主因。
+
+    过滤函数由 `AgentContext.output_filter` 注入（`core/agent.py`
+    `_build_tool_context`）。没注入时原样返回：这是 WebUI 测试台等
+    非 QQ 场景的正常情况，不是静默失败 —— 真实 QQ 路径由
+    `tests/test_outbound_send_filter_guard.py` 钉住必须有注入。
+    """
+
+    if not text:
+        return text
+    output_filter = context.get("output_filter")
+    if not callable(output_filter):
+        return text
+    try:
+        filtered = output_filter(text)
+    except Exception as exc:
+        # 过滤器本身炸了不能让原文直接出群 —— 这里是封群风险点，宁可少说。
+        _log.warning("outbound_filter_failed | err=%s | 已改发占位文本", exc)
+        return "（这条我先不说了）"
+    return str(filtered) if filtered is not None else text
+
+
+def sanitize_outbound_payload(payload: Any, context: dict[str, Any]) -> Any:
+    """递归过滤嵌套出站结构里的文字（合并转发的 messages 是这种形状）。
+
+    OneBot 合并转发形如
+    ``[{"type":"node","data":{"name":..,"content":[{"type":"text","data":{"text":..}}]}}]``
+    —— 真正出群的文字埋在两层里。只碰 ``text`` 键，不动 URL / file / 名字，
+    免得把图片地址也一起替换掉。
+    """
+
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, list):
+        return [sanitize_outbound_payload(item, context) for item in payload]
+    if isinstance(payload, dict):
+        cleaned: dict[Any, Any] = {}
+        for key, value in payload.items():
+            if key == "text" and isinstance(value, str):
+                cleaned[key] = sanitize_outbound_text(value, context)
+            else:
+                cleaned[key] = sanitize_outbound_payload(value, context)
+        return cleaned
+    return payload
+
+
 async def _handle_send_group_message(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     api_call = context.get("api_call")
     if not callable(api_call):
         return ToolCallResult(ok=False, error="no_api_call_available")
     group_id = int(args.get("group_id", 0))
-    message = str(args.get("message", ""))
+    message = sanitize_outbound_text(str(args.get("message", "")), context)
     if not group_id or not message:
         return ToolCallResult(ok=False, error="missing group_id or message")
     if len(message) > 4000:
@@ -761,7 +814,7 @@ async def _handle_send_private_message(args: dict[str, Any], context: dict[str, 
     if not callable(api_call):
         return ToolCallResult(ok=False, error="no_api_call_available")
     user_id = int(args.get("user_id", 0))
-    message = str(args.get("message", ""))
+    message = sanitize_outbound_text(str(args.get("message", "")), context)
     if not user_id or not message:
         return ToolCallResult(ok=False, error="missing user_id or message")
     if len(message) > 4000:
@@ -810,6 +863,9 @@ async def _napcat_api_call(
             data = {"items": result[:50], "total": len(result)}
         return ToolCallResult(ok=True, data=data, display=display_ok)
     except Exception as exc:
+        # 这里以前零日志：线上只能看到工具返回 ok=False，看不到是哪个 api、
+        # 也看不到 NapCat 报了什么（比如 get_record 的 retcode=1200 EPERM）。
+        _log.warning("napcat_api_failed | api=%s | %s", api, exc)
         return ToolCallResult(ok=False, error=str(exc))
 
 
@@ -1710,16 +1766,23 @@ async def _handle_get_group_honor_info(args: dict[str, Any], context: dict[str, 
     )
 
 
-async def _handle_upload_group_file(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    group_id = int(args.get("group_id", 0))
-    file_path = str(args.get("file", ""))
-    name = str(args.get("name", ""))
-    folder = str(args.get("folder", "") or "").strip()
-    if not group_id or not file_path or not name:
-        return ToolCallResult(ok=False, error="missing group_id, file or name")
-    # 安全: 限制文件路径，防止 LLM 上传任意系统文件
+def resolve_uploadable_path(file_path: str) -> tuple[Path | None, str]:
+    """把模型给的上传路径解析成允许目录下的真实文件。返回 (路径, 错误)。
+
+    **所有上传类工具都必须过这里。** 这段白名单原来只写在
+    `_handle_upload_group_file` 里，而 `_handle_upload_private_file`
+    把 `file` 直接送进 NapCat、零校验 —— 2026-08-06 子 agent 扫描实测：
+    `permission_level='user'` 调 `upload_private_file` 传 `.env`，
+    返回 `ok=True`，NapCat 收到了那个路径。
+
+    `.env` 里是全部 provider API key、`ONEBOT_ACCESS_TOKEN`、`WEBUI_TOKEN`。
+    两个工具都不在任何权限集合里，所以普通群成员就能走到。
+
+    提取成共享 helper 而不是给 private 那个补一份，是因为两份白名单必然漂移
+    —— 这个仓库已经有两份 `_group_admin_tools` 漂移的先例。
+    """
+
     resolved = Path(file_path).resolve()
-    # 只允许 storage/ 和 tmp/ 目录下的文件
     project_root = Path(__file__).resolve().parents[1]
     allowed_dirs = [
         project_root / "storage",
@@ -1737,10 +1800,24 @@ async def _handle_upload_group_file(args: dict[str, Any], context: dict[str, Any
     ):
         allowed_dirs.append(extra)
     if not any(str(resolved).lower().startswith(str(d.resolve()).lower()) for d in allowed_dirs):
-        return ToolCallResult(ok=False, error="安全限制: 只能上传 storage/tmp 或 NapCat temp 目录下的文件")
+        return None, "安全限制: 只能上传 storage/tmp 或 NapCat temp 目录下的文件"
     if not resolved.is_file():
-        _log.warning("upload_group_file_missing | file=%s", clip_text(str(resolved), 180))
-        return ToolCallResult(ok=False, error="文件不存在或当前进程不可读")
+        _log.warning("upload_path_missing | file=%s", clip_text(str(resolved), 180))
+        return None, "文件不存在或当前进程不可读"
+    return resolved, ""
+
+
+async def _handle_upload_group_file(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    group_id = int(args.get("group_id", 0))
+    file_path = str(args.get("file", ""))
+    name = str(args.get("name", ""))
+    folder = str(args.get("folder", "") or "").strip()
+    if not group_id or not file_path or not name:
+        return ToolCallResult(ok=False, error="missing group_id, file or name")
+    # 安全: 限制文件路径，防止 LLM 上传任意系统文件
+    resolved, path_error = resolve_uploadable_path(file_path)
+    if resolved is None:
+        return ToolCallResult(ok=False, error=path_error)
     kwargs: dict[str, Any] = {"group_id": group_id, "file": str(resolved), "name": name}
     if folder:
         kwargs["folder"] = folder
@@ -1758,7 +1835,8 @@ async def _handle_get_group_notice(args: dict[str, Any], context: dict[str, Any]
 
 async def _handle_send_group_notice(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     group_id = int(args.get("group_id", 0))
-    content = str(args.get("content", ""))
+    # 群公告是**置顶且所有成员可见**的出站文字，比普通消息更需要过滤。
+    content = sanitize_outbound_text(str(args.get("content", "")), context)
     if not group_id or not content:
         return ToolCallResult(ok=False, error="missing group_id or content")
     return await _napcat_api_call(
@@ -2523,7 +2601,9 @@ async def _handle_get_ai_characters(args: dict[str, Any], context: dict[str, Any
 async def _handle_send_group_ai_record(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     group_id = int(args.get("group_id", 0))
     character = str(args.get("character", ""))
-    text = str(args.get("text", ""))
+    # 这段文字是**朗读成语音**发出去的，比纯文字更需要过滤 —— 语音里的
+    # 敏感内容一样会被平台判定，而且用户更难事后察觉发了什么。
+    text = sanitize_outbound_text(str(args.get("text", "")), context)
     if not group_id or not character or not text:
         return ToolCallResult(ok=False, error="missing group_id, character or text")
     return await _napcat_api_call(
@@ -3967,7 +4047,7 @@ async def _handle_translate_en2zh(args: dict[str, Any], context: dict[str, Any])
 
 async def _handle_send_group_forward_msg(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     group_id = int(args.get("group_id", 0))
-    messages = args.get("messages", [])
+    messages = sanitize_outbound_payload(args.get("messages", []), context)
     if not group_id or not messages:
         return ToolCallResult(ok=False, error="missing group_id or messages")
     return await _napcat_api_call(
@@ -3978,7 +4058,7 @@ async def _handle_send_group_forward_msg(args: dict[str, Any], context: dict[str
 
 async def _handle_send_private_forward_msg(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     user_id = int(args.get("user_id", 0))
-    messages = args.get("messages", [])
+    messages = sanitize_outbound_payload(args.get("messages", []), context)
     if not user_id or not messages:
         return ToolCallResult(ok=False, error="missing user_id or messages")
     return await _napcat_api_call(
@@ -4129,9 +4209,14 @@ async def _handle_upload_private_file(args: dict[str, Any], context: dict[str, A
     name = str(args.get("name", ""))
     if not user_id or not file_path or not name:
         return ToolCallResult(ok=False, error="missing user_id, file or name")
+    # 和 upload_group_file 走同一份白名单。此前这里**完全没有校验**，
+    # 实测普通用户能让机器人把 .env 私发给自己。见 resolve_uploadable_path 的说明。
+    resolved, path_error = resolve_uploadable_path(file_path)
+    if resolved is None:
+        return ToolCallResult(ok=False, error=path_error)
     return await _napcat_api_call(
         context, "upload_private_file", f"已发送文件 {name} 给 {user_id}",
-        user_id=user_id, file=file_path, name=name,
+        user_id=user_id, file=str(resolved), name=name,
     )
 
 
@@ -4166,7 +4251,11 @@ async def _handle_set_online_status(args: dict[str, Any], context: dict[str, Any
 
 
 async def _handle_send_msg(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    message = str(args.get("message", ""))
+    # 这个工具不在 AgentLoop._SIDE_EFFECT_SEND_TOOLS 里（那份清单是给
+    # 「每回合只调一次」记账用的），所以第一版出站过滤守卫按那份清单取全集时
+    # 看不见它 —— 2026-08-06 的子 agent 审计抓到的。全集应该是
+    # 「读了文字类 args 又调了 NapCat 发送 API」的 handler，与那份清单无关。
+    message = sanitize_outbound_text(str(args.get("message", "")), context)
     if not message:
         return ToolCallResult(ok=False, error="missing message")
     kwargs: dict[str, Any] = {"message": message}
@@ -4351,7 +4440,8 @@ async def _handle_get_group_system_msg(args: dict[str, Any], context: dict[str, 
 
 
 async def _handle_send_forward_msg(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    messages = args.get("messages", [])
+    # 同 _handle_send_msg：不在 _SIDE_EFFECT_SEND_TOOLS 里，第一版守卫看不见它。
+    messages = sanitize_outbound_payload(args.get("messages", []), context)
     if not messages or not isinstance(messages, list):
         return ToolCallResult(ok=False, error="missing messages array")
     message_type = str(args.get("message_type", "group"))
@@ -4406,10 +4496,33 @@ async def _handle_get_record(args: dict[str, Any], context: dict[str, Any]) -> T
     out_format = str(args.get("out_format", "mp3")).strip()
     if not file:
         return ToolCallResult(ok=False, error="missing file")
-    result = await _napcat_api_call(context, "get_record", "获取语音文件成功", file=file, out_format=out_format)
+
+    # NapCat 转码要 spawn ffmpeg，本机被系统拒（retcode=1200 spawn EPERM）。
+    # 换 out_format 只是便宜的第二选择：能不能绕过取决于 NapCat 实现，
+    # 主路仍是 analyze_voice 直读 record 段自带的本机原始文件。
+    formats: list[str] = []
+    for candidate in (out_format, "amr", "wav"):
+        if candidate and candidate not in formats:
+            formats.append(candidate)
+
+    result = ToolCallResult(ok=False, error="record_transcode_unavailable")
+    for candidate in formats:
+        result = await _napcat_api_call(
+            context, "get_record", "获取语音文件成功", file=file, out_format=candidate
+        )
+        if result.ok:
+            break
+        if result.error == "no_api_call_available":
+            return result
+
     if result.ok and result.data:
         d = result.data
         result.display = f"语音: {d.get('file', '?')} | URL: {d.get('url', '?')[:80]}"
+        return result
+    if not result.ok:
+        # 异常原文（含 retcode）只留在 _napcat_api_call 的日志里，不进 display。
+        result.error = "record_transcode_unavailable"
+        result.display = "这条语音我这边取不到文件。"
     return result
 
 
