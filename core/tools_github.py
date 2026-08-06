@@ -4,12 +4,21 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
+from pathlib import Path
 from typing import Any
 import logging as _logging
 
+import httpx
 from utils.text import clip_text, normalize_text
-from core.tools_types import ToolResult, _tool_trace_tag, _shared_github_request, _shared_repo_readme_request
+from core.tools_types import (
+    ToolResult,
+    _tool_trace_tag,
+    _shared_github_request,
+    _shared_repo_readme_request,
+    _unwrap_redirect_url,
+)
 
 _tool_log = _logging.getLogger("yukiko.tools")
 

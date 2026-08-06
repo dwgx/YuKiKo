@@ -18,6 +18,7 @@ import hashlib
 import html
 import json
 import logging
+import random
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -50,6 +51,9 @@ class MusicSourceMatcher:
 
     def __init__(self, timeout: float = 8):
         self._timeout = timeout
+        # QQ 音乐 vkey 请求要求一个十位数字 guid；固定用同一个而不是每次随机，
+        # 免得上游把变动的 guid 当异常流量。
+        self._qq_guid = f"{random.randint(10 ** 9, 10 ** 10 - 1)}"
         self._headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Accept": "*/*",
@@ -58,6 +62,15 @@ class MusicSourceMatcher:
         self._preferred_sources = ("kuwo", "kugou", "migu", "soundcloud", "qq")
         self._secondary_sources = {"qq"}
         self._soundcloud = SoundCloudClient(timeout=max(8.0, timeout))
+
+    # kuwo 搜索窗口。变体噪音很多，窗口太窄正片会被挤出去。
+    _KUWO_SEARCH_ROWS = 20
+
+    # 歌手已知时，候选歌手低于这个相似度就判定为「另一个人唱的」。
+    # 只在双方都有歌手信息、且没有包含关系时才用到（feat 串靠包含关系放行）。
+    _MIN_ARTIST_SCORE = 0.5
+    # 带括号修饰的变体相对干净标题的罚分，只用于同分时的取舍，不足以改变过线与否。
+    _BRACKETED_VARIANT_PENALTY = 0.02
 
     _BLOCKED_VERSION_MARKERS = (
         "伴奏",
@@ -182,9 +195,12 @@ class MusicSourceMatcher:
         """
         sources = self._normalize_sources(sources)
 
-        # 清理歌曲名和歌手名
-        song_name = self._normalize_text(song_name)
-        artist = self._normalize_text(artist)
+        # 清理歌曲名和歌手名 —— 用「查询形态」保留词边界。
+        # 这里曾经用 _normalize_text（比较形态），把 "Life's a Struggle" 压成
+        # "lifesastruggle" 再发给上游，英文歌名因此几乎必然搜不到。
+        # 下游 _find_best_match 会自己再做比较形态归一化，所以传查询形态是安全的。
+        song_name = self._normalize_query_text(song_name)
+        artist = self._normalize_query_text(artist)
 
         if not song_name:
             return None
@@ -404,13 +420,38 @@ class MusicSourceMatcher:
         artist: str,
         duration_ms: int,
     ) -> AlternativeSource | None:
-        """从咪咕音乐搜索 - 使用 app API。"""
+        """从咪咕音乐搜索 - 使用 app API。
+
+        2026-08-06 实测的上游现状：
+
+        * 参数名是 ``text``，不是 ``keyword``。用 ``keyword`` 会拿到 HTTP 200 +
+          ``code=299999 info='参数校验失败 text:不能为空'`` —— 不抛异常，只是 0 条结果。
+        * 只带 ``text`` 会返回 ``code=000000 info='成功'`` 但依然 0 条歌曲，
+          必须同时带 ``searchSwitch`` 打开 song 维度。
+        * 返回体里**没有** ``listenUrl``/``mp3``/``hqUrl`` 这类可播字段，只有
+          ``lyricUrl``/``mrcurl``，且 ``rateFormats`` 每档都是 ``price:"200"`` +
+          ``showTag:["vip"]``。所以这个源现在只能搜到、放不出 —— 修好参数后
+          它会快速走到 ``_extract_migu_play_url`` 返回空并干净失败，
+          而不是像以前那样绕一圈 301 再报一条像 bug 的 WARNING。
+        """
+
         keyword = f"{song_name} {artist}".strip()
 
         # 咪咕 App API（更稳定）
         search_url = "https://app.c.nf.migu.cn/MIGUM2.0/v1.0/content/search_all.do"
         params = {
-            "keyword": keyword,
+            "text": keyword,
+            "searchSwitch": json.dumps(
+                {
+                    "song": 1,
+                    "album": 0,
+                    "singer": 0,
+                    "tagSong": 0,
+                    "mvSong": 0,
+                    "songlist": 0,
+                    "bestShow": 1,
+                }
+            ),
             "type": 2,
             "pgc": 1,
             "rows": 5,
@@ -435,8 +476,8 @@ class MusicSourceMatcher:
             songs = song_result.get("result", []) if isinstance(song_result, dict) else []
 
             if not songs:
-                # 回退到旧版 API
-                return await self._search_migu_legacy(song_name, artist, duration_ms)
+                _log.info("migu_no_songs | code=%s | info=%s", data.get("code"), data.get("info"))
+                return None
 
             best_match = self._find_best_match(songs, song_name, artist, duration_ms, "migu")
             if not best_match:
@@ -445,6 +486,10 @@ class MusicSourceMatcher:
             # 从结果中提取播放链接
             play_url = self._extract_migu_play_url(best_match)
             if not play_url:
+                _log.info(
+                    "migu_no_playable_url | song=%s | 上游返回体只有 lyricUrl/mrcurl，音质档位均为 vip",
+                    song_name,
+                )
                 return None
 
             return AlternativeSource(
@@ -457,56 +502,12 @@ class MusicSourceMatcher:
             )
         except Exception as exc:
             _log.warning("migu_search_fail | %s", exc)
-            return await self._search_migu_legacy(song_name, artist, duration_ms)
-
-    async def _search_migu_legacy(
-        self,
-        song_name: str,
-        artist: str,
-        duration_ms: int,
-    ) -> AlternativeSource | None:
-        """咪咕旧版搜索接口（回退用）。"""
-        keyword = f"{song_name} {artist}".strip()
-        search_url = "https://m.music.migu.cn/migu/remoting/scr_search_tag"
-        params = {
-            "keyword": keyword,
-            "type": 2,
-            "rows": 5,
-            "pgc": 1,
-        }
-
-        try:
-            headers = dict(self._headers)
-            headers["Referer"] = "https://m.music.migu.cn/"
-
-            async with httpx.AsyncClient(timeout=self._timeout, headers=headers) as client:
-                resp = await client.get(search_url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-
-            songs = data.get("musics", [])
-            if not songs:
-                return None
-
-            best_match = self._find_best_match(songs, song_name, artist, duration_ms, "migu")
-            if not best_match:
-                return None
-
-            play_url = best_match.get("mp3", "") or best_match.get("listenUrl", "")
-            if not play_url or not play_url.startswith("http"):
-                return None
-
-            return AlternativeSource(
-                url=play_url,
-                source="migu",
-                quality="hq",
-                duration_ms=0,
-                size=0,
-                br=128000,
-            )
-        except Exception as exc:
-            _log.warning("migu_legacy_search_fail | %s", exc)
             return None
+
+    # 已删除 _search_migu_legacy：端点 https://m.music.migu.cn/migu/remoting/scr_search_tag
+    # 2026-08-06 实测 301 -> https://m.music.migu.cn/v5，那是个 HTML SPA，跟不跟重定向
+    # 都拿不到 JSON。它只在主端点 0 结果时被调用，而当时主端点是因为参数名过期才 0 结果，
+    # 于是每次 migu 查询都白跑一次请求并留下一条像 bug 的 migu_legacy_search_fail。
 
     @staticmethod
     def _extract_migu_play_url(song: dict) -> str:
@@ -563,7 +564,9 @@ class MusicSourceMatcher:
             "itemset": "web_2013",
             "client": "kt",
             "pn": 0,
-            "rn": 5,
+            # 2026-08-06 实测：rn=5 时窗口会被伴奏/片段/DJ 版/演唱会串烧占满，
+            # 正片被挤出去，同一个查询两次跑出的 5 条还不一样 —— 命中纯看运气。
+            "rn": self._KUWO_SEARCH_ROWS,
             "rformat": "json",
             "encoding": "utf8",
         }
@@ -773,7 +776,20 @@ class MusicSourceMatcher:
             return None
 
     async def _get_qq_play_url(self, song_mid: str) -> str:
-        """获取 QQ 音乐播放链接。"""
+        """获取 QQ 音乐播放链接。
+
+        2026-08-06 实测：匿名（无登录 cookie）**拿不到任何 purl**。
+        试过 4 种 module/platform 组合（``vkey.GetVkeyServer`` / ``music.vkey.GetVkey``、
+        ``platform=20`` / ``yqq.json``、带/不带 ``filename``、带/不带 Referer）
+        以及老端点 ``fcg_music_express_mobile3``，全部返回空 purl，
+        响应里带 ``msg='<本机IP>;invalidq;'``。连《晴天》这种最大众的曲目也一样。
+
+        所以 ``qq_vkey_no_purl`` 不是请求构造 bug，是**权限墙** —— 要能播必须提供
+        QQ 音乐登录凭证（uin + qm_keyst），和 QZone cookie 同一类问题。
+        本仓目前没有 QQ 音乐 cookie 的接线（``core/cookie_auth.py`` 只服务
+        QZone / bilibili / douyin）。
+        """
+
         # QQ 音乐 vkey 获取 API
         url = "https://u.y.qq.com/cgi-bin/musicu.fcg"
 
@@ -782,7 +798,11 @@ class MusicSourceMatcher:
                 "module": "vkey.GetVkeyServer",
                 "method": "CgiGetVkey",
                 "param": {
-                    "guid": "0",
+                    # guid="0" 不符合上游要求（要十位数字）。首次干净探测时
+                    # guid="0" 回 result=104003、换成十位数字回 result=0；
+                    # 但连续请求几次后本机 IP 被限流，两者都回 104003。
+                    # 无论哪种情况 purl 都是空的（那要凭证），改这里只是让请求本身合法。
+                    "guid": self._qq_guid,
                     "songmid": [song_mid],
                     "songtype": [0],
                     "uin": "0",
@@ -810,7 +830,17 @@ class MusicSourceMatcher:
 
             purl = midurlinfo[0].get("purl", "")
             if not purl:
-                _log.warning("qq_vkey_no_purl | song_mid=%s | midurlinfo=%s", song_mid, midurlinfo[0])
+                # 实测这条恒定发生在匿名访问下（见方法 docstring），不是偶发故障，
+                # 所以降到 INFO 并只留判定所需的三个字段 —— 原来整个 40 键 dict
+                # 刷进 WARNING，读起来像 bug，实际是「没登录」。
+                info = midurlinfo[0]
+                _log.info(
+                    "qq_vkey_no_purl | song_mid=%s | result=%s | subcode=%s | "
+                    "匿名无播放权限，需要 QQ 音乐登录凭证",
+                    song_mid,
+                    info.get("result"),
+                    info.get("subcode"),
+                )
                 return ""
 
             # 拼接完整 URL
@@ -908,6 +938,22 @@ class MusicSourceMatcher:
             if target_name_norm and not direct_name_hit and name_score < min_name_score:
                 continue
 
+            # 歌手门：歌名对上但歌手完全是另一个人，说明这是翻唱/他人版本，
+            # 不是同一段录音。剥掉括号修饰后歌名往往拿满分（`孤勇者 (cover: 陈奕迅)`
+            # 归一化成 `孤勇者`），只靠总分阈值挡不住 —— 0.7+0+0.1 = 0.8 会通过。
+            # 只在双方都有歌手信息时生效：候选缺字段不等于歌手不符。
+            direct_artist_hit = bool(
+                target_artist_norm and artist_norm
+                and (target_artist_norm in artist_norm or artist_norm in target_artist_norm)
+            )
+            if (
+                target_artist_norm
+                and artist_norm
+                and not direct_artist_hit
+                and artist_score < self._MIN_ARTIST_SCORE
+            ):
+                continue
+
             # 时长匹配（允许 ±10 秒误差）
             duration_score = 1.0
             if target_duration_ms > 0 and duration > 0:
@@ -919,6 +965,11 @@ class MusicSourceMatcher:
 
             # 综合评分 - 歌名权重最高
             score = (name_score * 0.7 + artist_score * 0.2 + duration_score * 0.1)
+
+            # 正片与带修饰的变体归一化后同分，靠这个微小罚分让干净标题胜出
+            # （同时存在 `晴天` 和 `晴天 (Live)` 时要挑前者）。
+            if self._strip_bracketed_qualifiers(html.unescape(str(name))) != html.unescape(str(name)):
+                score -= self._BRACKETED_VARIANT_PENALTY
 
             if score > best_score:
                 best_score = score
@@ -934,15 +985,45 @@ class MusicSourceMatcher:
         return None
 
     @staticmethod
-    def _normalize_text(text: str) -> str:
-        """标准化文本 - 去除特殊字符、空格、转小写。"""
+    def _strip_bracketed_qualifiers(text: str) -> str:
+        """剥掉括号修饰（(DJ版)、(Live)、(cover: X) 等），保留主标题。
+
+        必须在 ``normalize_matching_text`` **之前**调用 —— 后者把所有标点
+        （含括号）替换成空格，跑完之后这两条正则永远匹配不到任何东西。
+        """
+
+        stripped = re.sub(r"\([^)]*\)", " ", text)
+        stripped = re.sub(r"（[^）]*）", " ", stripped)
+        # 整个名字都在括号里时（如 "(instrumental)"）不要剥成空串，
+        # 否则候选会因为归一化后为空而静默消失。
+        if not re.search(r"\w", stripped, flags=re.UNICODE):
+            return text
+        return stripped
+
+    @classmethod
+    def _normalize_query_text(cls, text: str) -> str:
+        """归一化「发给上游的搜索词」—— 保留词边界。
+
+        与 ``_normalize_text`` 的分工：这个用于**查询**，那个用于**比较**。
+        把比较用的形态当查询词发出去会把 "Life's a Struggle" 压成
+        "lifesastruggle"，上游搜不到任何东西。
+        """
+
         if not text:
             return ""
-        # 处理 HTML 实体
-        text = normalize_matching_text(html.unescape(text))
-        # 移除括号内容（如 (DJ版)、(伴奏) 等）
-        text = re.sub(r'\([^)]*\)', '', text)
-        text = re.sub(r'（[^）]*）', '', text)
+        unescaped = html.unescape(text)
+        # 撇号直接删（"Life's" -> "Lifes"），其余标点转空格以保住词边界。
+        collapsed = re.sub(r"['’]", "", unescaped)
+        collapsed = re.sub(r"[^\w\s一-鿿]", " ", collapsed)
+        return re.sub(r"\s+", " ", collapsed).strip()
+
+    @classmethod
+    def _normalize_text(cls, text: str) -> str:
+        """标准化文本 - 去除特殊字符、空格、转小写。用于**相似度比较**。"""
+        if not text:
+            return ""
+        # 处理 HTML 实体，并在激进清理之前剥掉括号内容
+        text = normalize_matching_text(cls._strip_bracketed_qualifiers(html.unescape(text)))
         # 移除特殊字符
         text = re.sub(r'[^\w\s]', '', text)
         # 移除空格并转小写

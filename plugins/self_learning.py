@@ -26,7 +26,7 @@ from typing import Any
 
 import yaml
 from plugins.self_learning_runtime import BaseCodeExecutionBackend, create_code_execution_backend
-from utils.text import normalize_text
+from utils.text import clip_text, normalize_text
 
 _log = logging.getLogger("yukiko.plugin.self_learning")
 

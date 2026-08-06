@@ -16,6 +16,7 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse
 import httpx
 from core.agent_tools_types import PromptHint, ToolCallResult, ToolSchema
 from core.agent_tools_registry import AgentToolRegistry
+from core.agent_tools_napcat import _score_download_source_trust
 from core.napcat_compat import call_napcat_api
 from core.recalled_messages import (
     build_conversation_id as _build_recall_conversation_id,

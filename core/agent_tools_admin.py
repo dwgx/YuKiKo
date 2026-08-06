@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import random
@@ -399,7 +400,22 @@ async def _handle_music_play_by_id(args: dict[str, Any], context: dict[str, Any]
             api_call=api_call,
         )
         if not result.ok:
-            return ToolCallResult(ok=False, error=result.error or "play_failed")
+            # 把 payload["text"] 当 display 传出去 —— 那是 MusicPlayResult.message，
+            # 例如「没找到与歌手「宋岳庭」匹配的可播版本，请换个关键词或指定歌曲ID」。
+            #
+            # 丢掉它的代价（2026-08-06 实测 trace 118886-12-a3424cb9）：模型只看到
+            # core/agent.py:2361 合成的「music_play_by_id 失败: download_failed」，
+            # 那读起来像临时故障，于是它接着试 music_play、再试 bilibili_audio_extract。
+            # 该回合 6 步 / 73 秒，是水位线后最慢的一个。每多一步 ≈10 秒。
+            # 同族的 _handle_music_search 一直是这么传的，这里是漏了，不是设计选择。
+            failure_payload = (
+                result.payload if isinstance(getattr(result, "payload", None), dict) else {}
+            )
+            return ToolCallResult(
+                ok=False,
+                error=result.error or "play_failed",
+                display=str(failure_payload.get("text", "")),
+            )
 
         payload = result.payload if isinstance(getattr(result, "payload", None), dict) else {}
         audio_file = payload.get("audio_file")
@@ -452,7 +468,17 @@ async def _handle_bilibili_audio_extract(args: dict[str, Any], context: dict[str
             api_call=api_call,
         )
         if not result.ok:
-            return ToolCallResult(ok=False, error=result.error or "extract_failed")
+            # 同 _handle_music_play_by_id：不要把人话丢掉只留错误码。
+            # 这个工具是音乐放不出来时模型的最后一个替代方案，它的失败原因
+            # 直接决定模型是「换关键词再试」还是「告诉用户这首拿不到」。
+            failure_payload = (
+                result.payload if isinstance(getattr(result, "payload", None), dict) else {}
+            )
+            return ToolCallResult(
+                ok=False,
+                error=result.error or "extract_failed",
+                display=str(failure_payload.get("text", "")),
+            )
 
         # 返回音频信息
         return ToolCallResult(

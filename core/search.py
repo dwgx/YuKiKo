@@ -240,6 +240,10 @@ class SearchEngine:
             "format": "json",
             "language": "zh-CN",
             "categories": "images",
+            # safesearch=2 是 SearXNG 的严格档。不填时用实例自己的默认值，
+            # 常见部署默认是 0（关闭）—— 图片会被 search_media 直接发进群，
+            # 一张 R18 图对封群的杀伤远大于文字提及，所以这里必须显式写死。
+            "safesearch": "2",
         }
         try:
             async with httpx.AsyncClient(
@@ -815,7 +819,11 @@ class SearchEngine:
             ) as client:
                 response = await client.get(
                     "https://www.bing.com/images/search",
-                    params={"q": query, "form": "HDRSC3"},
+                    # adlt=strict 是 bing 的安全搜索严格档；SRCHHPGUSR cookie 是
+                    # bing 真正读的那个开关，只给 query 参数有时不生效，两个都带。
+                    # 不带的话这条降级路径会绕过 DDG 那边已有的 safesearch。
+                    params={"q": query, "form": "HDRSC3", "adlt": "strict"},
+                    headers={**self.request_headers, "Cookie": "SRCHHPGUSR=ADLT=STRICT"},
                 )
                 response.raise_for_status()
                 html = response.text or ""

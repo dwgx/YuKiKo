@@ -80,12 +80,29 @@ class ZhihuCrawler:
         return self._client
 
     async def hot_list(self, limit: int = 20) -> list[CrawlResult]:
-        """获取知乎热榜。"""
+        """获取知乎热榜。
+
+        2026-08-06 实测：主端点 `/api/v3/feed/topstory/hot-lists/total` 恒定 401
+        （需要登录），备用端点 `/api/v4/creators/rank/hot` 正常返回 20 条。
+
+        主端点重试 2 次、每次失败后 sleep 1 秒，等于**每次热榜调用都白烧
+        2 个请求 + 1 秒**才走到能用的那个。所以先探一次主端点（万一鉴权
+        政策又变回来），拿到 401/403 就立刻转备用，不再重试 —— 鉴权失败重试
+        多少次都是 401，那不是瞬时故障。
+        """
+
         client = await self._get_client()
         data: dict[str, Any] = {}
         for _attempt in range(2):
             try:
                 resp = await client.get(self._HOT_LIST_URL)
+                if resp.status_code in (401, 403):
+                    # 鉴权失败是稳定状态，重试无意义 —— 直接去备用端点。
+                    _log.info(
+                        "zhihu_hot_list_needs_auth | status=%d | 转备用端点",
+                        resp.status_code,
+                    )
+                    break
                 if resp.status_code != 200:
                     _log.warning("zhihu_hot_list | status=%d | attempt=%d", resp.status_code, _attempt)
                     if _attempt == 0:
@@ -129,15 +146,24 @@ class ZhihuCrawler:
                         continue
                     if qurl and not qurl.startswith("http"):
                         qurl = f"https://www.zhihu.com{qurl}" if qurl.startswith("/") else ""
+                    # 2026-08-06 实测这个端点的真实返回体：
+                    #   item = {"question": {...}, "reaction": {...}}
+                    #   question 里**没有** answer_count / follower_count
+                    #   reaction 里**没有** zans，有的是 new_pv / new_follow_num /
+                    #                       new_answer_num
+                    # 原来按 v3 的键名读，于是热度恒为空、两个计数恒为 0，
+                    # 而热度正是趋势排序的依据 —— 走到备用端点等于热榜失去排序信号。
+                    reaction = item.get("reaction") or {}
+                    new_pv = int(reaction.get("new_pv", 0) or 0)
                     results.append(CrawlResult(
                         title=qtitle,
                         url=qurl,
                         snippet=clip_text(normalize_text(str(question.get("highlight_title", ""))), 180),
                         source="zhihu",
-                        heat=normalize_text(str((item.get("reaction") or {}).get("zans", ""))),
+                        heat=f"{new_pv} 浏览" if new_pv else "",
                         extra={
-                            "answer_count": int(question.get("answer_count", 0) or 0),
-                            "follower_count": int(question.get("follower_count", 0) or 0),
+                            "answer_count": int(reaction.get("new_answer_num", 0) or 0),
+                            "follower_count": int(reaction.get("new_follow_num", 0) or 0),
                         },
                     ))
         except Exception as e:
@@ -153,6 +179,20 @@ class ZhihuCrawler:
                 "offset": 0, "limit": limit,
             })
             if resp.status_code != 200:
+                # 2026-08-06 实测：这个端点已不可用。试过 5 种参数组合
+                # （当前这组、只带 q+t、q+t+limit、加 search_source/vertical、只带 q），
+                # 全部返回 400 + `{"HitLabels":null}`；换 Referer 时见过 403。
+                # 形态说明它要的是签名头（知乎的 x-zse-* 反爬），不是参数问题 ——
+                # 属于凭证/签名墙，和 QQ 音乐 vkey 同类，**代码改不了**。
+                #
+                # 原来这里是裸 `return []`，一条日志都不留 —— 于是「知乎搜索没结果」
+                # 和「知乎搜索已经不可用」在日志里完全一样，谁也不会去查。
+                _log.warning(
+                    "zhihu_search_unavailable | status=%d | query=%s | "
+                    "上游需要签名头，非参数问题，实测 5 种组合全失败",
+                    resp.status_code,
+                    clip_text(query, 40),
+                )
                 return []
             data = resp.json()
         except Exception as e:
