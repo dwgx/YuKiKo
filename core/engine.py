@@ -845,7 +845,16 @@ class YukikoEngine:
                 )
                 self.plugins.load(global_config=self.config)
                 if hasattr(self, "agent"):
-                    self.agent.refresh_runtime_config(self.config)
+                    # persona_text 必须显式传：它在构造 AgentLoop 时是按值传入的，
+                    # reload 不重建 AgentLoop，不传的话 agent 路会一直用启动时那份旧稿。
+                    self.agent.refresh_runtime_config(
+                        self.config,
+                        persona_text=(
+                            self.personality.persona_text
+                            if hasattr(self, "personality")
+                            else None
+                        ),
+                    )
                 self._async_init_done = False  # re-run async_init on next message
                 self.logger.info("配置热重载完成")
             return ok, msg
@@ -1164,6 +1173,25 @@ class YukikoEngine:
             return EngineResponse(
                 action="moderate", reason=safety.reason, reply_text=rendered
             )
+        # 把结构事实显式交给 trigger，而不是让它去反解 text。
+        # text 到这里已经被 normalize_text 压掉了 app.py 拼进去的换行，
+        # 于是「占位符」和「用户自己打的字」在 trigger 眼里连成一行；
+        # 而图片 summary 是没有右边界的自由文本（实测 `image:哎呦，你干嘛～`），
+        # 按空格切必然误伤 —— 实测「表情包 + 用户喊 yuki」会被判成裸媒体而沉默。
+        # raw_segments 是精确的结构事实，_extract_multimodal_user_text 是本仓
+        # 已有的剥离实现（core/engine.py:4004，另有四处调用点），这里复用它。
+        trigger_media_types = [
+            normalize_text(str(seg.get("type", ""))).lower()
+            for seg in (message.raw_segments or [])
+            if isinstance(seg, dict) and normalize_text(str(seg.get("type", "")))
+        ]
+        # 注意用 message.text（未压平）而不是上面的 text —— 换行是精确边界，
+        # 而 text 已经在 core/engine.py:1022 被 normalize_text 压成一行了。
+        trigger_user_text = (
+            self._user_typed_text_for_trigger(message.text)
+            if trigger_media_types
+            else text
+        )
         trigger = self.trigger.evaluate(
             TriggerInput(
                 conversation_id=message.conversation_id,
@@ -1175,6 +1203,10 @@ class YukikoEngine:
                 reply_to_user_id=message.reply_to_user_id,
                 bot_id=message.bot_id,
                 timestamp=message.timestamp,
+                media_types=trigger_media_types,
+                user_text=trigger_user_text,
+                has_user_text=bool(trigger_user_text),
+                trace_id=message.trace_id,
             ),
             recent_messages=self._build_runtime_group_context(
                 message.conversation_id,
@@ -2397,6 +2429,11 @@ class YukikoEngine:
                 explicit_bot_addressed=explicit_bot_addressed,
                 message_id=message.message_id,
                 reply_to_message_id=message.reply_to_message_id,
+                # 工具直发路径的敏感词过滤。send_group_message 这类工具绕开
+                # _try_agent_path 的后处理，不注入这个就是零过滤出群。
+                output_filter=self.safety.filter_output,
+                # 外部抓取内容的时政话题门。见 AgentContext.topic_gate 的说明。
+                topic_gate=self.safety.is_political_topic,
                 raw_segments=message.raw_segments,
                 reply_media_segments=message.reply_media_segments,
                 reply_to_user_id=message.reply_to_user_id,
@@ -3999,6 +4036,39 @@ class YukikoEngine:
                 "user mentioned bot and sent multimodal message:"
             )
         )
+
+    @staticmethod
+    def _user_typed_text_for_trigger(raw_text: str) -> str:
+        """从**未压平**的 message.text 里精确切出用户自己打的那段字。
+
+        为什么按行切而不是用 `_extract_multimodal_user_text`：
+        app.py:1487 的结构是确定的 —— `f"{media_event}\\n{clean_text}"`，
+        `media_event` 由 app_helpers._build_multimodal_text 产出、恒为单行，
+        语音转写另起一行 `[语音内容] xxx`。所以换行就是精确边界。
+
+        那个共享 helper 走的是正则启发式，`image:\\s*\\S+` 里的 `\\s*` 会把冒号后的
+        **下一个词**一起吃掉：`image:[image] yukiko 看看` 先被方括号正则压成
+        `image: yukiko 看看`，再被这条吃成 `看看` —— 别名没了，
+        「喊 yukiko 也不回」。实测过，所以这里不复用它。
+
+        本函数只服务 trigger 的「用户到底有没有打字」判断，不动那五个调用点。
+        `[语音内容]` 行**算**用户内容：语音转写就是用户说的话。
+        """
+
+        raw = str(raw_text or "")
+        if not raw:
+            return ""
+        kept: list[str] = []
+        for idx, line in enumerate(raw.split("\n")):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if idx == 0 and re.match(
+                r"^MULTIMODAL_EVENT(?:_AT)?\b", stripped, flags=re.IGNORECASE
+            ):
+                continue
+            kept.append(stripped)
+        return normalize_text(" ".join(kept))
 
     @staticmethod
     def _extract_multimodal_user_text(text: str) -> str:

@@ -25,11 +25,22 @@ _log = logging.getLogger("yukiko.safety")
 # ── QQ 平台输出敏感词（bot 回复中出现可能导致封群）──
 # 这些词会在 bot 输出时被替换，与输入尺度无关
 _DEFAULT_OUTPUT_SENSITIVE: dict[str, str] = {
-    # 政治敏感
+    # 政治敏感 —— 领导人/ 历史事件
     "习近平": "某领导人", "毛泽东": "某历史人物", "邓小平": "某历史人物",
+    "江泽民": "某历史人物", "胡锦涛": "某历史人物", "温家宝": "某历史人物",
     "六四": "某历史事件", "天安门事件": "某历史事件", "法轮功": "某组织",
     "达赖": "某人物", "藏独": "某话题", "疆独": "某话题", "台独": "某话题",
-    "文化大革命": "某历史时期", "大跃进": "某历史时期",
+    "港独": "某话题", "疆场": "某话题",
+    "文化大革命": "某历史时期", "大跃进": "某历史时期", "反右": "某历史时期",
+    # 政党 / 政权 —— 业主 2026-08-06 点名的缺口（"中国政党"）
+    "共产党": "某政党", "中共": "某政党", "国民党": "某政党",
+    "政治局": "某机构", "中央委员": "某职务", "人民代表大会": "某会议",
+    # 时政新闻类 —— 业主点名的缺口（"红色新闻"）
+    "红色新闻": "某类新闻", "时政新闻": "某类新闻", "党媒": "某媒体",
+    "人民日报": "某媒体", "新华社": "某媒体", "央视新闻": "某媒体",
+    # 运动 / 抗议
+    "颜色革命": "某话题", "民主运动": "某话题", "维权运动": "某话题",
+    "政变": "某话题", "游行示威": "某话题",
     # 暴力/违法
     "炸弹制作": "**", "枪支制造": "**", "毒品制作": "**",
     # 色情（防止 LLM 输出）
@@ -37,6 +48,39 @@ _DEFAULT_OUTPUT_SENSITIVE: dict[str, str] = {
     "肛交": "**", "自慰": "**", "手淫": "**",
     # 其他高风险
     "自杀方法": "**", "自杀教程": "**",
+}
+
+# ── 时政 / 政权类话题（命中只回避，不记违规、不冷却）──
+# 目的不是审查用户，而是不让 bot 自己产出时政内容 —— 那是 QQ 群封群的主要成因之一。
+# 与 _DEFAULT_OUTPUT_SENSITIVE 的分工：那张表是**输出**词替换（只能换词），
+# 这个集合作用在**输入**上，让整个话题被回避掉，而不是等一整段政治评论
+# 侥幸不含表里的词就放行。
+_DEFAULT_POLITICAL_TERMS: set[str] = {
+    # 领导人 / 职务
+    "习近平", "毛泽东", "邓小平", "江泽民", "胡锦涛", "温家宝",
+    "国家主席", "总书记", "政治局", "中央委员",
+    # 政党 / 政权 / 政体
+    # 「政党」「政治制度」这类通用词是刻意收进来的：业主点名的「中国政党」
+    # 就是靠它命中，而单独列举各党名永远列不全。
+    "政党", "政治制度", "政治体制", "政体",
+    "共产党", "中共", "国民党", "一党制", "多党制", "党中央",
+    "人民代表大会", "两会", "政协",
+    # 历史事件 / 运动
+    "六四", "天安门事件", "文化大革命", "大跃进", "反右",
+    "颜色革命", "民主运动", "维权运动", "政变", "游行示威",
+    # 分裂 / 组织
+    "法轮功", "达赖", "藏独", "疆独", "台独", "港独",
+    # 时政新闻
+    "红色新闻", "时政新闻", "党媒", "人民日报", "新华社", "央视新闻",
+    # 制度评论常见落点
+    "共产主义", "社会主义制度", "威权", "独裁", "专制",
+    # 具体的国家行动 / 政策名。刻意只收**专有名词**，不收「国家」「政府」
+    # 「专项行动」这类通用词 —— 那些在正常聊天里太常见，收进来会大面积误伤
+    # （实测「政策模式怎么配」「行政区划查询」这类必须放行）。
+    # 收这些是因为 2026-08-06 实测知乎热榜前三条就有
+    # 「如何看待国家这一次的扫黑除恶专项行动？」，而它一个词都没命中。
+    "扫黑除恶", "反腐", "双规", "维稳", "举国体制",
+    "计划生育", "户籍制度", "劳动教养", "社会信用体系",
 }
 
 # ── 绝对红线（任何尺度都拦截）──
@@ -151,6 +195,24 @@ class SafetyEngine:
         self._sexual_mild_kink_terms: set[str] = {
             "sm", "spank", "捆绑", "主奴", "dom", "sub", "调教",
         }
+        # 时政 / 政权类话题。命中只**回避话题**，不记违规、不进冷却 ——
+        # 群友随口提一句时政不是攻击者，把他冷却 120 秒会打断正常对话。
+        # 这一层是为了「整段议论里一个词都不在输出替换表上」的情况：
+        # filter_output 只能换词，换不掉一整段政治评论。
+        self._political_terms: set[str] = _normalize_term_list(
+            config.get("political_terms", [])
+        ) or set(_DEFAULT_POLITICAL_TERMS)
+        self._political_allow_terms: set[str] = _normalize_term_list(
+            config.get("political_allow_terms", [])
+        )
+        self.political_deflect_enable = bool(config.get("political_deflect_enable", True))
+        self.political_deflect_reply = str(
+            config.get(
+                "political_deflect_reply",
+                "这方面我不太懂，也不想聊，换个话题吧～",
+            )
+        )
+
         self._intent_cues: set[str] = {
             "怎么买", "哪里买", "怎么做", "教程", "方法", "步骤",
             "教我", "给我", "渠道", "链接", "网址", "网站",
@@ -207,6 +269,19 @@ class SafetyEngine:
                 return SafetyDecision(risk_level="safe", action="allow", reason="cooldown_but_tech")
             return SafetyDecision(risk_level="high_risk", action="silence", reason="cooldown_active")
 
+        # 时政话题：回避但不惩罚。必须在 _record_violation 之前返回 ——
+        # 记违规会让随口提一句时政的群友吃 120 秒冷却，连正常聊天一起哑掉，
+        # 三次之后还会升到 600 秒长冷却。回避话题不需要这个代价。
+        if self.political_deflect_enable and self._is_political_topic(content):
+            _log.info("safety_political_deflect | 话题回避，未记违规")
+            return SafetyDecision(
+                risk_level="political",
+                action="moderate",
+                reason="political_topic_deflected",
+                should_reply=True,
+                reply_text=self.political_deflect_reply,
+            )
+
         risk_level = self._classify_risk(content)
         if risk_level == "safe":
             return SafetyDecision(risk_level="safe", action="allow", reason="safe")
@@ -224,6 +299,35 @@ class SafetyEngine:
             should_reply=True,
             reply_text=self.high_risk_reply,
         )
+
+    def is_political_topic(self, text: str) -> bool:
+        """公开入口：这段文字是否落在时政话题上。
+
+        给**外部抓取回来的内容**用（热搜标题、网页摘要、字幕），
+        判定为真时调用方应丢弃该条，而不是让它进模型上下文。
+
+        与 `evaluate()` 的分工：那个作用在用户消息上并回一句「换个话题吧」，
+        这个只做判定、不产生回复、不记违规。
+        """
+
+        if not self.political_deflect_enable:
+            return False
+        return self._is_political_topic(normalize_text(text).lower())
+
+    def _is_political_topic(self, content: str) -> bool:
+        """这条消息是否落在时政 / 政权话题上。
+
+        用 `_has_risky_term`（和其余词库同一套匹配语义），并支持业主用
+        `political_allow_terms` 放行误伤词 —— 例如群名、游戏名里带「政变」。
+        """
+
+        if not self._political_terms:
+            return False
+        if self._political_allow_terms and self._has_risky_term(
+            content, self._political_allow_terms
+        ):
+            return False
+        return self._has_risky_term(content, self._political_terms)
 
     def _classify_risk(self, content: str) -> str:
         """根据当前尺度等级判断风险。"""
