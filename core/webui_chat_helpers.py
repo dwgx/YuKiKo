@@ -569,6 +569,38 @@ def _guess_media_type_from_hint(hint: str, fallback: str = "application/octet-st
     return guessed or fallback
 
 
+def _is_dns_interception_range(ip: object) -> bool:
+    """这个地址是否属于 DNS 拦截常用的 RFC 2544 基准测试段（198.18.0.0/15）。
+
+    Python 的 `ipaddress` 把 198.18.0.0/15 判为 `is_private=True`，但它是
+    **RFC 2544 基准测试段**，不是真实内网。VPN / 代理 / 某些企业网关会把公网
+    域名解析到这个段做流量拦截，于是所有真实站点都会被 SSRF 判定误伤。
+
+    实测（2026-08-06，业主本机）：`v.douyin.com` / `www.bilibili.com` /
+    `www.zhihu.com` / `music.163.com` / `github.com` 全部解析到 198.18.x.x，
+    `_is_private_ip` 对六个真实站点全判内网。
+
+    这不是测试环境的假象 —— 机器人自己的日志里有真实受害记录：08-05 群友发的
+    抖音链接被 `parse_video` 拒为「命中了安全限制（内网/本地地址不可访问）」，
+    模型随后把同一 URL 重试 4 次、烧完 8 步 54 秒、零产出
+    （trace 118886-4-6b429ed2，`external_fact_ok=0`）。
+
+    排除这个段不削弱真实防护：
+    - 云元数据端点 169.254.169.254 属 `link_local`，是另一条检查，不受影响
+    - loopback / 10.0.0.0/8 / 192.168.0.0/16 / 172.16.0.0/12 全部照旧拦截
+    - 该段是基准测试保留段，正常内网服务不会部署在这里
+    """
+
+    import ipaddress
+
+    if not isinstance(ip, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        return False
+    try:
+        return ip in ipaddress.ip_network("198.18.0.0/15")
+    except (TypeError, ValueError):
+        return False
+
+
 def _is_private_ip(hostname: str) -> bool:
     """检查 hostname 是否指向私有/内网地址，防止 SSRF。"""
     import ipaddress
@@ -577,6 +609,8 @@ def _is_private_ip(hostname: str) -> bool:
         for info in socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM):
             addr = info[4][0]
             ip = ipaddress.ip_address(addr)
+            if _is_dns_interception_range(ip):
+                continue
             if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
                 return True
     except (socket.gaierror, ValueError):

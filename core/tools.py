@@ -2114,6 +2114,17 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
     def _is_public_ip_obj(
         ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address,
     ) -> bool:
+        # DNS 拦截段（198.18.0.0/15，RFC 2544 基准测试段）当公网处理。
+        # Python 把它判为 is_private，但 VPN / 代理会把公网域名解析到这里，
+        # 于是真实站点被误判成内网。实测本机 v.douyin.com / bilibili / zhihu /
+        # 163 / github 全落在这个段里，而机器人日志中 08-05 群友的抖音链接
+        # 正是这样被拒的（trace 118886-4-6b429ed2，模型随后重试 4 次烧完 8 步）。
+        # 不影响 169.254.169.254（link_local）与其余真实内网段的拦截。
+        # 完整理由见 core/webui_chat_helpers.py::_is_dns_interception_range。
+        from core.webui_chat_helpers import _is_dns_interception_range
+
+        if _is_dns_interception_range(ip_obj):
+            return True
         return not (
             ip_obj.is_private
             or ip_obj.is_loopback
