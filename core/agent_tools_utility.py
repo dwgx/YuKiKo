@@ -360,11 +360,31 @@ async def _handle_send_emoji(args: dict[str, Any], context: dict[str, Any]) -> T
     emoji_level = normalize_text(str(control.get("emoji_level", "medium"))).lower() or "medium"
     if emoji_level == "off":
         return ToolCallResult(ok=False, data={}, display="emoji_disabled_by_control")
-    if query.lower() in {"随机", "random"}:
+    # 概率门只用于「模型自己想加个表情调节气氛」，不能用于「用户明确要求发」。
+    #
+    # 2026-08-06 业主报「我给他添加表情包他也不发」，实测根因就在这里：
+    # 说「发个表情包」→ 模型正确调 send_emoji(query="随机", turn_goal="send")
+    # → 这里掷骰子，medium 档 55% 概率直接拒，且回一句
+    # 「当前语境不适合发表情」——那句话是假的，实际是随机数，
+    # 用户和模型都无从判断到底为什么没发。
+    #
+    # `turn_goal` 的语义就是判别信号，见 _check_sticker_send_turn_goal 的注释：
+    # send = 「用户确实要你把表情发到聊天里」。既然模型已经这样声明，
+    # 概率门与之直接矛盾。
+    explicit_send_request = (
+        normalize_text(str(args.get("turn_goal", ""))).lower() == _STICKER_TURN_GOAL_SEND
+    )
+    if query.lower() in {"随机", "random"} and not explicit_send_request:
         prob_map = {"low": 0.2, "medium": 0.45, "high": 0.75}
         p = float(prob_map.get(emoji_level, 0.45))
         if random.random() > p:
-            return ToolCallResult(ok=False, data={}, display="当前语境不适合发表情")
+            return ToolCallResult(
+                ok=False,
+                data={},
+                # 说清是概率抑制，不要谎称「语境不适合」——模型会据此错误地
+                # 认为该换个查询词重试，白烧一步。
+                display="这轮随机抑制了自发表情（不是用户点名要的场合）",
+            )
 
     sticker_mgr = context.get("sticker_manager")
     if not sticker_mgr:

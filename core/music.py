@@ -25,6 +25,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from core.soundcloud import SoundCloudClient
+from utils.media import sniff_audio_container
 from utils.text import has_unrequested_title_qualifier, normalize_matching_text, normalize_text
 
 _log = logging.getLogger("yukiko.music")
@@ -1720,9 +1721,41 @@ class MusicEngine:
             return False
 
         try:
-            return target_path.exists() and target_path.stat().st_size > 1024
+            if not target_path.exists() or target_path.stat().st_size <= 1024:
+                return False
         except Exception:
             return False
+
+        # 内容必须真的是音频。
+        #
+        # 原来这里只检查 `size > 1024`，而上游返回的 HTML 错误页轻松超过 1024 字节，
+        # 于是错误页被存成 .mp3 发出去。业主报「他发的语音听歌也听不了」，
+        # 实测日志里对应的是 ffmpeg 的
+        #   extract_audio_failed | *.mp3 | Format mp3 detected only with low score of 1
+        # —— ffmpeg 在说这个文件根本不是 mp3。
+        #
+        # 判定复用 utils/media.py::sniff_audio_container（napcat 的下载工具路径
+        # 早就在做同类校验，music.py 这条路没接 —— 又一处「防护存在但另一条路没接」）。
+        container = sniff_audio_container(target_path)
+        if not container:
+            head = b""
+            try:
+                head = target_path.read_bytes()[:64]
+            except Exception:
+                pass
+            _log.warning(
+                "music_download_not_audio | url=%s | bytes=%d | head=%r | "
+                "上游大概返回了错误页而不是音频",
+                url[:120],
+                target_path.stat().st_size,
+                head[:32],
+            )
+            # 还能转码就交给 ffmpeg 再试一次（有些源给的是容器不带魔数的流）
+            if self._ffmpeg and await self._transcode_remote_audio_to_mp3(url, target_path):
+                return bool(sniff_audio_container(target_path))
+            target_path.unlink(missing_ok=True)
+            return False
+        return True
 
     @staticmethod
     def _should_transcode_remote_audio(url: str, content_type: str) -> bool:
