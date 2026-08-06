@@ -102,6 +102,7 @@ class OpenAICompatibleClient(BaseLLMClient):
                     tool_choice=tool_choice,
                 )
                 self._record_served_model(candidate_model, index, bool(tools))
+                self._warn_if_output_truncated(result, candidate_model, resolved_max_tokens, bool(tools))
                 return result
             except Exception as exc:
                 last_exc = exc
@@ -252,6 +253,85 @@ class OpenAICompatibleClient(BaseLLMClient):
         else:
             _log.info("model_primary_serving | provider=%s | served=%s", self.provider, served)
 
+    @staticmethod
+    def _responses_finish_reason(data: dict[str, Any]) -> str:
+        """把 Responses API 的截断信号翻译成 chat/completions 的 ``finish_reason``。
+
+        /responses 不返回 finish_reason，而是用 ``status="incomplete"`` +
+        ``incomplete_details.reason="max_output_tokens"`` 表达「被输出预算切断」。
+        这里原先硬编码 ``"stop"``，等于把该通道的截断信号丢掉：输出明明被 max_output_tokens
+        截断，日志里却显示正常收尾，于是只能去怀疑模型或 prompt。
+        """
+        if not isinstance(data, dict):
+            return "stop"
+        details = data.get("incomplete_details")
+        reason = ""
+        if isinstance(details, dict):
+            reason = str(details.get("reason") or "").strip().lower()
+        status = str(data.get("status") or "").strip().lower()
+        if reason in {"max_output_tokens", "max_tokens", "length"}:
+            return "length"
+        if reason in {"content_filter", "content_policy"}:
+            return "content_filter"
+        # status=incomplete 但没给 reason：仍属未说完，按截断处理比按正常收尾更接近事实。
+        if status == "incomplete":
+            return "length"
+        return "stop"
+
+    @staticmethod
+    def _extract_finish_reason(result: Any) -> str:
+        if not isinstance(result, dict):
+            return ""
+        choices = result.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        first = choices[0]
+        if not isinstance(first, dict):
+            return ""
+        return str(first.get("finish_reason") or "").strip().lower()
+
+    def _warn_if_output_truncated(
+        self, result: Any, model_name: str, max_tokens: int, with_tools: bool
+    ) -> None:
+        """输出被 max_tokens 截断时告警。
+
+        ``finish_reason == "length"`` 说明模型没说完就被切断。带 tools 时后果更严重：
+        tool_call 的 arguments JSON 会断在半路，**看起来和「模型吐坏 JSON」完全一样**，
+        于是上层把它当畸形 JSON 去修，而真正的原因是输出预算不够。
+        原先这个信号虽然被解析并回传，但全仓无任何调用方读取，两类故障因此无法区分。
+
+        畸形 arguments 至少有三个独立成因，日志必须能把它们分开，否则只会修错地方：
+        1. 本函数报的输出截断（预算不够）—— 解法是加 max_tokens，不是修 JSON；
+        2. 网关返回结构性畸形（实测 ``{}{"url": ...}``，空对象拼真对象）—— 在
+           ``core/agent.py`` 修复，与截断无关；
+        3. 弱模型在大工具面下的能力不足 —— 由 ``depth`` 字段指认。
+
+        ``max_tokens`` 传的是本次请求**实际发出**的值（``resolved_max_tokens``，
+        即 per-call 覆盖后的结果），不是 ``self.max_tokens`` 配置值。
+        实测二者不同：agent 循环按 ``agent.max_tokens``（缺省 4096）发请求，
+        而 ``config/config.yml`` 的 ``api.max_tokens`` 是 1600 —— 打配置值会指向错误的旋钮。
+
+        **不要改成用 usage 推断截断。** 2026-08-05 实测（原始请求，绕过本客户端）：
+        skiapi 网关**完全忽略 max_tokens** —— 发 ``max_tokens=8`` 仍返回
+        ``completion_tokens=604`` 且 ``finish_reason="stop"``。
+        因此在该网关上 ``completion_tokens >= max_tokens`` 恒成立，拿它当截断信号会
+        每次都误报，把这里变成噪声源。只信 provider 自报的 finish_reason。
+        同一次实测的副产物：该网关对一句话 prompt 报 ``prompt_tokens=4928``，
+        说明它自己往上游塞了东西 —— 它的 usage 数字不能用来做本地预算核算。
+        """
+        if self._extract_finish_reason(result) != "length":
+            return
+        _log.warning(
+            "model_output_truncated | provider=%s | model=%s | depth=%d | max_tokens=%d"
+            " | with_tools=%s%s",
+            self.provider,
+            model_name,
+            self._served_depth,
+            max_tokens,
+            with_tools,
+            " | tool_call arguments 可能被截断，勿误判为模型畸形输出" if with_tools else "",
+        )
+
     def served_model_state(self) -> dict[str, Any]:
         """暴露当前实际服务的模型状态，供上层按模型能力自适应。
 
@@ -359,7 +439,7 @@ class OpenAICompatibleClient(BaseLLMClient):
                 {
                     "index": 0,
                     "message": {"role": "assistant", "content": content},
-                    "finish_reason": "stop",
+                    "finish_reason": self._responses_finish_reason(data),
                 }
             ],
             "raw": data,

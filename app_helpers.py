@@ -764,8 +764,19 @@ async def _safe_send(bot: Bot, event: MessageEvent, message: Message) -> bool:
         _log.debug("safe_send_primary_fail | %s", e)
         await _maybe_block_group_send_on_error(bot=bot, event=event, exc=e)
         if _is_hard_send_channel_error(e):
-            _suspend_bot_send(bot_id=bot_id, seconds=120, reason=f"hard_send_error:{clip_text(str(e), 80)}")
+            _suspend_bot_send(bot_id=bot_id, seconds=120, reason=f"hard_send_error:{clip_text(str(e), 200)}")
             _log.warning("safe_send_abort_hard_error | bot=%s | group=%s", bot_id or "-", group_id)
+            return False
+        if _is_unretryable_send_error(e):
+            # 结果未知：可能已经发出去了。不重发（避免重复刷屏），但也不停整个 bot。
+            # 报文截到 200 字而不是 80 —— 80 会把 `EventChecker ...` 后面的真实原因切掉，
+            # 实测 31 条里有 21 条只剩 "EventChecker ..." 看不出是哪个通道。
+            _log.warning(
+                "safe_send_outcome_unknown | bot=%s | group=%s | detail=%s",
+                bot_id or "-",
+                group_id,
+                clip_text(str(e), 200),
+            )
             return False
         if _is_transient_send_error(e):
             retry_delays = (0.5, 1.2)
@@ -782,9 +793,18 @@ async def _safe_send(bot: Bot, event: MessageEvent, message: Message) -> bool:
                         _suspend_bot_send(
                             bot_id=bot_id,
                             seconds=120,
-                            reason=f"hard_send_error:{clip_text(str(retry_exc), 80)}",
+                            reason=f"hard_send_error:{clip_text(str(retry_exc), 200)}",
                         )
                         _log.warning("safe_send_abort_hard_error_retry | bot=%s | group=%s", bot_id or "-", group_id)
+                        return False
+                    if _is_unretryable_send_error(retry_exc):
+                        _log.warning(
+                            "safe_send_outcome_unknown_retry | bot=%s | group=%s | attempt=%d | detail=%s",
+                            bot_id or "-",
+                            group_id,
+                            idx,
+                            clip_text(str(retry_exc), 200),
+                        )
                         return False
             # 网络/链路类错误重试后仍失败时，不做 payload 回退，避免重复刷同一条。
             _log.warning("safe_send_abort_after_transient_retries | bot=%s | group=%s", bot_id or "-", group_id)

@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import ipaddress
 import logging
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,7 +77,10 @@ class MusicKeywordIntent:
 class MusicEngine:
     """Search + play + silk conversion."""
 
-    _DEFAULT_API_BASE = "http://mc.alger.fun/api"
+    # 默认不预设任何第三方聚合 API：旧默认 http://mc.alger.fun/api 实测已失效（503），
+    # 且是明文 HTTP。业主想用聚合源就自己在 music.api_bases 里填 HTTPS 候选。
+    # 留空时搜索直接走 netease 官方 HTTPS + core/music_sources.py 本地音源。
+    _DEFAULT_API_BASE = ""
     _NETEASE_SEARCH_URL = "https://music.163.com/api/search/get"
     _NETEASE_PLAYER_URL = "https://music.163.com/api/song/enhance/player/url"
     _ALGER_PLAYER_URL_V1 = "/song/url/v1"
@@ -86,17 +92,43 @@ class MusicEngine:
     _DEFAULT_MAX_VOICE_DURATION_S = 0  # 0 means no truncation
     _DEFAULT_TRIAL_MAX_DURATION_MS = 35_000
     _BREAK_LIMIT_MIN_FULL_MS = 90_000
+    # 聚合源整体墙钟预算：实测挂掉的上游一次 503 就要 5.1s，旧逻辑一个 query variant
+    # 能烧 7 次 ≈ 39s，直接吃满 agent 的 tool_timeout_seconds=28，可用的 netease 腿
+    # （实测 0.9s 出 10 条）永远轮不到。预算到点就放弃聚合源，交给后面的兜底。
+    _DEFAULT_UPSTREAM_BUDGET_S = 8.0
+    # 同一 host 判定不可达后的静默期：期内跳过，不再发请求也不再烧预算。
+    _DEFAULT_UNREACHABLE_COOLDOWN_S = 300.0
+    _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
     def __init__(self, cfg: dict[str, Any] | None = None):
         cfg = cfg or {}
         music_cfg = cfg.get("music", cfg) if isinstance(cfg, dict) else {}
 
         self._enable = bool(music_cfg.get("enable", True))
-        self._api_base = str(music_cfg.get("api_base", self._DEFAULT_API_BASE)).rstrip("/")
+        self._allow_insecure_api_base = bool(music_cfg.get("allow_insecure_api_base", False))
+        self._api_bases = self._resolve_api_bases(music_cfg)
+        # 兼容仍按单个基址读的调用方（get_lyrics 等）。
+        self._api_base = self._api_bases[0] if self._api_bases else ""
         self._cache_dir = Path(music_cfg.get("cache_dir", "storage/cache/music"))
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._timeout = float(music_cfg.get("timeout_seconds", 10))
+        self._upstream_budget_s = max(
+            2.0, float(music_cfg.get("upstream_budget_seconds", self._DEFAULT_UPSTREAM_BUDGET_S))
+        )
+        self._unreachable_cooldown_s = max(
+            0.0,
+            float(music_cfg.get("unreachable_cooldown_seconds", self._DEFAULT_UNREACHABLE_COOLDOWN_S)),
+        )
+        # host → 静默期截止时间戳（熔断器）。
+        self._unreachable_until: dict[str, float] = {}
+        # 「本次工具调用」的聚合源总预算截止点。None = 不在一次操作里。
+        # 必须是每次 search()/play() 一个，而不是每次 _search_alger()/_get_alger_url() 一个：
+        # search() 对每个 query variant 各调一次 _search_alger（实测
+        # _build_search_queries('蛋堡 热水澡') 产出 4 个 variant），
+        # play() 对最多 8 个候选各调一次 _get_alger_url ——
+        # 预算写 8 秒、实际能烧 32~64 秒，「秒级放弃」的契约就是假的。
+        self._operation_deadline: float | None = None
         self._ffmpeg = shutil.which("ffmpeg") or self._find_bundled_ffmpeg() or ""
         self._pilk_available = self._check_pilk()
 
@@ -137,7 +169,6 @@ class MusicEngine:
                 _log.warning("music_source_matcher_init_fail | %s", exc)
                 self._source_matcher = None
 
-        self._alger_web_base = self._derive_alger_web_base(self._api_base)
         self._alger_discovered_api_bases: list[str] = []
         self._soundcloud_client = SoundCloudClient(timeout=max(8.0, self._timeout))
 
@@ -519,6 +550,212 @@ class MusicEngine:
                 break
         return merged
 
+    # ── 聚合 API 基址：多候选 + HTTPS 强制 ──────────────────────────
+    def _resolve_api_bases(self, music_cfg: dict[str, Any]) -> list[str]:
+        """合并 music.api_bases（列表）与 music.api_base（单值，向后兼容），按序去重。
+
+        默认要求 HTTPS。公网明文 HTTP 候选被丢弃并留 WARNING，除非
+        music.allow_insecure_api_base 为真；环回/内网地址一律放行（自建服务不出网）。
+        """
+        raw_candidates: list[Any] = []
+        configured_list = music_cfg.get("api_bases")
+        if isinstance(configured_list, str):
+            raw_candidates.extend(re.split(r"[,\s]+", configured_list))
+        elif isinstance(configured_list, (list, tuple)):
+            raw_candidates.extend(configured_list)
+        raw_candidates.append(music_cfg.get("api_base", self._DEFAULT_API_BASE))
+
+        out: list[str] = []
+        for item in raw_candidates:
+            base = normalize_text(str(item or "")).rstrip("/")
+            if not base or base in out:
+                continue
+            if self._is_insecure_public_base(base):
+                if not self._allow_insecure_api_base:
+                    _log.warning(
+                        "music_api_base_insecure_skipped | base=%s | "
+                        "出网调用必须 HTTPS；要放行请开 music.allow_insecure_api_base",
+                        base,
+                    )
+                    continue
+                _log.warning("music_api_base_insecure_allowed | base=%s", base)
+            out.append(base)
+        return out
+
+    @staticmethod
+    def _is_insecure_public_base(base: str) -> bool:
+        """明文 HTTP 且指向公网 host 时为真（环回/内网自建服务不算）。"""
+        parsed = urlparse(base)
+        if normalize_text(parsed.scheme).lower() != "http":
+            return False
+        host = normalize_text(parsed.hostname or "").lower()
+        if not host or host == "localhost" or host.endswith(".localhost"):
+            return False
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            return True
+        return not (addr.is_loopback or addr.is_private or addr.is_link_local)
+
+    @staticmethod
+    def _base_host(url: str) -> str:
+        return normalize_text(urlparse(normalize_text(url)).netloc).lower()
+
+    def _is_host_unreachable(self, url: str) -> bool:
+        """该 host 是否处于熔断静默期。"""
+        host = self._base_host(url)
+        if not host:
+            return False
+        until = self._unreachable_until.get(host, 0.0)
+        if until <= 0:
+            return False
+        if until > time.monotonic():
+            return True
+        self._unreachable_until.pop(host, None)
+        return False
+
+    def _mark_host_unreachable(self, url: str, reason: str) -> None:
+        host = self._base_host(url)
+        if not host or self._unreachable_cooldown_s <= 0:
+            return
+        already_open = self._is_host_unreachable(url)
+        self._unreachable_until[host] = time.monotonic() + self._unreachable_cooldown_s
+        if not already_open:
+            _log.warning(
+                "music_api_host_circuit_open | host=%s | cooldown=%.0fs | reason=%s",
+                host,
+                self._unreachable_cooldown_s,
+                reason[:160],
+            )
+
+    def _resolve_upstream_deadline(self) -> float:
+        """取聚合源预算截止点：优先用本次操作的，没有才现算一个。
+
+        `_operation_deadline` 由 `_upstream_operation()` 在 search()/play() 入口设置，
+        所以同一次工具调用里的多次 variant / 候选请求**共享**一个预算。
+        独立调用（比如单独取歌词）拿不到操作上下文，就退回单次预算 ——
+        行为与改动前一致，不会变得更松。
+        """
+
+        pending = self._operation_deadline
+        if pending is not None:
+            return pending
+        return time.monotonic() + self._upstream_budget_s
+
+    @contextlib.contextmanager
+    def _upstream_operation(self):
+        """把一次工具调用内的所有聚合源请求圈进同一个预算。
+
+        嵌套调用（play() 内部又调 search()）沿用外层截止点，不重置 ——
+        否则内层一重置，外层的「秒级放弃」就又失效了。
+        """
+
+        if self._operation_deadline is not None:
+            yield
+            return
+        self._operation_deadline = time.monotonic() + self._upstream_budget_s
+        try:
+            yield
+        finally:
+            self._operation_deadline = None
+
+    async def _fetch_alger_json(
+        self,
+        endpoint: str,
+        params: dict[str, Any],
+        *,
+        source: str,
+        deadline: float,
+    ) -> dict[str, Any] | None:
+        """请求一个聚合源端点。快速失败：预算耗尽或 host 熔断时直接放弃。
+
+        返回 None 表示这次没拿到可用 JSON，失败原因一定落一条 WARNING。
+        """
+        if self._is_host_unreachable(endpoint):
+            _log.warning(
+                "music_api_skip_circuit_open | source=%s | host=%s",
+                source,
+                self._base_host(endpoint),
+            )
+            return None
+
+        attempt = 0
+        while True:
+            attempt += 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _log.warning(
+                    "music_api_budget_exhausted | source=%s | endpoint=%s | attempt=%d",
+                    source,
+                    endpoint,
+                    attempt,
+                )
+                return None
+            request_timeout = min(self._timeout, remaining)
+            started = time.monotonic()
+            try:
+                async with httpx.AsyncClient(timeout=request_timeout, headers=self._COMMON_HEADERS) as client:
+                    resp = await client.get(endpoint, params=params)
+                    status = resp.status_code
+                    if status in self._RETRYABLE_STATUS:
+                        cost = time.monotonic() - started
+                        # 只在还够再跑一次同等开销的请求时才重试，避免把预算烧在死上游。
+                        if attempt < 2 and (deadline - time.monotonic()) > cost:
+                            continue
+                        self._mark_host_unreachable(endpoint, f"http_{status}")
+                        _log.warning(
+                            "music_api_fail | source=%s | endpoint=%s | status=%d | attempts=%d",
+                            source,
+                            endpoint,
+                            status,
+                            attempt,
+                        )
+                        return None
+                    resp.raise_for_status()
+                    data = resp.json()
+            except httpx.TransportError as exc:
+                self._mark_host_unreachable(endpoint, type(exc).__name__)
+                _log.warning(
+                    "music_api_fail | source=%s | endpoint=%s | transport=%s | %s",
+                    source,
+                    endpoint,
+                    type(exc).__name__,
+                    exc,
+                )
+                return None
+            except Exception as exc:
+                # 这条原来只记 WARNING 就 return，**不标记 host 不可达** ——
+                # 于是「熔断期内零请求」只覆盖了 TransportError 和可重试 5xx，
+                # 而最常见的形态（稳定 7s 回 404、HTTP 200 但 body 不是 JSON）
+                # 一律漏过去。实测后果：上游稳定回 404 时跑完 4 个 variant / 8 次 HTTP，
+                # _unreachable_until 仍是空的，下一回合从头再烧一遍
+                # （ToolExecutor 长驻，熔断状态本该跨回合复用）。
+                #
+                # 慢/坏响应与连不上是同一类事实：这个 host 现在给不出可用 JSON。
+                # 所以一并熔断。判定只看「有没有拿到可用响应」这个结构事实，
+                # 不去猜错误语义。
+                self._mark_host_unreachable(endpoint, f"bad_response:{type(exc).__name__}")
+                _log.warning(
+                    "music_api_fail | source=%s | endpoint=%s | exc=%s | %s | circuit=opened",
+                    source,
+                    endpoint,
+                    type(exc).__name__,
+                    exc,
+                )
+                return None
+            if not isinstance(data, dict):
+                # 200 + 非 JSON 对象：同样是「这个 host 给不出可用 JSON」。
+                self._mark_host_unreachable(endpoint, "non_dict_payload")
+                _log.warning(
+                    "music_api_fail | source=%s | endpoint=%s | reason=non_dict_payload"
+                    " | got=%s | circuit=opened",
+                    source,
+                    endpoint,
+                    type(data).__name__,
+                )
+                return None
+            return data
+
     @staticmethod
     def _derive_alger_web_base(api_base: str) -> str:
         base = normalize_text(api_base).rstrip("/")
@@ -544,11 +781,53 @@ class MusicEngine:
             return f"{parsed.scheme}://{parsed.netloc}/api"
         return ""
 
-    async def _discover_alger_api_bases_via_crawl(self) -> list[str]:
-        """从 Alger 前端页面/JS 中提取 API 基址，作为 API 不可用时的爬虫兜底。"""
-        web_base = normalize_text(self._alger_web_base).rstrip("/")
+    async def _discover_alger_api_bases_via_crawl(self, *, deadline: float | None = None) -> list[str]:
+        """从各候选基址的前端页面/JS 中提取 API 基址，作为 API 不可用时的爬虫兜底。
+
+        熔断中的 host 直接跳过 —— 上游整台挂掉时再去爬它的首页只是白烧预算。
+        """
+        out: list[str] = []
+        for api_base in self._api_bases:
+            if deadline is not None and time.monotonic() >= deadline:
+                _log.warning("music_crawl_budget_exhausted | base=%s", api_base)
+                break
+            if self._is_host_unreachable(api_base):
+                continue
+            for found in await self._crawl_one_web_base(
+                self._derive_alger_web_base(api_base), api_base, deadline=deadline
+            ):
+                if found not in out:
+                    out.append(found)
+        return out
+
+    async def _crawl_one_web_base(
+        self, web_base: str, api_base: str, *, deadline: float | None = None
+    ) -> list[str]:
+        """爬一个前端站点找 API 基址。**每个请求都要夹 deadline。**
+
+        原实现只在外层 `_discover_alger_api_bases_via_crawl` 的循环顶检查一次 deadline，
+        进来之后用 `self._timeout`（模板 15s）发最多 5 个请求（1 个首页 + 4 个 JS），
+        一个都不夹 remaining —— 单次爬取最坏 5×15=75 秒，而 upstream_budget_seconds 写的是 8。
+        「秒级放弃聚合源」的契约在这条腿上完全不成立。
+        """
+        web_base = normalize_text(web_base).rstrip("/")
         if not web_base:
             return []
+
+        def _budget_left() -> float:
+            """剩余预算。没有 deadline 时退回单次 timeout，行为与改动前一致。"""
+
+            if deadline is None:
+                return float(self._timeout)
+            return deadline - time.monotonic()
+
+        def _request_timeout() -> float | None:
+            """本次请求该用多长超时。None 表示预算已耗尽，别发了。"""
+
+            left = _budget_left()
+            if left <= 0:
+                return None
+            return max(0.5, min(float(self._timeout), left))
 
         script_urls: list[str] = []
         discovered: list[str] = []
@@ -568,10 +847,14 @@ class MusicEngine:
             seen.add(normalized)
             discovered.append(normalized)
 
-        _add_api_base(self._api_base)
+        _add_api_base(api_base)
 
+        index_timeout = _request_timeout()
+        if index_timeout is None:
+            _log.warning("music_crawl_budget_exhausted | stage=index | web=%s", web_base)
+            return discovered
         try:
-            async with httpx.AsyncClient(timeout=max(10.0, self._timeout), headers=self._COMMON_HEADERS) as client:
+            async with httpx.AsyncClient(timeout=index_timeout, headers=self._COMMON_HEADERS) as client:
                 index_resp = await client.get(web_base)
                 index_resp.raise_for_status()
                 html = normalize_text(index_resp.text)
@@ -586,8 +869,17 @@ class MusicEngine:
                         break
 
                 for js_url in script_urls:
+                    js_timeout = _request_timeout()
+                    if js_timeout is None:
+                        _log.warning(
+                            "music_crawl_budget_exhausted | stage=js | web=%s | fetched=%d/%d",
+                            web_base,
+                            script_urls.index(js_url),
+                            len(script_urls),
+                        )
+                        break
                     try:
-                        js_resp = await client.get(js_url)
+                        js_resp = await client.get(js_url, timeout=js_timeout)
                         js_resp.raise_for_status()
                         js_text = normalize_text(js_resp.text)
                     except Exception:
@@ -599,8 +891,12 @@ class MusicEngine:
                     # 前端常见 request.get("/song/url/v1")，至少可反推出同域 /api。
                     if ("/song/url/v1" in js_text) or ("/song/url" in js_text and "/search" in js_text):
                         _add_api_base(f"{web_base}/api")
+        except httpx.TransportError as exc:
+            self._mark_host_unreachable(web_base, type(exc).__name__)
+            _log.warning("alger_crawl_discover_fail | web=%s | %s", web_base, exc)
+            return discovered
         except Exception as exc:
-            _log.warning("alger_crawl_discover_fail | %s", exc)
+            _log.warning("alger_crawl_discover_fail | web=%s | %s", web_base, exc)
             return discovered
 
         if len(discovered) > 1:
@@ -611,60 +907,53 @@ class MusicEngine:
             )
         return discovered
 
-    async def _candidate_alger_api_bases(self) -> list[str]:
-        base = self._normalize_alger_api_base(self._api_base)
+    def _candidate_alger_api_bases(self) -> list[str]:
+        """全部聚合源候选（配置顺序 + 爬虫发现），已剔除熔断中的 host。"""
         out: list[str] = []
-        if base:
-            out.append(base)
-        for item in self._alger_discovered_api_bases:
+        skipped = 0
+        for item in [*self._api_bases, *self._alger_discovered_api_bases]:
             norm = self._normalize_alger_api_base(item)
-            if norm and norm not in out:
-                out.append(norm)
+            if not norm or norm in out:
+                continue
+            if self._is_host_unreachable(norm):
+                skipped += 1
+                continue
+            out.append(norm)
+        if skipped and not out:
+            _log.warning("music_api_all_candidates_circuit_open | skipped=%d", skipped)
         return out
 
     async def _search_alger(self, keyword: str, limit: int) -> list[MusicSearchResult]:
         params = {"keywords": keyword, "limit": limit}
         tried: set[str] = set()
+        deadline = self._resolve_upstream_deadline()
 
         async def _try_search(base: str, source: str) -> list[MusicSearchResult]:
             endpoint = f"{base}{self._ALGER_SEARCH_URL}"
-            key = f"{source}:{endpoint}"
-            if key in tried:
+            if endpoint in tried:
                 return []
-            tried.add(key)
-            # 带重试的请求（Alger 偶发 502）
-            last_exc: Exception | None = None
-            for attempt in range(3):
-                try:
-                    async with httpx.AsyncClient(timeout=self._timeout, headers=self._COMMON_HEADERS) as client:
-                        resp = await client.get(endpoint, params=params)
-                        if resp.status_code == 502 and attempt < 2:
-                            await asyncio.sleep(0.5 * (attempt + 1))
-                            continue
-                        resp.raise_for_status()
-                        data = resp.json()
-                except Exception as exc:
-                    last_exc = exc
-                    if attempt < 2:
-                        await asyncio.sleep(0.5 * (attempt + 1))
-                        continue
-                    _log.warning("alger_search_fail | source=%s | %s", source, exc)
-                    return []
-                rows = self._parse_search_songs(data)
-                if rows:
-                    return rows
+            tried.add(endpoint)
+            data = await self._fetch_alger_json(endpoint, params, source=source, deadline=deadline)
+            if data is None:
+                return []
+            rows = self._parse_search_songs(data)
+            if not rows:
                 _log.warning("alger_search_empty | source=%s | endpoint=%s", source, endpoint)
-                return []
-            if last_exc:
-                _log.warning("alger_search_fail | source=%s | %s", source, last_exc)
-            return []
+            return rows
 
-        for api_base in await self._candidate_alger_api_bases():
+        candidates = self._candidate_alger_api_bases()
+        for idx, api_base in enumerate(candidates):
             rows = await _try_search(api_base, source="api")
             if rows:
                 return rows
+            if idx + 1 < len(candidates):
+                _log.warning(
+                    "music_api_failover | from=%s | to=%s | stage=search",
+                    self._base_host(api_base),
+                    self._base_host(candidates[idx + 1]),
+                )
 
-        discovered = await self._discover_alger_api_bases_via_crawl()
+        discovered = await self._discover_alger_api_bases_via_crawl(deadline=deadline)
         for api_base in discovered:
             if api_base not in self._alger_discovered_api_bases:
                 self._alger_discovered_api_bases.append(api_base)
@@ -955,6 +1244,7 @@ class MusicEngine:
     async def _get_alger_url(self, song_id: int) -> MusicPlayUrl:
         best = MusicPlayUrl()
         tried: set[str] = set()
+        deadline = self._resolve_upstream_deadline()
 
         async def _try_base(api_base: str, source_tag: str) -> MusicPlayUrl:
             local_best = MusicPlayUrl()
@@ -963,39 +1253,33 @@ class MusicEngine:
                 (f"{api_base}{self._ALGER_PLAYER_URL}", {"id": song_id, "br": 320000}, "alger"),
             ]
             for endpoint, params, source in endpoint_rows:
-                key = f"{source_tag}:{endpoint}"
-                if key in tried:
+                if endpoint in tried:
                     continue
-                tried.add(key)
-                # 带重试（Alger 偶发 502）
-                for attempt in range(2):
-                    try:
-                        async with httpx.AsyncClient(timeout=self._timeout, headers=self._COMMON_HEADERS) as client:
-                            resp = await client.get(endpoint, params=params)
-                            if resp.status_code == 502 and attempt < 1:
-                                await asyncio.sleep(0.5)
-                                continue
-                            resp.raise_for_status()
-                            data = resp.json()
-                    except Exception as exc:
-                        if attempt < 1:
-                            await asyncio.sleep(0.5)
-                            continue
-                        _log.warning("alger_url_fail | id=%d | source=%s | %s", song_id, f"{source_tag}:{source}", exc)
-                        break
-                    rows = data.get("data", [])
-                    candidate = self._extract_play_url_meta(rows, source=f"{source_tag}:{source}")
-                    local_best = self._pick_better_url(local_best, candidate)
-                    break
+                tried.add(endpoint)
+                data = await self._fetch_alger_json(
+                    endpoint, params, source=f"{source_tag}:{source}", deadline=deadline
+                )
+                if data is None:
+                    continue
+                rows = data.get("data", [])
+                candidate = self._extract_play_url_meta(rows, source=f"{source_tag}:{source}")
+                local_best = self._pick_better_url(local_best, candidate)
             return local_best
 
-        for api_base in await self._candidate_alger_api_bases():
+        candidates = self._candidate_alger_api_bases()
+        for idx, api_base in enumerate(candidates):
             candidate = await _try_base(api_base, source_tag="api")
             best = self._pick_better_url(best, candidate)
             if best.url and not best.is_trial:
                 return best
+            if idx + 1 < len(candidates):
+                _log.warning(
+                    "music_api_failover | from=%s | to=%s | stage=play_url",
+                    self._base_host(api_base),
+                    self._base_host(candidates[idx + 1]),
+                )
 
-        discovered = await self._discover_alger_api_bases_via_crawl()
+        discovered = await self._discover_alger_api_bases_via_crawl(deadline=deadline)
         for api_base in discovered:
             if api_base not in self._alger_discovered_api_bases:
                 self._alger_discovered_api_bases.append(api_base)
@@ -1090,18 +1374,23 @@ class MusicEngine:
         return "\n".join(visible)
 
     async def get_lyrics(self, song_id: int) -> str:
-        url = f"{self._api_base}/lyric"
-        params = {"id": song_id}
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout, headers=self._COMMON_HEADERS) as client:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-        except Exception as exc:
-            _log.warning("lyric_fail | id=%d | %s", song_id, exc)
+        candidates = self._candidate_alger_api_bases()
+        if not candidates:
+            _log.warning("lyric_skip_no_api_base | id=%d | 未配置可用的 music.api_bases", song_id)
             return ""
-
-        return str(data.get("lrc", {}).get("lyric", "") or "")
+        params = {"id": song_id}
+        deadline = self._resolve_upstream_deadline()
+        for api_base in candidates:
+            data = await self._fetch_alger_json(
+                f"{api_base}/lyric", params, source="lyric", deadline=deadline
+            )
+            if data is None:
+                continue
+            lrc = data.get("lrc")
+            lyric = str(lrc.get("lyric", "") or "") if isinstance(lrc, dict) else ""
+            if lyric:
+                return lyric
+        return ""
 
     async def play(
         self,

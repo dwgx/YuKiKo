@@ -247,9 +247,14 @@ def _ask_output() -> dict[str, Any]:
 
 
 def _ask_music() -> dict[str, Any]:
-    print("\n── 音乐能力（Alger API）──")
+    print("\n── 音乐能力 ──")
     enable = _yes_no("启用点歌/听歌功能?", True)
-    api_base = _input("音乐 API 地址", "http://mc.alger.fun/api")
+    # 默认值从 http://mc.alger.fun/api 改成空：该上游实测彻底不可达
+    # （curl HTTP 000，HTTPS 版证书错误），而且是明文 HTTP。
+    # 留空时链路仍然可用 —— netease 官方 HTTPS 搜索 + 本地音源，
+    # 实测搜索 0.9s/10 条、play 端到端 4.4s 成功。
+    print("  留空即可：会用官方 HTTPS 搜索 + 本地音源。要用自建聚合 API 再填。")
+    api_base = _input("音乐 API 地址（可留空）", "")
     return {
         "enable": enable,
         "api_base": api_base,

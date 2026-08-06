@@ -55,6 +55,21 @@ _TRANSIENT_ERROR_CUES = (
     "<!doctype",
 )
 
+# 工具面上限建议。Anthropic 公开指引：工具数超过约 30–50 个后模型的选择准确率开始下降。
+#
+# 本仓的实测前提（必须一起读，否则会把这两个常量调错方向）：
+#   - navigator 每个分区最多 22 个工具，加 3 个控制工具（think / final_answer /
+#     navigate_section）共 25 个，本身已在上述区间之内；
+#   - 单个工具 schema 约 93 token，25 个约 2.1K token，不构成 token 压力。
+# 所以两档上限都**高于 25**：正常的分区化调用永远不会被裁剪。上限只兜住一条路径 ——
+# navigator 未启用、或 `scoped_tools()` 交集为空时，调用方会回落到全量
+# permission-visible 工具集（约 167 个 schema），那才是弱模型真正撑不住的场面。
+#
+# 降级档没有压到 22 以下，是刻意的：从 22 个里再砍几个，有相当概率砍掉本次真正需要的
+# 那一个，把「可修复的畸形 JSON」换成「任务直接做不了」，是更差的结果。
+_TOOL_CEILING_PRIMARY = 48
+_TOOL_CEILING_DEGRADED = 28
+
 
 class ModelClient:
     """按 provider 路由到不同厂商客户端，支持自动降级。
@@ -464,6 +479,72 @@ class ModelClient:
         state["provider_failover"] = self._active_provider != self._primary_provider
         state["degraded"] = bool(state.get("degraded")) or state["provider_failover"]
         return state
+
+    def tool_budget_advice(self) -> dict[str, Any]:
+        """按「当前实际服务的模型」给出工具面预算建议，供 agent 循环构造 tools 前查询。
+
+        纯函数式：只读 ``served_model_state()``，不改任何状态，同一状态下可反复调用。
+        返回值语义：
+
+        - ``max_tools``：本次建议的工具数上限（含控制工具）。降级时收紧。
+        - ``narrow_reason``：为什么收紧，直接写进日志，避免事后看不懂上限从哪来。
+        - ``degraded`` / ``model`` / ``depth`` / ``provider``：原样透出，便于同一行日志定位。
+
+        **不提供「简化 schema」开关是刻意的**：``_prune_tools_schema()`` 已在工具数 > 10 时
+        无条件压缩 description（100 字）与参数说明（60 字），主模型也照压，降级档没有额外
+        余量可压；再压就会切掉消歧指引（如 ``set_group_ban`` 说明里「user_id 留空时必须能
+        从 @ / 回复唯一解析」），那正是防止模型吐错参数的部分，等于助长它要治的病。
+        同理也不提供「丢可选参数」：本仓的 optional 常常是承重的
+        （``set_group_ban`` 的 group_id / user_id、``send_group_message`` 的 image_url
+        都在 required 之外），丢掉就是直接砍掉能力。
+        """
+        state = self.served_model_state()
+        degraded = bool(state.get("degraded"))
+        if not degraded:
+            return {
+                "max_tools": _TOOL_CEILING_PRIMARY,
+                "narrow_reason": "",
+                "degraded": False,
+                "model": state.get("model", ""),
+                "depth": int(state.get("depth", 0) or 0),
+                "provider": state.get("provider", ""),
+            }
+        reason = "provider_failover" if state.get("provider_failover") else "model_fallback"
+        return {
+            "max_tools": _TOOL_CEILING_DEGRADED,
+            "narrow_reason": f"{reason}:depth={int(state.get('depth', 0) or 0)}",
+            "degraded": True,
+            "model": state.get("model", ""),
+            "depth": int(state.get("depth", 0) or 0),
+            "provider": state.get("provider", ""),
+        }
+
+    @staticmethod
+    def enforce_tool_ceiling(
+        tool_names: list[str],
+        max_tools: int,
+        protected: tuple[str, ...] | list[str] = (),
+    ) -> tuple[list[str], int]:
+        """把工具名列表压到 ``max_tools`` 以内，返回 ``(裁剪后列表, 被丢弃数量)``。
+
+        ``protected`` 里的名字永不丢弃且保持在前 —— 控制工具（think / final_answer /
+        navigate_section）被丢掉的话，模型连「换分区」和「收尾」都做不到，会卡死在循环里。
+        其余按原顺序保留，因为上游的顺序已经带了相关性信息。
+
+        未超上限时原样返回（含顺序），因此可安全地无条件调用。
+        """
+        names = [str(n) for n in tool_names if str(n or "").strip()]
+        if max_tools <= 0 or len(names) <= max_tools:
+            return names, 0
+        protected_set = {str(p) for p in protected}
+        keep = [n for n in names if n in protected_set]
+        for name in names:
+            if len(keep) >= max_tools:
+                break
+            if name not in protected_set:
+                keep.append(name)
+        # 控制工具数量本身就超过上限时，宁可越界也不丢控制工具。
+        return keep, max(0, len(names) - len(keep))
 
     def supports_vision_input(self, model: str | None = None) -> bool:
         """判断当前模型是否支持图片输入（自动启发式，可被配置覆盖）。"""

@@ -18,3 +18,18 @@ rookiepy==0.5.6
 websockets==12.0
 pilk==0.2.4
 opencc-python-reimplemented==0.1.7
+# 语音转文字（analyze_voice）。装的是 faster-whisper，不是 openai-whisper ——
+# openai-whisper 从来没进过这个文件，所以 utils/media.py 里的 `import whisper`
+# 恒 ImportError，线上 analyze_voice 实测 0/9 成功。
+faster-whisper==1.1.1
+# faster_whisper/utils.py:8 是模块级 `import requests`，但 faster-whisper 1.1.1 的
+# 元数据里没声明它（Requires: av, ctranslate2, huggingface-hub, onnxruntime,
+# tokenizers, tqdm）。以前 requests 是 huggingface-hub 的传递依赖，而 hf-hub 1.x
+# 已换成 httpx、不再依赖 requests —— 不显式钉住，全新 clone 装完 import
+# faster_whisper 就 ImportError。
+requests==2.32.3
+# faster-whisper 只约束 ctranslate2<5,>=4.0。显式钉死本机实测通过的版本：
+# 它是带 C++ 后端的推理运行时，小版本升级会换 CPU kernel 与 compute_type 支持，
+# 是"装上了但转不出字"这类只在生产复现的问题的高发点。4.8.1 有
+# cp39~cp314 × macOS/Linux/Windows 全平台 wheel，钉死不影响任何目标平台安装。
+ctranslate2==4.8.1

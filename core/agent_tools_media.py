@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -939,27 +940,152 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
 
 # ── 语音分析 handler ──
 
-async def _handle_analyze_voice(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    """处理语音转文字请求。"""
-    from pathlib import Path as _Path
-    import hashlib
+# 语音落盘目录做成模块常量，测试可以指到临时目录，不必往真 storage 里塞 fixture。
+_VOICE_CACHE_DIR = Path("storage/cache/voice")
 
+# 失败时对用户说的话：不出现工具名、错误码、异常原文、pip 命令。
+# 业主实测抱怨过「analyze_image 又超时了」这种回复 —— display 会被模型抄进群。
+_VOICE_FAILURE_DISPLAY = {
+    "voice_not_found": "我没看到语音消息，你直接发一条语音、或者回复那条语音再叫我就行。",
+    "voice_fetch_failed": "这条语音我没取到文件，你再发一遍试试。",
+    "voice_decode_failed": "这段语音我没解开，方便的话打字说一句吧。",
+    "voice_engine_unavailable": "这条语音我这边暂时听不了，你要是方便打字说一句也行。",
+    "voice_transcribe_empty": "这段语音像是没录上声音，我这边听不到内容。",
+}
+
+# 曾经这里有个 _VOICE_ERROR_ALIAS，把 error 写成
+# "voice_engine_unavailable (whisper_not_installed)" 去兜三处 prompt 里的旧码。
+# 已删除：`error` 是要回喂给模型的（core/agent.py 把 result.error 写进 tool_result），
+# 带上 whisper 字样等于给模型一个把实现名抄进群里的机会 —— display 干净不代表安全。
+# 三处 failure_policy 文案已同步改成 voice_engine_unavailable：
+# core/prompt_navigator.py / config/prompts.yml / config/templates/master.template.yml。
+
+
+def _voice_failure(
+    code: str,
+    *,
+    trace_id: str = "",
+    stage: str = "",
+    reason: str = "",
+    src: str = "",
+) -> ToolCallResult:
+    """统一的语音失败出口：一条带 trace 的 WARNING + 一句干净的用户可见文案。"""
+    _log.warning(
+        "voice_analyze_failed | trace=%s | stage=%s | code=%s | reason=%s | src=%s",
+        trace_id or "-",
+        stage or "-",
+        code,
+        reason or "-",
+        clip_text(src, 120) or "-",
+    )
+    return ToolCallResult(
+        ok=False,
+        error=code,
+        display=_VOICE_FAILURE_DISPLAY.get(code, _VOICE_FAILURE_DISPLAY["voice_fetch_failed"]),
+    )
+
+
+async def _fetch_voice_bytes(
+    reference: str, cache_dir: Path, *, trace_id: str
+) -> tuple[Path | None, str]:
+    """把一个语音引用（http 直链或本机路径）落到缓存目录，返回 `(路径, reason)`。
+
+    落盘名统一 `{md5}.src` —— 旧代码硬编码 `.mp3`，而 QQ 语音其实是 SILK，
+    假扩展名只会误导后面的转码。
+    """
+    from utils.media import download_file
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    voice_path = cache_dir / f"{hashlib.md5(reference.encode()).hexdigest()}.src"
+    if voice_path.is_file() and voice_path.stat().st_size > 0:
+        return voice_path, ""
+
+    local_path = _resolve_local_path_from_uri(reference)
+    if local_path is not None:
+        try:
+            shutil.copyfile(local_path, voice_path)
+        except Exception as exc:
+            _log.warning(
+                "voice_local_copy_error | trace=%s | src=%s | %s", trace_id or "-", local_path, exc
+            )
+            return None, "local_copy_failed"
+        if voice_path.is_file() and voice_path.stat().st_size > 0:
+            return voice_path, ""
+        return None, "local_copy_empty"
+
+    if not re.match(r"^https?://", reference, flags=re.IGNORECASE):
+        return None, "not_fetchable"
+
+    try:
+        downloaded = await download_file(reference, voice_path, timeout=20.0)
+    except Exception as exc:
+        _log.warning(
+            "voice_download_error | trace=%s | url=%s | %s",
+            trace_id or "-",
+            clip_text(reference, 120),
+            exc,
+        )
+        return None, "download_exception"
+    # download_file 内部已经校验过落盘存在且非空，这里不重复判文件，
+    # 否则会把「下载成功」的契约收紧成「必须真有磁盘文件」。
+    if downloaded:
+        return voice_path, ""
+    return None, "download_failed"
+
+
+async def _voice_bytes_to_wav(voice_path: Path) -> tuple[str | None, str]:
+    """按字节探测容器再转 WAV，返回 `(wav 路径, reason)`。
+
+    QQ 语音是腾讯 SILK v3，ffmpeg 没有对应 demuxer，必须走 pilk；
+    旧代码在转码失败后把原始字节当 wav 直接喂给 ASR，只会制造假的空转写。
+    """
+    from utils.media import decode_silk_to_wav, extract_audio, sniff_audio_container
+
+    container = sniff_audio_container(voice_path)
+    wav_target = voice_path.with_suffix(".wav")
+    if container == "silk":
+        wav_path, reason = await decode_silk_to_wav(voice_path, wav_target)
+        if wav_path:
+            return wav_path, ""
+        return None, f"silk_{reason}"
+
+    wav_path = await extract_audio(voice_path, wav_target)
+    if wav_path:
+        return wav_path, ""
+    # 具体 stderr 已经由 utils.media 归一并落日志；这里只把容器名带回给上层的
+    # stage=decode 那一行，不重复打。
+    return None, f"decode_failed_container={container or 'unknown'}"
+
+
+async def _handle_analyze_voice(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """处理语音转文字请求。
+
+    取字节和转文字是两段独立的失败原因：本机 NapCat 的 get_record 会 spawn ffmpeg
+    被系统拒（retcode=1200 EPERM），所以 record 段自带的本机原始文件优先，
+    get_record 只在本地和 http 都拿不到时才兜底。
+    """
     explicit_url = normalize_text(str(args.get("url", "")))
     raw_segments = context.get("raw_segments", [])
     reply_media_segments = context.get("reply_media_segments", [])
     api_call = context.get("api_call")
+    trace_id = normalize_text(str(context.get("trace_id", "")))
 
+    local_candidates: list[str] = []
     url_candidates: list[str] = []
     file_id_candidates: list[str] = []
-    seen_urls: set[str] = set()
+    seen_refs: set[str] = set()
     seen_file_ids: set[str] = set()
 
-    def _append_voice_url(value: Any) -> None:
-        url = normalize_text(str(value))
-        if not url or url in seen_urls:
+    def _append_voice_ref(value: Any) -> None:
+        """按可读性分流：段内能直接读到的本机文件走本地道，其余当 http 直链。"""
+        ref = normalize_text(str(value))
+        if not ref or ref in seen_refs:
             return
-        seen_urls.add(url)
-        url_candidates.append(url)
+        seen_refs.add(ref)
+        if _resolve_local_path_from_uri(ref) is not None:
+            local_candidates.append(ref)
+        else:
+            url_candidates.append(ref)
 
     def _append_voice_file_id(value: Any) -> None:
         file_id = normalize_text(str(value))
@@ -969,7 +1095,7 @@ async def _handle_analyze_voice(args: dict[str, Any], context: dict[str, Any]) -
         file_id_candidates.append(file_id)
 
     if explicit_url:
-        _append_voice_url(explicit_url)
+        _append_voice_ref(explicit_url)
 
     for segs in (raw_segments, reply_media_segments):
         for seg in (segs or []):
@@ -981,117 +1107,243 @@ async def _handle_analyze_voice(args: dict[str, Any], context: dict[str, Any]) -
             data = seg.get("data", {}) or {}
             if not isinstance(data, dict):
                 continue
-            _append_voice_url(data.get("url", ""))
+            # path 是 NapCat 给的本机原始文件，旧代码完全没看它。
+            _append_voice_ref(data.get("path", ""))
+            _append_voice_ref(data.get("url", ""))
             _append_voice_file_id(data.get("file", "") or data.get("file_id", ""))
 
-    if not url_candidates and not file_id_candidates:
-        return ToolCallResult(
-            ok=False,
-            error="voice_not_found",
-            display="没有找到语音消息。请发送语音或回复一条语音消息再试。",
-        )
+    if not local_candidates and not url_candidates and not file_id_candidates:
+        return _voice_failure("voice_not_found", trace_id=trace_id, stage="collect")
 
-    # 尝试通过 NapCat API 用 file_id 反查完整可下载地址。
-    if callable(api_call):
+    cache_dir = _VOICE_CACHE_DIR
+    failure_codes: set[str] = set()
+
+    asr_spec = _resolve_asr_spec(context)
+    result = await _try_voice_candidates(
+        local_candidates + url_candidates,
+        cache_dir,
+        trace_id=trace_id,
+        failures=failure_codes,
+        asr_spec=asr_spec,
+    )
+    if result is not None:
+        return result
+
+    # 本地和 http 都没成的时候才去问 NapCat —— 它在本机是 spawn EPERM 死的。
+    # 唯一不值得问的情况是 ASR 引擎本身不在：再换一份字节回来也转不出文字。
+    ask_napcat = (
+        callable(api_call)
+        and bool(file_id_candidates)
+        and "voice_engine_unavailable" not in failure_codes
+    )
+    if ask_napcat:
+        recovered_refs: list[str] = []
         for voice_file_id in file_id_candidates:
             try:
-                result = await call_napcat_api(
-                    api_call,
-                    "get_record",
-                    file=voice_file_id,
-                    out_format="mp3",
+                record = await call_napcat_api(
+                    api_call, "get_record", file=voice_file_id, out_format="mp3"
                 )
             except Exception as exc:
-                _log.warning("voice_get_record_error | file=%s | %s", voice_file_id, exc)
+                _log.warning(
+                    "voice_get_record_error | trace=%s | file=%s | reason=api_error | %s",
+                    trace_id or "-",
+                    clip_text(voice_file_id, 80),
+                    exc,
+                )
                 continue
-            if not isinstance(result, dict):
+            if not isinstance(record, dict):
                 continue
-
-            # 某些实现直接返回转录文本
-            text = str(result.get("text", "")).strip()
+            # 某些实现直接返回转录文本。
+            text = str(record.get("text", "")).strip()
             if text:
                 return ToolCallResult(
                     ok=True,
                     data={"text": text, "source": "napcat_stt"},
                     display=f"语音内容: {text}",
                 )
+            for key in ("path", "url", "file"):
+                ref = normalize_text(str(record.get(key, "")))
+                if ref and ref not in seen_refs:
+                    seen_refs.add(ref)
+                    recovered_refs.append(ref)
 
-            _append_voice_url(result.get("url", "") or result.get("file", ""))
+        if recovered_refs:
+            result = await _try_voice_candidates(
+                recovered_refs,
+                cache_dir,
+                trace_id=trace_id,
+                failures=failure_codes,
+                asr_spec=asr_spec,
+            )
+            if result is not None:
+                return result
 
-    if not url_candidates:
-        return ToolCallResult(ok=False, error="voice_url_unavailable", display="无法获取语音文件地址")
+    # 一次回合里可能既有取不到的、也有解不开的：按严重度挑最靠后的那个报。
+    for code in ("voice_transcribe_empty", "voice_engine_unavailable", "voice_decode_failed"):
+        if code in failure_codes:
+            return _voice_failure(code, trace_id=trace_id, stage="transcribe")
+    return _voice_failure("voice_fetch_failed", trace_id=trace_id, stage="fetch")
 
+
+def _resolve_asr_spec(context: dict[str, Any]) -> dict[str, Any]:
+    """从运行时 config 取 ASR 规格（config.media.asr）。
+
+    不传的话 utils/media.py 会退到它自己的 _ASR_DEFAULT_* 常量与
+    YUKIKO_ASR_* 环境变量 —— 功能正确，但 config.yml / WebUI 里改了不生效。
+    读 context["config"] 而不是注册时的 config，是为了 /yukibot 热重载能立刻生效
+    （与 core/agent_tools_web.py:247 的 _resolve_qzone_config 同一套语义）。
+    """
+
+    runtime = context.get("config")
+    source = runtime if isinstance(runtime, dict) else {}
+    media = source.get("media") if isinstance(source.get("media"), dict) else {}
+    asr = media.get("asr") if isinstance(media.get("asr"), dict) else {}
+    spec: dict[str, Any] = {}
+    for key in ("model_size", "device", "compute_type"):
+        raw_value = asr.get(key)
+        # 不能直接 str(...)：str(None) 是 "None"，非空，会被当成合法规格
+        # 传给 faster-whisper，然后在加载模型时才炸。
+        if not isinstance(raw_value, str):
+            continue
+        value = normalize_text(raw_value)
+        if value:
+            spec[key] = value
     try:
-        from utils.media import download_file, extract_audio, transcribe_audio_enhanced
+        timeout = float(asr.get("timeout_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        timeout = 0.0
+    if timeout > 0:
+        spec["timeout"] = timeout
+    spec["enable"] = bool(asr.get("enable", True))
+    return spec
 
-        cache_dir = _Path("storage/cache/voice")
-        cache_dir.mkdir(parents=True, exist_ok=True)
 
-        had_download = False
-        had_empty_transcript = False
+async def _try_voice_candidates(
+    references: list[str],
+    cache_dir: Path,
+    *,
+    trace_id: str,
+    failures: set[str],
+    asr_spec: dict[str, Any] | None = None,
+) -> ToolCallResult | None:
+    """逐个候选走「取字节 → 转 WAV → 转写」，成功返回结果，否则记下失败码返回 None。"""
+    from utils.media import transcribe_audio_enhanced
 
-        for voice_url in url_candidates:
-            fname = hashlib.md5(voice_url.encode()).hexdigest()
-            voice_path = cache_dir / f"{fname}.mp3"
+    spec = dict(asr_spec or {})
+    asr_enabled = bool(spec.pop("enable", True))
 
-            if not (voice_path.is_file() and voice_path.stat().st_size > 0):
-                downloaded = False
-                if re.match(r"^https?://", voice_url, flags=re.IGNORECASE):
-                    downloaded = await download_file(voice_url, voice_path, timeout=20.0)
-                else:
-                    local_path = _Path(voice_url).expanduser()
-                    if local_path.is_file():
-                        try:
-                            shutil.copyfile(local_path, voice_path)
-                            downloaded = voice_path.is_file() and voice_path.stat().st_size > 0
-                        except Exception as exc:
-                            _log.warning(
-                                "voice_local_copy_error | src=%s | %s", local_path, exc
-                            )
-                if not downloaded:
-                    continue
-
-            had_download = True
-
-            wav_path = await extract_audio(voice_path, voice_path.with_suffix(".wav"))
-            if not wav_path:
-                wav_path = str(voice_path)  # 尝试直接用 mp3
-
-            res = await transcribe_audio_enhanced(wav_path, language="zh")
-            text = res.get("text", "")
-            formatted_text = res.get("formatted_text", text)
-            
-            if text:
-                _score = res.get("score")
-                _score = float(_score) if _score is not None else -999.0
-                _pass = res.get("pass", "unknown")
-                return ToolCallResult(
-                    ok=True,
-                    data={"text": text, "formatted": formatted_text, "score": _score, "pass": _pass, "source": "whisper_enhanced"},
-                    display=f"【语音内容识别】(置信度分: {_score:.2f}, 策略: {_pass})\n{formatted_text}",
-                )
-            had_empty_transcript = True
-
-        if had_empty_transcript:
-            return ToolCallResult(
-                ok=False,
-                error="whisper_transcribe_empty",
-                display="语音转录结果为空，可能是静音或无法识别",
-            )
-        if not had_download:
-            return ToolCallResult(
-                ok=False, error="voice_download_failed", display="语音文件下载失败"
-            )
-        return ToolCallResult(
-            ok=False,
-            error="voice_prepare_failed",
-            display="语音准备失败",
+    for reference in references:
+        voice_path, fetch_reason = await _fetch_voice_bytes(
+            reference, cache_dir, trace_id=trace_id
         )
-    except ImportError:
-        return ToolCallResult(ok=False, error="whisper_not_installed", display="语音转录功能需要安装 openai-whisper: pip install openai-whisper")
-    except Exception as exc:
-        _log.warning("analyze_voice_error | %s", exc)
-        return ToolCallResult(ok=False, error=f"voice_error: {exc}", display=f"语音分析失败: {exc}")
+        if voice_path is None:
+            failures.add("voice_fetch_failed")
+            _log.warning(
+                "voice_analyze_failed | trace=%s | stage=fetch | code=voice_fetch_failed | "
+                "reason=%s | src=%s",
+                trace_id or "-",
+                fetch_reason,
+                clip_text(reference, 120),
+            )
+            continue
+
+        wav_path, decode_reason = await _voice_bytes_to_wav(voice_path)
+        if not wav_path:
+            failures.add("voice_decode_failed")
+            _log.warning(
+                "voice_analyze_failed | trace=%s | stage=decode | code=voice_decode_failed | "
+                "reason=%s | src=%s",
+                trace_id or "-",
+                decode_reason,
+                clip_text(reference, 120),
+            )
+            continue
+
+        # 这层 try 保留。原来的理由（"utils/media.py 里 load_model 不在任何 try 内"）
+        # 已经不成立 —— 那边现在把模型装载包进 try 并归到
+        # pass=engine_missing / reason=asr_model_load_failed 了。
+        # 但仍要兜：transcribe_audio_enhanced 里除装载之外还有解码、执行器调度、
+        # 繁简转换等环节，任何一处冒出的异常都会一路窜到
+        # core/agent_tools_registry.py:588，被包成 `tool_exception: OSError: ...`
+        # 写进 ToolCallResult.error —— 而 error 是要回喂给模型的，
+        # 于是内部异常原文有机会被模型抄进群里。
+        if not asr_enabled:
+            # 业主把 media.asr.enable 关了 —— 别去加载模型，也别谎称是静音。
+            _log.warning(
+                "voice_analyze_failed | trace=%s | stage=transcribe | pass=disabled"
+                " | reason=asr_disabled_by_config | src=%s",
+                trace_id or "-",
+                clip_text(reference, 120),
+            )
+            failures.add("voice_engine_unavailable")
+            return None
+        try:
+            res = await transcribe_audio_enhanced(wav_path, language="zh", **spec)
+        except Exception as exc:
+            _log.warning(
+                "voice_analyze_failed | trace=%s | stage=transcribe | pass=exception"
+                " | exc=%s | err=%s | src=%s",
+                trace_id or "-",
+                type(exc).__name__,
+                clip_text(str(exc), 160) or "-",
+                clip_text(reference, 120),
+            )
+            # 引擎侧炸了，换一份字节回来也是一样的结果，不再试剩下的候选。
+            failures.add("voice_engine_unavailable")
+            return None
+        if not isinstance(res, dict):
+            _log.warning(
+                "voice_analyze_failed | trace=%s | stage=transcribe | pass=bad_shape"
+                " | got=%s | src=%s",
+                trace_id or "-",
+                type(res).__name__,
+                clip_text(reference, 120),
+            )
+            failures.add("voice_engine_unavailable")
+            return None
+        text = str(res.get("text", "") or "")
+        pass_name = str(res.get("pass", "unknown") or "unknown")
+        if text:
+            score = res.get("score")
+            score = float(score) if score is not None else -999.0
+            return ToolCallResult(
+                ok=True,
+                data={
+                    "text": text,
+                    "formatted": res.get("formatted_text", text),
+                    "score": score,
+                    "pass": pass_name,
+                    "source": "whisper_enhanced",
+                },
+                display=f"【语音内容】\n{res.get('formatted_text', text)}",
+            )
+
+        # 引擎不在 ≠ 用户录了段静音。旧实现把两者压成同一句「可能是静音」，
+        # 于是每次都让用户白重录一遍。
+        if pass_name in ("engine_missing",):
+            failures.add("voice_engine_unavailable")
+            # 引擎不在的话，再换一份字节回来也转不出文字：剩下的候选一律不试，
+            # 省掉注定失败的下载/WS 往返。
+            _log.warning(
+                "voice_analyze_failed | trace=%s | stage=transcribe | pass=%s | reason=%s | src=%s",
+                trace_id or "-",
+                pass_name,
+                str(res.get("reason", "") or "-"),
+                clip_text(reference, 120),
+            )
+            return None
+        if pass_name in ("timeout", "error", "none"):
+            failures.add("voice_decode_failed")
+        else:
+            failures.add("voice_transcribe_empty")
+        _log.warning(
+            "voice_analyze_failed | trace=%s | stage=transcribe | pass=%s | reason=%s | src=%s",
+            trace_id or "-",
+            pass_name,
+            str(res.get("reason", "") or "-"),
+            clip_text(reference, 120),
+        )
+    return None
 
 
 def _resolve_video_url_from_args_or_context(args: dict[str, Any], context: dict[str, Any]) -> str:

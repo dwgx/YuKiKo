@@ -14,7 +14,7 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
-from core.agent_tools_types import PromptHint, ToolCallResult, ToolSchema
+from core.agent_tools_types import PromptHint, ToolCallResult, ToolHandler, ToolSchema
 from core.agent_tools_registry import AgentToolRegistry
 from core.napcat_compat import call_napcat_api
 from core.recalled_messages import (
@@ -244,6 +244,22 @@ def _make_qzone_handler(mode: str, config: dict[str, Any]) -> ToolHandler:
     """创建 QZone 工具 handler，优先使用 runtime config，兼容热重载。"""
 
     async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        # 这六个 QZone 辅助函数的实现都在 agent_tools_web.py —— 本模块只用不重写，
+        # 否则「运行时 config 优先于注册时 config」这条热重载语义会有两份实现各自漂移。
+        # 之前它们既没导入也没本地定义，实测线上直接 NameError：
+        # `analyze_qzone 失败: tool_exception: NameError: name '_resolve_qzone_config' is not defined`，
+        # 五个 QZone 工具（profile/moods/albums/analyze/photos）全部报废。
+        # 注意 ruff 在基线上就报了这 6 个 F821，而 pyproject.toml 的 per-file-ignores
+        # **没有**放行本文件 —— 那些告警是真的，不是 re-export hub 那种刻意忽略。
+        # 放在函数内导入是跟着下面 core.qzone 的既有风格，也避免模块级互相 import。
+        from core.agent_tools_web import (
+            _normalize_qzone_tool_error,
+            _qzone_album_payload,
+            _qzone_mood_payload,
+            _qzone_profile_payload,
+            _resolve_qzone_config,
+            _safe_int,
+        )
         from core.qzone import QZoneClient, parse_cookie_string
 
         qz_cfg = _resolve_qzone_config(config, context)

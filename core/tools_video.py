@@ -28,7 +28,12 @@ from utils.process_compat import macos_subprocess_kwargs, resolve_executable_for
 import logging as _logging
 from core.tools_types import _SilentYTDLPLogger, _tool_trace_tag, _write_netscape_cookie_file
 from core.video_analyzer import VideoAnalysisResult, VideoAnalyzer
-from core.search import SearchResult
+# SearchEngine 是 bilibili_audio_extract 用的（:2372 处 SearchEngine(search_cfg)）。
+# 漏它的后果：该工具一调就 `NameError: name 'SearchEngine' is not defined`，
+# 而 handler 里的 try/except 把它包成 error="extract_error" —— 看起来像"提取失败"，
+# 实际是符号不存在。实测线上 2 次调用全废，而它正是音乐放不出来时模型给的替代方案。
+# ruff 基线上就报了这条 F821，没人看。
+from core.search import SearchEngine, SearchResult
 
 try:
     from yt_dlp import YoutubeDL

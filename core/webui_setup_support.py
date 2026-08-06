@@ -634,7 +634,17 @@ class WebUISetupSupport:
         verbosity = normalize_text(str(body.get("verbosity", "medium"))).lower() or "medium"
         token_saving = bool(body.get("token_saving", False))
         music_enable = bool(body.get("music", True))
-        music_api_base = normalize_text(str(body.get("music_api_base", ""))) or "http://mc.alger.fun/api"
+        # 不预设第三方聚合音乐 API：旧默认 http://mc.alger.fun/api 实测已 503 且是明文 HTTP。
+        # 留空时 MusicEngine 走 netease 官方 HTTPS + 本地音源，业主要用聚合源自己填 HTTPS 地址。
+        music_api_base = normalize_text(str(body.get("music_api_base", "")))
+        music_api_bases = [
+            base
+            for base in (
+                normalize_text(str(item))
+                for item in (body.get("music_api_bases") or [])
+            )
+            if base
+        ]
         image_gen_enable = bool(body.get("image_gen_enable", True))
         image_gen_provider = normalize_text(str(body.get("image_gen_provider", ""))).lower()
         if not image_gen_provider:
@@ -687,7 +697,11 @@ class WebUISetupSupport:
                 "group_overrides": {},
                 "group_style_overrides": {},
             },
-            "music": {"enable": music_enable, "api_base": music_api_base},
+            "music": {
+                "enable": music_enable,
+                "api_base": music_api_base,
+                "api_bases": music_api_bases,
+            },
             "video_analysis": {
                 "bilibili": {"enable": True, "sessdata": normalize_text(str(body.get("bili_sessdata", ""))), "bili_jct": normalize_text(str(body.get("bili_jct", "")))},
                 "douyin": {"enable": True, "cookie": normalize_text(str(body.get("douyin_cookie", "")))},
