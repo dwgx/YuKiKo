@@ -92,22 +92,59 @@ class HighRiskConfirmLoopTests(unittest.TestCase):
         result2 = agent._guard_high_risk_tool_call(ctx2, "admin_command", args_v2)
         self.assertEqual(result2, "")  # 应放行，不再循环确认
 
-    def test_confirm_overrides_args_with_saved_copy(self) -> None:
-        """确认后应使用首次拦截时保存的 tool_args，防止参数漂移。"""
+    def test_identity_arg_drift_reprompts_instead_of_executing(self) -> None:
+        """身份参数在确认轮变了 → 重新提示新参数，**不执行任何一边**。
+
+        2026-08-06 改了这条契约。原来的行为是「用首次保存的参数静默覆盖」，
+        断言 `drifted_args["target"] == "user:456"`。改动原因：
+
+        同一个签名变化对应两种情形，代码只凭参数分不出来 ——
+        (a) LLM 自己幻觉换了对象；(b) 管理员在确认轮里更正对象
+        （「搞错了是 789，确认执行」）。静默覆盖在 (b) 下会封**原来那个人**
+        而且报告成功，即执行了管理员没看过的操作。
+
+        重新提示对两种情形都安全：(a) 管理员看到不对的对象就取消；
+        (b) 管理员看到自己的更正被采纳。代价是多一轮确认。
+
+        「防漂移」这个**结果**仍然成立且更强 —— 漂移后的参数不会被执行，
+        只是实现从「静默覆盖」换成了「重新确认」。
+        """
+
         agent = _StubAgentLoop()
 
         ctx1 = _make_ctx("拉黑用户")
         original_args = {"target": "user:456", "action": "ban"}
         agent._guard_high_risk_tool_call(ctx1, "admin_command", original_args)
 
-        # 确认时 LLM 给了不同参数
         ctx2 = _make_ctx("确认执行")
         drifted_args = {"target": "user:789", "action": "kick"}
-        agent._guard_high_risk_tool_call(ctx2, "admin_command", drifted_args)
+        result = agent._guard_high_risk_tool_call(ctx2, "admin_command", drifted_args)
 
-        # drifted_args 应被覆盖为原始保存的参数
-        self.assertEqual(drifted_args["target"], "user:456")
-        self.assertEqual(drifted_args["action"], "ban")
+        # 必须返回提示文本（= 未放行），而不是空字符串（= 放行执行）
+        self.assertTrue(
+            result,
+            "身份参数变了却直接放行 —— 会执行管理员没看过的那一条",
+        )
+        # 且不能把参数改回旧值：新提示展示的必须是用户当前说的对象
+        self.assertEqual(drifted_args["target"], "user:789")
+
+    def test_incidental_arg_drift_still_confirms(self) -> None:
+        """只有非身份参数变化（模型附带生成 reason）时必须放行。
+
+        否则管理员会陷入确认死循环 —— 模型每轮都会稍微改一点措辞。
+        """
+
+        agent = _StubAgentLoop()
+
+        ctx1 = _make_ctx("拉黑用户")
+        agent._guard_high_risk_tool_call(
+            ctx1, "admin_command", {"target": "user:456", "action": "ban"}
+        )
+
+        ctx2 = _make_ctx("确认执行")
+        with_reason = {"target": "user:456", "action": "ban", "reason": "user request"}
+        result = agent._guard_high_risk_tool_call(ctx2, "admin_command", with_reason)
+        self.assertEqual(result, "", "附带字段变化被误判成对象漂移，会导致确认死循环")
 
     def test_cancel_clears_pending(self) -> None:
         """取消后 pending 应被清理。"""

@@ -47,8 +47,17 @@ class NavigatorObviousToolTimeoutCapRegressionTests(unittest.TestCase):
         """`navigator_preflight_plain_text` 此前只在模板里有（true），
         内置默认值缺失（代码兜底 False）—— 升级安装与模板行为不一致。
 
-        preflight 与那个 cap 不同：实测 59/59 成功，产出的分区选择合理，
-        所以它保留开启，只是两处真相源要对齐。
+        本测试只锁「两处真相源对齐」，不表态该不该开。
+
+        早先这里写着「实测 59/59 成功」，那个数字是错的：它只数了
+        `navigator_preflight_section` 那一条成功日志，没数失败与静默两类。
+        重新按 trace 统计 `storage/logs/yukiko.log`（186 个 general_chat 回合，
+        全部跑了 preflight）：
+          - 61 次选出新分区（自身耗时 p50 6s / max 18s）
+          - 38 次撞 20s 超时上限后放弃，白烧约 633s，随后完整 prompt 照跑
+          - 87 次静默 return None（此前无任何日志，已补 `navigator_preflight_noop`）
+        真实成功率 61/186 ≈ 32.8%，不是 100%。
+        该不该保持开启要靠关掉它的对照组数据决定，见 NEXT-SESSION-PLAN.md §5.4。
         """
 
         defaults = _built_in_config_defaults()

@@ -187,6 +187,15 @@ class ConfigAndTriggerRegressionTests(unittest.TestCase):
         self.assertTrue(result.active_session)
 
     def test_memory_keywords_can_trigger_ai_listen_probe(self) -> None:
+        """契约已反转：关键词命中**不再**单独放行旁听。
+
+        原断言要求「一个人、一条消息、阈值设到 8 条/3 人/3.8 分都够不着」时，
+        仅凭 memory_keyword 命中就开口。那正是业主说的「人机感」来源 ——
+        靠词形命中说话，且绕过 ai_listen_min_score，等于让一个词否决整套阈值。
+        现在 keyword_hits 只经 `_build_listen_score` 加分，由分数门与热度门裁决；
+        `ai_listen_keyword_pass_enable=true` 可恢复旧行为。
+        """
+
         trigger = TriggerEngine(
             trigger_config={
                 "ai_listen_enable": True,
@@ -216,8 +225,32 @@ class ConfigAndTriggerRegressionTests(unittest.TestCase):
             ],
             memory_keywords=["projectx", "配置"],
         )
-        self.assertTrue(result.should_handle)
-        self.assertEqual(result.reason, "ai_listen_probe_memory_keyword")
+        self.assertFalse(result.should_handle)
+        self.assertNotEqual(result.reason, "ai_listen_probe_memory_keyword")
+
+        # 同一场景把开关打开就恢复旧行为，证明能力没被删掉、只是默认不用。
+        legacy = TriggerEngine(
+            trigger_config={
+                "ai_listen_enable": True,
+                "ai_listen_min_messages": 8,
+                "ai_listen_min_unique_users": 3,
+                "ai_listen_min_score": 3.8,
+                "ai_listen_keyword_enable": True,
+                "ai_listen_min_keyword_hits": 1,
+                "ai_listen_keyword_pass_enable": True,
+            },
+            bot_config={"name": "YuKiKo"},
+        )
+        legacy_result = legacy.evaluate(
+            payload,
+            recent_messages=[
+                "[Alice] 刚才 projectx 又报错了",
+                "[Bob] projectx 的配置是不是丢了",
+            ],
+            memory_keywords=["projectx", "配置"],
+        )
+        self.assertTrue(legacy_result.should_handle)
+        self.assertEqual(legacy_result.reason, "ai_listen_probe_memory_keyword")
 
     def test_mention_only_not_overridden_by_ai_listen(self) -> None:
         """mention_only policy must NOT be auto-upgraded even when ai_listen_enable is True."""
