@@ -1626,6 +1626,76 @@ resume 命令：
 **审计的对抗性存疑**：8 条 verdict 全部 CONFIRMED，零 REFUTED。
 要么发现质量确实高，要么验证者不够对抗。重跑时值得盯这个比例。
 
+### 13.16 业主线上报的两个问题：都修了，但表情包卡在 QQ 侧
+
+#### (a) 表情包不发 —— 两层根因，第二层未解决
+
+**第一层：概率门（已修）。** `core/agent_tools_utility.py` 在
+`query="随机"` 时掷骰子，medium 档 **55% 概率直接拒**，并回一句
+「当前语境不适合发表情」—— 那句是假的，实际是随机数。
+而 `turn_goal` 的语义（见 `_check_sticker_send_turn_goal` 注释）就是
+「用户确实要你把表情发到聊天里」，概率门与之直接矛盾。
+实测修前 3 次 2 拒、修后连测 5 次全发出。
+
+**第二层：发的是 QQ 内置表情不是用户的图（已修）。**
+`get_preferred_emoji_segment` 的优先级是
+native_segment → **语义匹配的 QQ face** → image。
+learned 表情包的 native_segment 实测为空，于是命中 face 分支直接返回，
+**image 分支永远走不到** —— 用户加的图从来没发出去过。
+业主那两张描述是「猫耳动漫少女问能否加入玩耍」「小猫委屈流泪发抖」也被匹配走，
+说明语义匹配过松。已改为 learned 时图片优先。
+
+**第三层：QQ 拒收图片（未解决，下一个人从这里开始）。**
+改对之后实测：
+```
+tool=send_emoji | ok=False | display=发送失败: ActionFailed(retcode=1200,
+    message='EventChecker Failed: ... rich media transfer failed')
+```
+与 §13.16(c) 那次连拒 19 条是同一个错误。**表情包现在能选对图、但发不出去。**
+
+#### (b) 语音听歌听不了 —— HTML 错误页被存成 mp3（已修）
+
+`core/music.py::_download_audio_to_cache` 把 HTTP 返回体原样写入，
+只检查 `size > 1024`。上游 HTML 错误页轻松超过 1024 字节，于是错误页被存成
+`.mp3` 发出去。日志里对应 ffmpeg 的
+`extract_audio_failed | *.mp3 | Format mp3 detected only with low score of 1`
+—— ffmpeg 在说这文件根本不是 mp3。
+
+判定函数**仓库里早就有**（`utils/media.py::sniff_audio_container`），
+napcat 的下载工具路径一直在用，music.py 这条路没接 ——
+又一处「防护存在但另一条路没接」，与 SSRF 那次同形态。
+实测 HTML/JSON 错误页被拒、mp3/m4a/wav 全通过、端到端点歌产出真音频
+（`容器=mp3` 7.4MB / `容器=silk` 664KB）。
+
+#### (c) QQ 富媒体发送在这个环境上不稳定 [未解决，优先级高]
+
+08-06 04:37–04:41 连拒 **19 条**，错误
+`EventChecker Failed: NTEvent ... errMsg: "rich media transfer failed"`，
+机器人随后自我暂停发送（`safe_send_skipped_bot_suspended` ×19），05:00 后恢复。
+20:2x 测表情包图片时又撞上同一个。
+
+这解释了业主的多个抱怨：表情包发不出、语音发不出。
+**这是 NapCat/QQ 侧问题，不是本仓代码。** 但值得查：
+是否与 QQ 限流该账号有关（连续富媒体失败通常是限流信号），
+或与 NapCat 版本 / `enableLocalFile2Url` 设置有关
+（`onebot11_<QQ>.json` 里该项为 false）。
+
+#### (d) 我这一轮的操作失误，记下来免得重踩
+
+**`pgrep -f "[p]ython main.py"` 匹配不到** —— 真实命令行里是大写 `Python`
+（`/opt/homebrew/.../Python.app/Contents/MacOS/Python main.py`）。
+我因此连续几次「重启」都是空操作，一段时间里以为在测新代码、实际跑的是旧进程，
+还累积出多个实例。用 `ps aux | grep "[Pp]ython main.py"` 才对。
+另外 `ps aux | grep -c` 会把 grep 自己的 shell wrapper 算进去，计数偏大 ——
+判断实例数要用 `lsof -nP -iTCP:8081 -sTCP:LISTEN` 看谁真在监听。
+
+**WebUI 测试台不能用于隔离测试。** 它驱动的是真引擎，回复会真的经 NapCat 发出去。
+所以往「合成群」999000001 发只会得到
+`EventChecker Failed`（那个群号在 QQ 上不存在），
+测不到东西；把它加进白名单也没用（卡在发送不是白名单）。
+**要端到端测就只能打真实群**，`scripts/tool_smoke_live.py` 因此默认干跑、
+必须显式 `--real-group` 才发。
+
 ### 13.7 一条给下一个 AI 的操作提醒
 
 `git stash list` 里有**两个 2026-08-05 23:15 / 23:36 的旧 stash**
