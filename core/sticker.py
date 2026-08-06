@@ -365,11 +365,23 @@ class StickerManager:
                 "fallback": "native",
             }
 
+        # 用户真的加过图片时，图片优先于「按描述语义匹配的 QQ 内置表情」。
+        #
+        # 2026-08-06 业主报「我给他添加表情包他也不发，他发的是 qqemoji」。
+        # 根因就是这里的优先级：learned 表情包的 native_segment 为空
+        # （实测两张都是 native_type=''），于是落到 _semantic_face_segment_for_emoji，
+        # 它按 description 匹配出一个 QQ 自带 face 段就直接返回 ——
+        # 下面的 image_segment 永远走不到，用户加的图片从来没被发出去过。
+        #
+        # face 替代只在「没有真实图片可发」时才合理。
+        image_segment = self.get_emoji_segment(key)
+        if image_segment and e.learned:
+            return image_segment, "image", {"fallback": "image"}
+
         face_segment, face_meta = self._semantic_face_segment_for_emoji(e)
         if face_segment:
             return face_segment, "face", face_meta
 
-        image_segment = self.get_emoji_segment(key)
         if image_segment:
             return image_segment, "image", {"fallback": "image"}
         return None, "", {}

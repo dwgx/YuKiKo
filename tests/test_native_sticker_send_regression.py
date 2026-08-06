@@ -64,7 +64,27 @@ class NativeStickerManagerRegressionTests(unittest.TestCase):
         self.assertIn(76, self.manager._faces)
         self.assertEqual(self.manager.get_face_segment(76)["data"]["id"], "76")
 
-    def test_preferred_segment_falls_back_to_face_before_image(self) -> None:
+    def test_user_added_sticker_sends_the_image_not_a_semantic_face(self) -> None:
+        """2026-08-06 改了这条契约：用户加过图片时，发图片，不发语义匹配的 QQ 表情。
+
+        原断言是 mode == "face" —— 即学来的表情包若语义匹配上 QQ 内置表情，
+        就改发原生 face（渲染更统一）。用它自己的例子（描述"给你点个赞"匹配
+        face 76 "/赞"）看，这个取舍说得通。
+
+        但业主线上报「我给他添加表情包他也不发，他发的是 qqemoji」，实测根因就是
+        这个优先级：learned 表情包的 native_segment 为空（实测两张都是
+        native_type=''），于是落到 _semantic_face_segment_for_emoji，
+        它按 description 匹配出一个 face 段就直接返回，下面的 image 分支
+        **永远走不到** —— 用户加的图从来没被发出去过。
+
+        而业主那两张的描述是「猫耳动漫少女问能否加入玩耍」「小猫委屈流泪发抖」，
+        也被匹配走了，说明语义匹配过松，不只是「点赞」这种强对应的情况。
+
+        新契约：用户显式加过图片（learned=True）就发图片。face 替代只在
+        **没有真实图片可发**时才用（见 test_preferred_segment_falls_back_to_image_last
+        与下面这条 face-only 的用例）。
+        """
+
         self.manager._faces[76] = FaceInfo(face_id=76, desc="/赞")
         key = self.manager._save_chat_emoji(
             user_id="10002",
@@ -76,10 +96,30 @@ class NativeStickerManagerRegressionTests(unittest.TestCase):
         )
 
         seg, mode, meta = self.manager.get_preferred_emoji_segment(key)
+        self.assertEqual(mode, "image", "用户加的图被换成了 QQ 内置表情")
+        self.assertEqual(seg["type"], "image")
+        self.assertEqual(meta["fallback"], "image")
+
+    def test_semantic_face_still_used_when_there_is_no_image(self) -> None:
+        """反向：没有真实图片时，语义 face 替代仍要生效，别把这条路一起砍掉。"""
+
+        self.manager._faces[76] = FaceInfo(face_id=76, desc="/赞")
+        key = self.manager._save_chat_emoji(
+            user_id="10004",
+            img_data=_PNG_BYTES,
+            description="给你点个赞",
+            emotions=["赞"],
+            category="反应",
+            tags=["点赞"],
+        )
+        # 把图片文件挪走，模拟"库里有记录但文件不在"
+        info = self.manager._emojis[key]
+        target = self.manager._emoji_root / info.file_path
+        target.unlink(missing_ok=True)
+
+        seg, mode, meta = self.manager.get_preferred_emoji_segment(key)
         self.assertEqual(mode, "face")
-        self.assertEqual(seg["type"], "face")
         self.assertEqual(seg["data"]["id"], "76")
-        self.assertEqual(meta["fallback"], "semantic_face")
 
     def test_preferred_segment_falls_back_to_image_last(self) -> None:
         key = self.manager._save_chat_emoji(
