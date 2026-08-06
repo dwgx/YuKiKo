@@ -410,6 +410,29 @@ async def _handle_get_hot_trends(args: dict[str, Any], context: dict[str, Any]) 
     platform = str(args.get("platform", "")).strip().lower()
     limit = min(20, max(3, int(args.get("limit", 10) or 10)))
 
+    # 时政条目在进模型之前就丢掉。
+    #
+    # 中文热搜天然带时政 —— 2026-08-06 实测知乎热榜前三条里就有
+    # 「如何看待国家这一次的扫黑除恶专项行动？」。而这条内容此前完全无过滤：
+    # 输入门只看用户消息，filter_output 只能替换词表内的词（"扫黑除恶" 不在表内），
+    # 更糟的是下面还会把标题写进知识库**持久化**，之后能通过 search_knowledge 再浮出来。
+    topic_gate = context.get("topic_gate")
+
+    def _drop_political(rows: list[Any]) -> tuple[list[Any], int]:
+        if not callable(topic_gate):
+            return rows, 0
+        kept = []
+        for row in rows:
+            probe = f"{getattr(row, 'title', '')} {getattr(row, 'snippet', '')}"
+            try:
+                blocked = bool(topic_gate(probe))
+            except Exception as exc:  # 门坏了不能让内容直接过 —— 这是封群风险点
+                _log.warning("topic_gate_failed | err=%s | 按拦截处理", exc)
+                blocked = True
+            if not blocked:
+                kept.append(row)
+        return kept, len(rows) - len(kept)
+
     try:
         if platform:
             method_map = {
@@ -422,6 +445,12 @@ async def _handle_get_hot_trends(args: dict[str, Any], context: dict[str, Any]) 
             if not func:
                 return ToolCallResult(ok=False, error=f"unknown_platform: {platform}")
             items = await func(limit)
+            items, dropped = _drop_political(items)
+            if dropped:
+                _log.info(
+                    "hot_trends_political_dropped | platform=%s | dropped=%d | kept=%d",
+                    platform, dropped, len(items),
+                )
             lines = [f"【{platform}热搜 Top{len(items)}】"]
             for i, item in enumerate(items, 1):
                 heat = f" ({item.heat})" if item.heat else ""
@@ -430,6 +459,20 @@ async def _handle_get_hot_trends(args: dict[str, Any], context: dict[str, Any]) 
                                 display="\n".join(lines))
         else:
             trends = await crawler_hub.get_trends_cached()
+            # 先过门再格式化、再入库 —— 顺序要紧：格式化后就只是一段文本，
+            # 逐条判定的机会没了；入库更是把时政标题持久化。
+            total_dropped = 0
+            filtered_trends: dict[str, Any] = {}
+            for plat, rows in trends.items():
+                kept, dropped = _drop_political(list(rows))
+                total_dropped += dropped
+                filtered_trends[plat] = kept
+            if total_dropped:
+                _log.info(
+                    "hot_trends_political_dropped | platform=all | dropped=%d",
+                    total_dropped,
+                )
+            trends = filtered_trends
             text = crawler_hub.format_trends_text(trends, limit=limit)
             # 同时存入知识库
             kb = context.get("knowledge_base")

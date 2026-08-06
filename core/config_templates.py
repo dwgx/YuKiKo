@@ -218,15 +218,47 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "max_same_tool_call": 3,
             "max_consecutive_think": 3,
             "tool_timeout_seconds": 28,
-            "tool_timeout_seconds_media": 45,
-            "llm_step_timeout_seconds": 30,
-            "llm_step_timeout_seconds_after_tool": 36,
+            # 45 -> 75。实测（storage/logs/yukiko.log）：analyze_image 64 次调用里
+            # **15 次撞满 45s 上限**，而跑完的那些 p50=11s / p90=19s / max=42s ——
+            # 45 正好卡在已观测成功耗时的临界点上，抬一点就能把那 15 次救回来。
+            # 媒体回合的总预算实测 inner=280s（agent_timeout_budget 日志，111 次），
+            # 75s 只占 27%，撑得住。而且 analyze_image 内部要打两次 LLM
+            # （_vision_describe + _normalize_vision_answer_with_retry），
+            # provider skiapi 单次小 prompt 就 6.7~10.7s，带图更慢。
+            "tool_timeout_seconds_media": 75,
+            # 30 -> 45。实测成功的 LLM 往返 p50=6s / p90=13s / p95=17s / max=36s，
+            # 只有 1.5% 超过 30s —— 但那 1.5% 全都直接失败了（22 次 timeout=30.0s）。
+            # 45 覆盖已观测最大值 36s 并留余量。
+            # 抬上限不会撑爆总预算：core/agent.py:1182 是
+            # min(llm_budget, max(6.0, remaining - 1.5))，deadline 恒起约束。
+            "llm_step_timeout_seconds": 45,
+            # 36 -> 50。实测 6 次撞 36s。按同比例抬，且仍在 clamp 上限 120 内。
+            "llm_step_timeout_seconds_after_tool": 50,
             # 0 = 关闭。见 core/agent.py:392 的注释：5 秒低于本项目 provider 的
             # 物理延迟下限（实测最快 6.7s），开着等于每回合白烧 5 秒换一个更差的决策。
             "navigator_obvious_tool_timeout_seconds": 0,
             # core/agent.py:400 读它，此前只在模板里有、内置默认值缺失 ——
             # 升级安装会拿到 False，与模板的 true 不一致。
             "navigator_preflight_plain_text": True,
+            # 这两个同样是「模板里有、内置默认值缺」的遗留：
+            # navigator_retry_model 由 core/agent.py:464 读（空串=用主模型），
+            # runtime_rules 由 core/agent.py:3245 读（空串=不注入额外规则）。
+            # 补的都是模板原值，零行为变更。
+            "navigator_retry_model": "",
+            "runtime_rules": "",
+            # 两个「代码在读、两处真相源都缺」的：
+            # preferred_name_prompt（core/agent.py 读，空串=不注入）
+            # tool_args_log_max_chars（工具参数进日志的截断长度）
+            # 都按代码兜底原值落盘，零行为变更。
+            #
+            # **原生看图的开关不在这里**。曾经有个 agent.vision_enabled，
+            # 它恒为 False 且两处真相源都没有，所以模型从没原生看过图。
+            # 现在那段注入已改成走 core/tools_vision.py 的
+            # build_native_vision_blocks()，开关是 search.vision.native_blocks_enable。
+            # agent.vision_enabled 的读取点已删除，别再把它加回来 —— 两个开关
+            # 串联、其中一个还是幽灵键，是更糟的状态。
+            "preferred_name_prompt": "",
+            "tool_args_log_max_chars": 600,
             "total_timeout_seconds": 0,
             "queue_timeout_margin_seconds": 8,
             "high_risk_control": {
@@ -292,6 +324,14 @@ def _built_in_config_defaults() -> dict[str, Any]:
                 "timeout_seconds": 35,
                 "max_tokens": 1200,
                 "temperature": 0.2,
+                # 原生看图。三处必须同值：这里、master.template.yml 的
+                # config.search.vision、以及 core/tools_vision.py 的
+                # _NATIVE_VISION_*_DEFAULT 常量（那三个在 tools_vision 里，已同值）。
+                # core/config_manager.py:60 是 deep_merge_dict(template, raw)，
+                # 模板在底会盖过这里，两边不同值等于「本机对、新装错」。
+                "native_blocks_enable": True,
+                "native_max_images": 4,
+                "native_max_image_bytes": 512 * 1024,
             },
         },
         "search_followup": {
@@ -309,6 +349,11 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "custom_allow_terms": [],
             "group_profiles": {},
             "output_sensitive_words": {},
+            # 时政话题回避：只换话题，不记违规、不冷却。见模板里的说明。
+            "political_deflect_enable": True,
+            "political_deflect_reply": "这方面我不太懂，也不想聊，换个话题吧～",
+            "political_terms": [],
+            "political_allow_terms": [],
         },
         "output": {
             "verbosity": "medium",
@@ -334,6 +379,45 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "ai_listen_min_score": 2.4,
             "followup_reply_window_seconds": 30,
             "followup_max_turns": 3,
+            # 以下九个键 core/trigger.py 一直在读，但两处真相源都没有 ——
+            # 只有代码兜底值，所以升级安装的行为与模板不一致，WebUI 配置页也看不见它们。
+            # 这里补的全部是各自的代码兜底原值（core/trigger.py 的 trigger_config.get 第二参数），
+            # 因此本次补齐是零行为变更，只是让它们可见、可调。
+            "active_session_timeout_minutes": 8,
+            "ai_listen_interval_seconds": 45,
+            "ai_listen_keywords": [],
+            "busy_window_seconds": 60,
+            "overload_enable": True,
+            "overload_min_messages": 20,
+            "overload_min_unique_users": 3,
+            "overload_notice_cooldown_seconds": 90,
+            "overload_pause_seconds": 45,
+            # ↓ 注意力门改造新增（core/trigger.py 同值代码兜底）。业主诉求是
+            # 「别人发一张图它不该说话，但被叫、被求助、群里聊得起来时要能插嘴」。
+            # 裸媒体（只有图/视频/语音段、没有文字）不再自己触发回复；
+            # @/私聊/叫名字仍然照回。false 恢复旧行为。
+            "media_only_requires_directed": True,
+            # followup 窗口内的裸媒体是否放行。保守默认关 ——
+            # 「机器人刚回复完、我紧接着发一张图」这条路在实测日志里占媒体轮 13/97。
+            "media_only_allow_in_followup": False,
+            # active_session 无条件放行的窗口。原来是整个 8 分钟内每条都回，
+            # 现在只有这 90 秒内无条件回，超出后降级为「证据 + 加分」交给旁听打分。
+            # 不要设成 0：tests/test_config_and_trigger_regression.py:163 依赖 0s 落在窗内。
+            "active_session_free_window_seconds": 90,
+            # 过期 active_session 给旁听分的加成（「这人不久前刚跟我说过话」）。
+            "active_session_score_bonus": 0.6,
+            # 关键词命中能否**单独**放行旁听。旧行为是 true，且它在
+            # core/trigger.py 里是 early-return，绕过 ai_listen_min_score ——
+            # 实测热词池被 MULTIMODAL_EVENT 占位文本自污染成
+            # ['image','message','multimodal','multimodal_event','qq','sent','user']，
+            # 于是每张裸图必然命中必然插话，这正是「人机感」的来源。默认关。
+            "ai_listen_keyword_pass_enable": False,
+            # 每会话每小时旁听探测硬上限，0 = 关闭旁听。
+            # 原来只有 45 秒冷却，理论上限 80 次/小时 —— provider 是 skiapi，
+            # 实测小 prompt 延迟 6.7~10.7 秒且高频 503，撑不住那个量。
+            # 20 而不是原来的 6：实测 6 时旁听探测每小时只发生个位数次，
+            # 「他叫你碳基」这类没有结构信号的消息送不进模型，表现为「不理人」。
+            "ai_listen_max_probes_per_hour": 20,
         },
         "routing": {
             "min_confidence": 0.55,
@@ -385,12 +469,43 @@ def _built_in_config_defaults() -> dict[str, Any]:
         "emotion": {"enable": True, "emoji_probability": 0.38},
         "music": {
             "enable": True,
-            "api_base": "http://mc.alger.fun/api",
+            # 原值 http://mc.alger.fun/api 已清空：该上游实测彻底不可达
+            # （curl HTTP 000，HTTPS 版证书错误），而且是**明文 HTTP**，
+            # 留着只会每次构造 MusicEngine 刷一条 music_api_base_insecure_skipped。
+            # 不预设新的第三方聚合 API 是刻意的 —— 无法验证其可用性与合法性。
+            # 清空后链路仍然可用：netease 官方 HTTPS 搜索 + core/music_sources.py
+            # 本地音源（实测搜索 0.9s/10 条、play 端到端 4.4s 成功）。
+            "api_base": "",
+            # 聚合源候选列表，按序 failover，要求 HTTPS。也接受逗号/空白分隔的字符串。
+            # **换源的主开关 —— 需要业主填入可用地址。** 自建 NeteaseCloudMusicApi 最稳。
+            "api_bases": [],
+            # 为 true 时放行公网明文 HTTP 聚合源（仍留 WARNING）。
+            # 环回/私网/localhost 不受此开关限制，始终放行。
+            "allow_insecure_api_base": False,
+            # 聚合源整体墙钟预算（秒）。必须显著小于 agent.tool_timeout_seconds=28，
+            # 否则上游挂掉时会吃满工具超时 —— 实测原来 music_search 撞 28s、
+            # music_play 撞 55s，成功率 0%。
+            "upstream_budget_seconds": 8,
+            # 某 host 判定不可达后的熔断静默期（秒），期内零请求。0 = 关闭熔断。
+            "unreachable_cooldown_seconds": 300,
             "max_voice_duration_seconds": 0,
             "break_limit_enable": True,
             "trial_max_duration_ms": 35000,
             "artist_guard_enable": True,
             "artist_guard_allow_mismatch_fallback": False,
+        },
+        # 本地语音转文字（analyze_voice）。后端 faster-whisper，requirements.txt 已钉死。
+        # 链路：QQ 语音是腾讯 SILK v3 -> pilk 解 WAV -> faster-whisper -> opencc 转简体。
+        # 三处默认值必须同：这里、master.template.yml 的 config.media.asr、
+        # 以及 utils/media.py 的 _ASR_DEFAULT_* 常量。
+        "media": {
+            "asr": {
+                "enable": True,
+                "model_size": "small",
+                "device": "cpu",
+                "compute_type": "int8",
+                "timeout_seconds": 180,
+            },
         },
     }
 
