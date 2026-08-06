@@ -17,6 +17,7 @@ import logging
 import re
 import secrets
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -65,6 +66,14 @@ _RE_FINAL_ANSWER_KEY = re.compile(r'"(?:tool|name)"\s*:\s*"final_answer"')
 _RE_TEXT_KEY = re.compile(r'"text"\s*:\s*"')
 _RE_ASCII_LETTER = re.compile(r"[A-Za-z]")
 _RE_CJK_CHAR = re.compile(r"[\u4e00-\u9fff]")
+# \u673a\u5668\u6807\u8bc6\u7b26\uff1a\u5e26\u4e0b\u5212\u7ebf\u7684 ASCII \u6807\u8bb0\uff08\u5de5\u5177\u540d analyze_image\u3001\u9519\u8bef\u7801
+# qzone_api_error\u3001tool_timeout:parse_video \u8fd9\u7c7b\uff09\u3002\u5224\u5b9a\u6761\u4ef6\u662f"\u542b\u4e0b\u5212\u7ebf"\u8fd9\u4e2a
+# \u7ed3\u6784\u7279\u5f81\uff0c\u4e0d\u662f\u8bcd\u8868 \u2014\u2014 \u4e2d\u6587\u6563\u6587\u548c\u666e\u901a\u82f1\u6587\u5355\u8bcd\u90fd\u4e0d\u542b\u4e0b\u5212\u7ebf\uff0cURL \u5355\u72ec\u6392\u9664\u3002
+_RE_MACHINE_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+(?::[A-Za-z0-9_.-]+)?")
+# retcode=-5503022 / status=503 \u8fd9\u7c7b key=value \u673a\u5668\u72b6\u6001\u3002
+_RE_MACHINE_KEY_VALUE = re.compile(r"\b[A-Za-z][A-Za-z0-9_]*\s*=\s*-?[A-Za-z0-9_.:-]+")
+# 剥掉机器标识符后至少还要剩这么多汉字，才算得上一句能发给用户的话。
+_MIN_CJK_FOR_USER_FACING_FAILURE = 6
 # 弱模型防护: 匹配所有标点/符号/空白 (用于检测纯标点垃圾)
 _RE_PUNCTUATION_CJK = re.compile(
     r"[\s\u3000-\u303f\uff01-\uff0f\uff1a-\uff20\uff3b-\uff40\uff5b-\uff65"
@@ -141,6 +150,17 @@ class AgentContext:
     knowledge_base: Any = None  # KnowledgeBase instance
     memory_engine: Any = None  # MemoryEngine instance（兼容 engine 注入）
     stream_callback: Any = None  # WebUI 思考流回调
+    # 话题门（SafetyEngine._is_political_topic）。用于把**外部抓取回来的内容**
+    # 里的时政条目丢掉，而不是等模型转述完再靠词替换兜。
+    # 实测 2026-08-06：知乎热榜返回「如何看待国家这一次的扫黑除恶专项行动？」，
+    # 而 get_hot_trends 零过滤，且会把标题写进知识库持久化。
+    # 输入门只看用户消息，filter_output 只能换词表内的词，这一层都覆盖不到。
+    topic_gate: Any = None  # fn(str) -> bool，True = 该丢弃
+    # 出站文本敏感词过滤（SafetyEngine.filter_output）。
+    # 必须注入：final_answer 走 engine 的 _try_agent_path 后处理时会过一遍
+    # filter_output，但 send_group_message 这类工具是**直接调 NapCat API**，
+    # 完全绕开那段后处理。漏了这个注入，工具直发的文本就是零过滤出群。
+    output_filter: Any = None  # fn(str) -> str
     trace_id: str = ""
     memory_context: list[str] = field(default_factory=list)
     related_memories: list[str] = field(default_factory=list)
@@ -200,6 +220,12 @@ class AgentLoop:
     4. 重复直到 LLM 调用 final_answer 或达到 max_steps
     """
 
+    # 畸形 JSON 参数「无损恢复」的累计次数，以及汇总日志的间隔。
+    # 这条路径实测占 skiapi 工具调用的 89%，逐条 WARNING 会淹掉日志，
+    # 所以按次数汇总。有损恢复走独立的 WARNING，不受这里影响。
+    _malformed_args_recovered_total = 0
+    _MALFORMED_ARGS_LOG_EVERY = 25
+
     # 有副作用的发送工具（避免 final_answer 重复发送）
     _SIDE_EFFECT_SEND_TOOLS = frozenset(
         {
@@ -222,6 +248,16 @@ class AgentLoop:
             "correct_sticker",
         }
     )
+    # 同一回合内 (工具, 参数) 完全相同只允许真正执行一次的工具。
+    # 这些工具对外有副作用且幂等语义明确，重复执行会被用户直接看见：
+    # 实测 send_face 连发 3 个相同表情进群、remember_user_fact 把同一条事实
+    # 写了 4 次。max_same_tool_call（默认 3）对它们太宽。
+    _ONCE_PER_TURN_TOOLS = _SIDE_EFFECT_SEND_TOOLS | {
+        "send_face",
+        "set_msg_emoji_like",
+        "remember_user_fact",
+        "correct_sticker",
+    }
     _EXTERNAL_FACT_TOOLS = frozenset(
         {
             "web_search",
@@ -252,6 +288,24 @@ class AgentLoop:
             "list_faces",
             "list_emojis",
             "browse_sticker_categories",
+            # 内容搬运类工具：display 里是**别人说过的原话**，是给模型读的素材，
+            # 不是给用户的答案。兜底把它原样发出去等于把那些话在群里又播一遍 ——
+            # 实测事故形状：查精华消息时把「@某人 你妈也死了」完整复述进群并加调侃。
+            # 用户确实主动要求了，但完整复述等于又发一遍。
+            # 这条路零 LLM、零人格底稿参与，所以 prompt 层的禁令碰不到它
+            # （core/agent_tools_napcat.py 各 handler 的 display 构造见括号内行号）。
+            "get_essence_msg_list",  # :2482 "共 N 条精华:\n[昵称] 内容"
+            "get_group_history",  # :1896
+            "get_chat_history",  # :1921
+            "get_group_msg_history",  # :2431
+            "get_forward_msg",  # :4008
+            # 名单/资料类：display 是成员名册与个人资料，同样不是答案，
+            # 而且直通等于把一批 QQ 号和昵称倒进群里。
+            "get_group_member_list",  # :1153
+            "get_friend_list",  # :1778
+            "get_group_list",  # :1787
+            "get_user_info",  # :1175
+            "get_login_info",  # :1846
         }
     )
     _DOWNLOAD_LLM_EXTRACT_TOOLS = frozenset(
@@ -261,6 +315,40 @@ class AgentLoop:
             "scrape_structured",
             "scrape_follow_links",
         }
+    )
+    # 失败类别标记 —— 只匹配 ToolCallResult.error 这个字段。
+    # 那里面的值全部由本仓代码自己写死（tool_timeout:xxx / permission_denied:yyy /
+    # memory_engine_unavailable / missing_required_args:...），是机器码而不是自然
+    # 语言，所以按前后缀取类别属于"结构事实"，不是对句子做语义判断。
+    # display（中文散文）绝对不参与分类。
+    _TOOL_FAILURE_CATEGORY_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("timeout", ("timeout", "timed_out")),
+        ("permission", ("permission_denied", "need_super_admin", "need_group_admin")),
+        ("missing_args", ("missing_required_args", "missing_", "empty_", "invalid_", "required")),
+        (
+            "blocked",
+            ("blocked", "unsafe", "nsfw", "guard", "disabled", "not_supported", "unsupported"),
+        ),
+        ("unavailable", ("unavailable", "missing_dependency", "not_installed", "no_api_call")),
+        ("not_found", ("not_found", "no_results", "no_result", "empty_result")),
+        ("upstream", ("_error", "_failed", "failed", "exception", "crash")),
+    )
+    # 类别 → 喂给兜底 LLM 的短标签。这是枚举映射而不是可调文案，故留在代码里；
+    # 给用户看的整句在 config/prompts.yml 的 messages.tool_failure_* 下。
+    _TOOL_FAILURE_CATEGORY_LABELS: dict[str, str] = {
+        "timeout": "超时",
+        "permission": "权限不足",
+        "missing_args": "关键信息不全",
+        "blocked": "被安全策略拦下",
+        "unavailable": "所需能力当前不可用",
+        "not_found": "没找到内容",
+        "upstream": "外部来源没响应",
+        "unknown": "没能完成",
+    }
+    # 这些兜底原因说明预算已经耗尽（模型侧超时 / 报错），再打一次 LLM 只会
+    # 二次超时。此时直接用类别兜底句，不做第二次模型调用。
+    _NO_SECOND_LLM_FALLBACK_REASONS = frozenset(
+        {"total_timeout", "llm_timeout", "llm_error"}
     )
 
     def __init__(
@@ -320,29 +408,42 @@ class AgentLoop:
             "set_online_status",
             "set_self_longnick",
         }
-        self._group_admin_tools = {
-            "set_group_ban",
-            "set_group_kick",
-            "set_group_whole_ban",
-            "set_group_admin",
-            "set_group_name",
-            "send_group_notice",
-            "delete_message",
-            "set_group_special_title",
-            "set_essence_msg",
-            "delete_essence_msg",
-            "set_group_card",
-            "set_group_portrait",
-            "delete_group_file",
-            "create_group_file_folder",
-            "del_group_notice",
-        }
+        # 从 registry 取，不再手维护第二份。
+        #
+        # 原来这里是一份硬编码清单，和 `AgentToolRegistry._GROUP_ADMIN_TOOLS`
+        # 各自维护，**已经漂移**：2026-08-06 实测 registry 有 16 项、这里 15 项，
+        # 少的是 `recall_recent_messages` —— 于是批量撤回跳过了 :2286 的
+        # 「执行群管理操作前需要明确点名机器人」这道门，而它 15 个同族兄弟都受这道门管。
+        #
+        # 两份清单漂移也是同一批权限漏洞的根因（delete_group_folder /
+        # set_group_add_request / upload_* 等六个工具当时两边都漏）。
+        # registry 是权限的执行方（:272 那两处 return permission_denied），
+        # 所以以它为真相源。
+        self._group_admin_tools = set(AgentToolRegistry._GROUP_ADMIN_TOOLS)
         self._admin_only_tools = self._super_admin_tools | self._group_admin_tools
         self.refresh_runtime_config(config)
 
-    def refresh_runtime_config(self, config: dict[str, Any]) -> None:
-        """热更新 Agent 的运行参数和管理员权限集合。"""
+    def refresh_runtime_config(
+        self, config: dict[str, Any], persona_text: str | None = None
+    ) -> None:
+        """热更新 Agent 的运行参数、管理员权限集合，以及人格底稿。
+
+        persona_text 必须一起刷：它在 core/engine.py:183 是**按值**传进构造函数的，
+        而 reload_config() 不重建 AgentLoop、只调本方法。原先本方法不碰它，
+        于是 `/yukibot` 之后 router 路和 thinking 路拿到了新人格，
+        **agent 路（线上每回合都走的那条）还在用进程启动时那份旧稿** ——
+        改 config/personas/yukiko.md 看起来"热重载成功"，实际对主路径零效果。
+        传 None 表示调用方不打算改它，保持现值。
+        """
         self.config = config if isinstance(config, dict) else {}
+        if persona_text is not None:
+            new_persona = normalize_text(str(persona_text))
+            if new_persona != normalize_text(str(getattr(self, "persona_text", "") or "")):
+                _log.info(
+                    "agent_persona_reloaded | chars=%d",
+                    len(new_persona),
+                )
+            self.persona_text = str(persona_text)
         agent_cfg = (
             self.config.get("agent", {}) if isinstance(self.config, dict) else {}
         )
@@ -602,6 +703,33 @@ class AgentLoop:
         for key in stale:
             self._pending_high_risk_actions.pop(key, None)
 
+    # 决定「这个操作作用在谁/哪个群身上」的参数。高风险确认只在这些参数变化时
+    # 重新提示 —— 模型第二轮常会附带生成 reason 之类的字段，把那也算漂移会让
+    # 管理员陷入确认死循环（tests/test_high_risk_and_sticker_regression.py 钉过）。
+    _IDENTITY_ARG_KEYS = (
+        "target",
+        "user_id",
+        "group_id",
+        "member_id",
+        "message_id",
+        "action",
+        "file",
+        "folder",
+        "key",
+        "path",
+    )
+
+    @classmethod
+    def _build_identity_signature(cls, args: dict[str, Any]) -> str:
+        """只按身份类参数生成签名，用于判断确认轮里对象是否被更正。"""
+
+        if not isinstance(args, dict):
+            return ""
+        subset = {k: args[k] for k in cls._IDENTITY_ARG_KEYS if k in args}
+        if not subset:
+            return ""
+        return cls._build_args_signature(subset)
+
     @staticmethod
     def _build_args_signature(args: dict[str, Any]) -> str:
         """Build a normalized signature for repeat-tool detection.
@@ -609,10 +737,15 @@ class AgentLoop:
         Strips whitespace from string values and lowercases them so that
         minor LLM variations like trailing spaces or case changes are
         treated as the same call.
+
+        字符串先做 NFKC 归一化：模型经常只把半角括号换成全角
+        （`(QQ:1)` → `（QQ:1）`）就绕过重复判定，导致同一副作用工具被真的
+        执行第二次（实测同一条 remember_user_fact 入库 4 次）。
+        只做等价字形折叠，不做任何语义/相似度判断。
         """
         def _norm(v: Any) -> Any:
             if isinstance(v, str):
-                return v.strip().lower()
+                return unicodedata.normalize("NFKC", v).strip().lower()
             if isinstance(v, dict):
                 return {k: _norm(val) for k, val in v.items()}
             if isinstance(v, list):
@@ -622,6 +755,107 @@ class AgentLoop:
             return json.dumps(_norm(args or {}), ensure_ascii=False, sort_keys=True)
         except Exception:
             return str(args or {})
+
+    # 守卫自己写进 steps 的 error 标记，不是工具真实失败原因，重述时要跳过
+    _GUARD_STEP_ERRORS = (
+        "repeated_tool_call:",
+        "duplicate_external_fact_query",
+        "consecutive_crashes_guard",
+    )
+
+    @classmethod
+    def _last_failure_text(cls, steps: list[dict[str, Any]]) -> str:
+        """取最近一次「工具真实失败」的原因文本，跳过守卫自己写的标记。"""
+        for step in reversed(steps):
+            if bool(step.get("ok")):
+                continue
+            error = normalize_text(str(step.get("error", "")))
+            if error.startswith(cls._GUARD_STEP_ERRORS):
+                continue
+            detail = error or normalize_text(str(step.get("display", "")))
+            if detail:
+                return clip_text(detail, 300)
+        return ""
+
+    def _build_guard_feedback_payload(
+        self,
+        *,
+        tool_name: str,
+        steps: list[dict[str, Any]],
+        reason_key: str,
+        reason_text: str,
+    ) -> dict[str, Any]:
+        """守卫拦截时回喂给模型的结构化 payload。
+
+        旧实现只回喂一句「禁止再次调用」的祈使句：模型既看不到上一次已经拿到
+        的结果，也看不到上一次失败的真实原因，于是原地重试到熔断。这里把两者
+        都显式带上，让模型自己决定 final_answer 还是换工具——不做本地语义否决。
+        """
+        payload: dict[str, Any] = {"tool": tool_name, "ok": False, "error": reason_text}
+        # 只认这个工具自己拿到过的产物：否则别的工具的图会被说成是它的结果
+        own_steps = [
+            s
+            for s in steps
+            if normalize_text(str(s.get("tool", ""))).lower() == tool_name.lower()
+        ]
+        obtained: dict[str, Any] = {}
+        summary = self._last_success_display(own_steps)
+        if summary:
+            obtained["summary"] = summary
+        image_urls = self._last_success_image_urls(own_steps)
+        if image_urls:
+            obtained["image_urls"] = image_urls[:3]
+        video_url = self._last_success_video_url(own_steps)
+        if video_url:
+            obtained["video_url"] = video_url
+        audio_file = self._last_success_audio_file(own_steps)
+        if audio_file:
+            obtained["audio_file"] = audio_file
+        # 「这个工具最近一次到底成功还是失败」决定该讲哪句话。
+        # 不看这一点会同时错三处（都实测过）：
+        #   - 先成功、随后连续崩溃时，obtained 非空就抢先说「上一次调用已经成功」，
+        #     真实错误整条丢掉 —— 与这次修复要达到的「让模型能解释为什么失败」正好相反；
+        #   - 失败原因取自全量 steps 而不是这个工具自己的 steps，
+        #     于是别的工具的错误被说成「该工具最近一次失败的真实原因」；
+        #   - 产物取的是「最后一次成功」，与被拦那次的参数无关。
+        # 所以：最近一次失败了就以失败为主叙述，产物仅作附带；成功才说成功。
+        last_own_failed = False
+        for step in reversed(own_steps):
+            if normalize_text(str(step.get("error", ""))).startswith(
+                self._GUARD_STEP_ERRORS
+            ):
+                # 守卫自己写的标记不算一次真实调用结果
+                continue
+            last_own_failed = not bool(step.get("ok"))
+            break
+
+        own_failure = self._last_failure_text(own_steps)
+
+        if obtained and not last_own_failed:
+            payload["already_obtained"] = obtained
+            payload["display"] = _pl.get_message(
+                "agent_guard_already_obtained",
+                "上一次调用已经成功，结果见 already_obtained。请直接用 final_answer 回复，"
+                "并原样携带其中的 image_urls / video_url / audio_file，不要再调用这个工具。",
+            )
+            return payload
+
+        failure = own_failure or reason_key
+        template = _pl.get_message(
+            "agent_guard_last_error",
+            "该工具最近一次失败的真实原因：{error}。请换其他工具，或用 final_answer "
+            "如实向用户说明这件事没做成以及为什么，不要重复同样的调用。",
+        )
+        payload["display"] = (
+            template.replace("{error}", failure)
+            if "{error}" in template
+            else f"{template} {failure}"
+        )
+        if obtained:
+            # 先前确实拿到过东西，但最近一次是失败的。两件事都给，
+            # 并说清产物是「更早那次」的，避免模型把它当成本次结果去交付。
+            payload["earlier_partial_result"] = obtained
+        return payload
 
     @staticmethod
     def _rewrite_tool_call_arguments(
@@ -678,6 +912,7 @@ class AgentLoop:
         decoder = json.JSONDecoder()
         idx = 0
         chunks = 0
+        clobbered: list[str] = []
         while idx < len(text):
             while idx < len(text) and text[idx].isspace():
                 idx += 1
@@ -689,19 +924,56 @@ class AgentLoop:
                 break
             chunks += 1
             if isinstance(obj, dict):
+                # 后段覆盖前段是既定行为，但「覆盖成不同的值」意味着有一个真参数
+                # 被悄悄丢掉了 —— 那是必须报警的形态，不是正常恢复。
+                clobbered.extend(
+                    key for key, value in obj.items()
+                    if key in merged and merged[key] != value
+                )
                 merged.update(obj)
             idx = end
 
+        # 是否把整段文本都消费掉了。没消费完 = 有一段解不出来被丢了
+        # （例如 provider 把第二段截断），而 merged 非空会让它看起来像成功。
+        tail = text[idx:].strip()
+
         if merged:
-            _log.warning(
-                "agent_tool_args_recovered_from_malformed_json | trace=%s | step=%d "
-                "| tool=%s | chunks=%d | raw_len=%d",
-                trace_id,
-                step_idx,
-                tool_name,
-                chunks,
-                len(text),
-            )
+            AgentLoop._malformed_args_recovered_total += 1
+            if clobbered or tail:
+                # 真告警：恢复过程本身有损。
+                _log.warning(
+                    "agent_tool_args_recovery_lossy | trace=%s | step=%d | tool=%s "
+                    "| chunks=%d | raw_len=%d | clobbered=%s | unconsumed=%s",
+                    trace_id,
+                    step_idx,
+                    tool_name,
+                    chunks,
+                    len(text),
+                    ",".join(sorted(set(clobbered))) or "-",
+                    clip_text(tail, 120) or "-",
+                )
+            else:
+                # 无损恢复。实测 skiapi 89% 的工具调用走这条路（37 次里 33 次，
+                # 形态全是 `{}` + 真参数两段），逐条 WARNING 会淹掉日志，
+                # 所以降到 DEBUG，另外每 N 次汇总一条 INFO 保留可见度。
+                _log.debug(
+                    "agent_tool_args_recovered_from_malformed_json | trace=%s | step=%d "
+                    "| tool=%s | chunks=%d | raw_len=%d",
+                    trace_id,
+                    step_idx,
+                    tool_name,
+                    chunks,
+                    len(text),
+                )
+                total = AgentLoop._malformed_args_recovered_total
+                if total % AgentLoop._MALFORMED_ARGS_LOG_EVERY == 0:
+                    _log.info(
+                        "agent_tool_args_malformed_json_rollup | total=%d | latest_tool=%s "
+                        "| chunks=%d | provider 持续返回串接 JSON，恢复无损",
+                        total,
+                        tool_name,
+                        chunks,
+                    )
             return merged
 
         _log.warning(
@@ -728,6 +1000,8 @@ class AgentLoop:
     ) -> dict[str, Any]:
         return {
             "api_call": ctx.api_call,
+            "output_filter": ctx.output_filter,
+            "topic_gate": ctx.topic_gate,
             "admin_handler": ctx.admin_handler,
             "config_patch_handler": ctx.config_patch_handler,
             "sticker_manager": ctx.sticker_manager,
@@ -797,7 +1071,40 @@ class AgentLoop:
             token = normalize_text(str(pending.get("confirm_token", ""))).lower()
             if token and token in content:
                 return True
-        return any(cue in content for cue in self.high_risk_confirm_cues)
+        return any(
+            cue in content and not self._cue_is_negated(content, cue)
+            for cue in self.high_risk_confirm_cues
+        )
+
+    @staticmethod
+    def _cue_is_negated(content: str, cue: str) -> bool:
+        """确认词前面紧挨着否定词时，这不是确认，是拒绝。
+
+        2026-08-06 子 agent 审计发现：`confirm_cues` 用的是**无锚点子串匹配**，
+        而「我不确认」「别确认」「无法确认」「不要确认」都包含「确认」，于是
+        `_is_confirmation_text` 全部返回 True。取消判定又拦不住它们
+        （cancel_cues 里没有这些词形），所以二次确认这道闸门**在用户明确拒绝时
+        反而放行封禁**。实测四种说法全部走到执行。
+
+        这里只做**语法否定**判定，不是语义词表：中文否定词是一个封闭的小集合，
+        且必须紧邻确认词才算（"确认取消订单" 里的「取消」不该让确认失效）。
+        `use_confirm_token` 打开时走 token 路径，不依赖这层。
+        """
+
+        negators = ("不", "别", "勿", "非", "无法", "未", "没", "莫")
+        # 否定词与确认词之间常隔一个情态字（「不要确认」「不能确认」「不用确认」）。
+        # 这些字本身不表意，剥掉再判否定。注意不能把主语一起剥 ——
+        # 「我要确认」剥成「我」，不是否定词，仍算确认。
+        modals = "要想能会用准许可以得了着"
+        start = 0
+        while True:
+            idx = content.find(cue, start)
+            if idx < 0:
+                return True  # 每一处出现都被否定了
+            prefix = content[:idx].rstrip(modals)
+            if not any(prefix.endswith(neg) for neg in negators):
+                return False  # 存在一处未被否定的确认词 → 视为确认
+            start = idx + 1
 
     def _is_cancellation_text(
         self, text: str, pending: dict[str, Any] | None = None
@@ -886,6 +1193,46 @@ class AgentLoop:
             cancel_token,
         )
 
+    def _cross_group_authority_error(
+        self, ctx: AgentContext, tool_name: str, tool_args: dict[str, Any]
+    ) -> str:
+        """群管理员的权限只在他本群有效 —— 跨群的高风险操作一律拒绝。
+
+        2026-08-06 子 agent 审计发现：`_resolve_permission_level` 按**消息来源群**
+        （`ctx.group_id` + `ctx.sender_role` + 该群已加白）授予 `group_admin`，
+        而 `set_group_ban` 这类 handler 的 `group_id` 是从**模型参数**读的，
+        两者从不交叉校验。后果：在 A 群当管理的人，可以让机器人对 B 群执行封禁
+        —— 权限在 A 群赚到，作用在 B 群，而 B 群里他可能什么都不是。
+
+        super_admin 不受此限（它本来就凌驾一切，见 `_resolve_permission_level`）。
+        """
+
+        if not self._tool_is_high_risk(tool_name):
+            return ""
+        # 先读参数里的目标群：没写 group_id 或就是本群时，什么都不用做。
+        # 顺序有意如此 —— 只有真的出现跨群嫌疑才去解析权限等级，
+        # 那一步要读 ctx 的多个字段，不该在每次高风险调用上白跑。
+        try:
+            target_group = int(tool_args.get("group_id", 0) or 0)
+        except (TypeError, ValueError):
+            return ""
+        if not target_group:
+            return ""
+        if target_group == int(getattr(ctx, "group_id", 0) or 0):
+            return ""
+        if self._resolve_permission_level(ctx) != "group_admin":
+            return ""
+        _log.warning(
+            "high_risk_cross_group_blocked | trace=%s | tool=%s | authority_group=%s "
+            "| target_group=%s | user=%s",
+            ctx.trace_id,
+            tool_name,
+            ctx.group_id,
+            target_group,
+            ctx.user_id,
+        )
+        return "这个操作要在目标群里由那个群的管理员发起，我不能跨群执行。"
+
     def _guard_high_risk_tool_call(
         self, ctx: AgentContext, tool_name: str, tool_args: dict[str, Any]
     ) -> str:
@@ -893,6 +1240,12 @@ class AgentLoop:
             return ""
         if not self._tool_is_high_risk(tool_name):
             return ""
+        # 跨群越权先拦，且**不受 high_risk_control_enable 之外的确认策略影响** ——
+        # 确认策略解决的是「你确定吗」，这里解决的是「你没有这个群的权限」，
+        # 后者不该因为某群把确认关掉就放行。
+        cross_group = self._cross_group_authority_error(ctx, tool_name, tool_args)
+        if cross_group:
+            return cross_group
         if not self._require_high_risk_confirmation_for_user(ctx):
             return ""
 
@@ -912,17 +1265,46 @@ class AgentLoop:
                 self._is_confirmation_text(msg_text, pending)
                 and pending_tool == tool_name
             ):
-                # 确认命中：同 tool_name 即放行，用 pending 保存的 tool_args 覆盖当前参数（防漂移）
+                # 参数在「提示」与「确认」之间变了：**重新提示新参数**，不要静默替换。
+                #
+                # 原来的做法是无条件用 pending 里保存的参数覆盖当前参数（注释写「防漂移」）。
+                # 防漂移的意图是对的 —— 你确认的必须是你看到的那一条。但「静默替换」
+                # 把它实现反了：管理员在确认轮里更正对象（「搞错了是 222222，确认执行」）
+                # 会导致**原来那个人**被封，而机器人报告成功。2026-08-06 子 agent 审计报的。
+                #
+                # 正确动作是拒绝这次确认并按新参数重新提示：既没有执行用户没看过的操作，
+                # 也没有把更正当成没发生。`args_sig` 本来就是为此写入的
+                # （此前只写不读，grep 只有一个写入点）。
                 saved_args = pending.get("saved_tool_args")
+                saved_identity = self._build_identity_signature(
+                    saved_args if isinstance(saved_args, dict) else {}
+                )
+                current_identity = self._build_identity_signature(tool_args)
+                if saved_identity and saved_identity != current_identity:
+                    _log.warning(
+                        "confirm_args_drifted | trace=%s | tool=%s | 重新提示新参数，"
+                        "不执行旧参数",
+                        ctx.trace_id,
+                        tool_name,
+                    )
+                    prompt, confirm_token, cancel_token = (
+                        self._build_high_risk_confirm_prompt(tool_name, tool_args)
+                    )
+                    self._pending_high_risk_actions[key] = {
+                        "tool_name": tool_name,
+                        "args_sig": self._build_args_signature(tool_args),
+                        "saved_tool_args": copy.deepcopy(tool_args),
+                        "created_at": time.time(),
+                        "expires_at": time.time() + self.high_risk_pending_ttl_seconds,
+                        "prompt": prompt,
+                        "confirm_token": confirm_token,
+                        "cancel_token": cancel_token,
+                    }
+                    return prompt
                 self._pending_high_risk_actions.pop(key, None)
                 if saved_args is not None:
                     tool_args.clear()
                     tool_args.update(saved_args)
-                    _log.info(
-                        "confirm_args_overridden | trace=%s | tool=%s",
-                        ctx.trace_id,
-                        tool_name,
-                    )
                 _log.info("confirm_matched | trace=%s | tool=%s", ctx.trace_id, tool_name)
                 return ""
             if pending_tool == tool_name:
@@ -964,7 +1346,10 @@ class AgentLoop:
         system_prompt = self._build_system_prompt(ctx)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": self._build_user_message(ctx)},
+            {
+                "role": "user",
+                "content": await self._compose_user_content(ctx, model_client),
+            },
         ]
 
         tool_calls_made = 0
@@ -972,6 +1357,9 @@ class AgentLoop:
         successful_external_fact_tools = 0
         seen_external_fact_signatures: set[str] = set()
         repeated_tool_counts: dict[str, int] = {}
+        # 真执行成功过的 (工具, 参数) 签名。副作用工具的"一回合只做一次"数的是
+        # 成功次数，不是调用次数。
+        succeeded_tool_signatures: set[str] = set()
         consecutive_tool_errors: dict[str, int] = {}
         consecutive_think_count = 0
         # 追踪工具已发送的媒体（避免 final_answer 重复发送）
@@ -1015,6 +1403,7 @@ class AgentLoop:
                 and ctx.navigator_state is not None
                 and normalize_text(ctx.navigator_state.active_section) == "general_chat"
             ):
+                preflight_started_at = time.monotonic()
                 preflight_section = await self._navigator_timeout_section_retry(
                     ctx=ctx,
                     step_idx=step_idx,
@@ -1022,6 +1411,7 @@ class AgentLoop:
                     steps=steps,
                     remaining=remaining,
                 )
+                preflight_elapsed = time.monotonic() - preflight_started_at
             if preflight_section:
                 if preflight_section[2]:
                     ctx.navigator_pending_tool_retry = (
@@ -1039,10 +1429,12 @@ class AgentLoop:
                 assistant_msg = {"role": "assistant", "content": response_text}
                 synthetic_tool_call = True
                 _log.info(
-                    "navigator_preflight_section | trace=%s | step=%d | section=%s | reason=%s",
+                    "navigator_preflight_section | trace=%s | step=%d | section=%s"
+                    " | elapsed=%.1fs | reason=%s",
                     ctx.trace_id,
                     step_idx,
                     preflight_section[0],
+                    preflight_elapsed,
                     clip_text(preflight_section[1], 120),
                 )
             else:
@@ -1081,6 +1473,11 @@ class AgentLoop:
                         ctx.native_tools
                     )
 
+                # 每步 LLM 调用计时。此前整条链路只有 agent_total_timeout 记总耗时，
+                # 单步耗时无处可查 —— 实测回合 p50 31s / p90 59s（2026-08-06，16 个
+                # 真实回合），但「慢在 provider 还是慢在步数」当时只能靠 31s÷3步 猜。
+                # 没有这条日志就没法判断优化该往哪走。
+                llm_started_at = time.monotonic()
                 try:
                     if native_tool_calling:
                         raw_response = await asyncio.wait_for(
@@ -1103,12 +1500,23 @@ class AgentLoop:
                             ),
                             timeout=llm_timeout,
                         )
+                    _log.info(
+                        "agent_llm_step_latency | trace=%s | step=%d | elapsed=%.1fs "
+                        "| tools=%d | native=%s",
+                        ctx.trace_id,
+                        step_idx,
+                        time.monotonic() - llm_started_at,
+                        len(schemas),
+                        native_tool_calling,
+                    )
                 except asyncio.TimeoutError:
                     _log.warning(
-                        "agent_llm_timeout | trace=%s | step=%d | timeout=%.1fs",
+                        "agent_llm_timeout | trace=%s | step=%d | timeout=%.1fs "
+                        "| elapsed=%.1fs",
                         ctx.trace_id,
                         step_idx,
                         llm_timeout,
+                        time.monotonic() - llm_started_at,
                     )
                     retry_tool = self._consume_navigator_pending_tool_retry(ctx)
                     if retry_tool:
@@ -1445,9 +1853,10 @@ class AgentLoop:
                     }
                 )
                 if missing_arg_counts[miss_key] >= 3:
+                    # 这里过去把工具名和参数名原样喂给兜底 LLM，模型会照抄进群。
+                    # 只传类别标签。
                     fallback_text = await self._ai_fallback_reply(
-                        ctx,
-                        f"工具 {tool_name} 连续缺少参数({miss_text})，无法继续执行",
+                        ctx, self._build_failure_situation_hint(["missing_args"])
                     )
                     return AgentResult(
                         reply_text=fallback_text
@@ -1513,10 +1922,28 @@ class AgentLoop:
                     video_url = self._last_success_video_url(steps)
                 if video_url:
                     text = self._sanitize_final_text_for_local_media(text, video_url)
+                # 模型显式声明这是拒绝时，不要逼它先调工具。
+                #
+                # 实测（2026-08-06，trace 118886-5-f46539ff）：用户带链接要盗版软件，
+                # 模型 step 0 就正确拒绝了「破解版这种东西涉及侵权，我这边不去搜也不会推」，
+                # 这道门以 evidence=url 驳回 → 模型只好 web_search 了它刚说不搜的东西
+                # → step 2 再答一遍。**拒绝被这道门推翻，而且多烧两次 LLM 往返（36.7s）。**
+                #
+                # 这道门本身要保留：它防的是「有链接却说我看不到」。但拒绝不是
+                # 「用嘴代替动手」—— 拒绝时本来就不该动手。
+                declined_request = bool(tool_args.get("declined"))
+                if declined_request:
+                    _log.info(
+                        "agent_final_answer_declined | trace=%s | step=%d | "
+                        "跳过 tool_review 门（模型声明这是拒绝）",
+                        ctx.trace_id,
+                        step_idx,
+                    )
                 if (
                     strict_tool_routing
                     and tool_calls_made == 0
                     and not strict_tool_policy_blocked
+                    and not declined_request
                     and self._requires_tool_review_before_final(ctx)
                 ):
                     strict_tool_policy_blocked = True
@@ -1718,7 +2145,8 @@ class AgentLoop:
                             text = self._last_success_display(steps)
                             if not text:
                                 text = await self._ai_fallback_reply(
-                                    ctx, "处理完了但没有拿到有效结果"
+                                    ctx,
+                                    self._build_failure_situation_hint(["not_found"]),
                                 )
                             if not text:
                                 text = _pl.get_message("no_result", "")
@@ -1761,31 +2189,13 @@ class AgentLoop:
                                 ctx.trace_id,
                             )
                             video_url = ""
-                    # 表情包/贴纸工具已完成时，final_answer 默认清空媒体（仅保留文字确认）
-                    _STICKER_LIKE_TOOLS = {
-                        "learn_sticker", "correct_sticker",
-                        "send_emoji", "send_sticker", "send_face",
-                    }
-                    sticker_tool_used = any(
-                        s.get("tool") in _STICKER_LIKE_TOOLS and s.get("result")
-                        for s in steps
-                    )
-                    if sticker_tool_used and (image_url or image_urls or video_url or audio_file):
-                        # 仅当用户明确要求"预览/发出来看看"时才保留
-                        user_wants_preview = any(
-                            kw in normalize_text(ctx.message_text)
-                            for kw in ("预览", "发出来看看", "看看效果", "/preview")
-                        )
-                        if not user_wants_preview:
-                            _log.info(
-                                "agent_strip_sticker_media | trace=%s | step=%d | stripped media from final_answer after sticker tool",
-                                ctx.trace_id,
-                                step_idx,
-                            )
-                            image_url = ""
-                            image_urls = []
-                            video_url = ""
-                            audio_file = ""
+                    # 这里原本有一段"表情工具跑完就清空 final_answer 媒体"的逻辑，
+                    # 判据是 step.get("result")，而工具步骤的键集只有
+                    # step/tool/ok/display/error(/data)，"result" 只出现在
+                    # final_answer 自己那条 —— 条件恒假，这段从未执行过。已删除：
+                    # 它想防的重复投递已由上面的 tool_sent_media 去重覆盖，
+                    # 而它的保留判据是"预览/发出来看看"关键词表，属于本仓明确
+                    # 拒绝的本地语义否决层，修好它等于新上线一个反约定的行为。
                     return AgentResult(
                         reply_text=text,
                         image_url=image_url,
@@ -1817,9 +2227,10 @@ class AgentLoop:
                         }
                     )
                     if consecutive_think_count >= self.max_consecutive_think + 2:
+                        # 「连续思考次数过多／没有执行有效工具」是内部状态，
+                        # 喂进去模型就会照抄。只给类别。
                         fallback_text = await self._ai_fallback_reply(
-                            ctx,
-                            "连续思考次数过多，没有执行有效工具",
+                            ctx, self._build_failure_situation_hint(["unknown"])
                         )
                         return AgentResult(
                             reply_text=fallback_text
@@ -1941,7 +2352,17 @@ class AgentLoop:
                     repeated_tool_counts.get(tool_signature, 0) + 1
                 )
                 repeat_count = repeated_tool_counts[tool_signature]
-                if repeat_count > self.max_same_tool_call:
+                # 有对外副作用的工具，同 args 只允许真执行成功一次。
+                # 数成功次数而不是调用次数：第一次瞬时失败（超时/网络抖动）后，
+                # 同 args 重试必须放行，否则这条消息本回合再也发不出去。
+                # 没成功过时退回通用上限 max_same_tool_call，仍然防死循环。
+                repeat_limit = (
+                    1
+                    if tool_name in self._ONCE_PER_TURN_TOOLS
+                    and tool_signature in succeeded_tool_signatures
+                    else self.max_same_tool_call
+                )
+                if repeat_count > repeat_limit:
                     steps.append(
                         {
                             "step": step_idx,
@@ -1950,15 +2371,30 @@ class AgentLoop:
                             "error": f"repeated_tool_call:{repeat_count}",
                         }
                     )
-                    self._append_tool_result(messages, parsed, assistant_msg, response_text, {
-                                        "tool": tool_name,
-                                        "ok": False,
-                                        "error": "同一工具和参数重复过多，请换工具策略或直接 final_answer。",
-                                    })
-                    if repeat_count >= self.max_same_tool_call + 2:
+                    guard_payload = self._build_guard_feedback_payload(
+                        tool_name=tool_name,
+                        steps=steps,
+                        reason_key="repeated_tool_call",
+                        reason_text="同一工具和参数重复过多，请换工具策略或直接 final_answer。",
+                    )
+                    _log.info(
+                        "agent_guard_block | trace=%s | step=%d | tool=%s | guard=%s | repeat=%d | has_artifact=%s",
+                        ctx.trace_id,
+                        step_idx,
+                        tool_name,
+                        "repeated_tool_call",
+                        repeat_count,
+                        "already_obtained" in guard_payload,
+                    )
+                    # 熔断判定必须在 append 之前：熔断后模型再也不会被调用，
+                    # 那条 tool 消息无人消费，纯浪费 token。
+                    if repeat_count >= repeat_limit + 2:
                         return await self._build_fallback_result(
                             ctx, steps, tool_calls_made, t0, "repeated_tool_call"
                         )
+                    self._append_tool_result(
+                        messages, parsed, assistant_msg, response_text, guard_payload
+                    )
                     continue
 
             ext_sig = ""
@@ -1973,11 +2409,24 @@ class AgentLoop:
                             "error": "duplicate_external_fact_query",
                         }
                     )
-                    self._append_tool_result(messages, parsed, assistant_msg, response_text, {
-                                        "tool": tool_name,
-                                        "ok": False,
-                                        "error": "这个外部查询之前已经成功执行过，请基于已有结果继续。",
-                                    })
+                    guard_payload = self._build_guard_feedback_payload(
+                        tool_name=tool_name,
+                        steps=steps,
+                        reason_key="duplicate_external_fact_query",
+                        reason_text="这个外部查询之前已经成功执行过，请基于已有结果继续。",
+                    )
+                    _log.info(
+                        "agent_guard_block | trace=%s | step=%d | tool=%s | guard=%s | repeat=%d | has_artifact=%s",
+                        ctx.trace_id,
+                        step_idx,
+                        tool_name,
+                        "duplicate_external_fact_query",
+                        0,
+                        "already_obtained" in guard_payload,
+                    )
+                    self._append_tool_result(
+                        messages, parsed, assistant_msg, response_text, guard_payload
+                    )
                     continue
 
             # 致命级循环拦截：如果某个工具连续抛错超过 2 次，强行熔断
@@ -1990,11 +2439,24 @@ class AgentLoop:
                         "error": "consecutive_crashes_guard",
                     }
                 )
-                self._append_tool_result(messages, parsed, assistant_msg, response_text, {
-                    "tool": tool_name,
-                    "ok": False,
-                    "error": "该工具已连续崩溃或报错，底层拒绝执行。请立即挂起或切换其他工具策略，禁止再次调用！",
-                })
+                guard_payload = self._build_guard_feedback_payload(
+                    tool_name=tool_name,
+                    steps=steps,
+                    reason_key="consecutive_crashes_guard",
+                    reason_text="该工具已连续崩溃或报错，底层拒绝执行，不要再调用它。",
+                )
+                _log.info(
+                    "agent_guard_block | trace=%s | step=%d | tool=%s | guard=%s | repeat=%d | has_artifact=%s",
+                    ctx.trace_id,
+                    step_idx,
+                    tool_name,
+                    "consecutive_crashes_guard",
+                    consecutive_tool_errors.get(tool_name, 0),
+                    "already_obtained" in guard_payload,
+                )
+                self._append_tool_result(
+                    messages, parsed, assistant_msg, response_text, guard_payload
+                )
                 continue
 
             # 执行工具
@@ -2008,6 +2470,9 @@ class AgentLoop:
                 self._resolve_tool_timeout_seconds(tool_name, has_media),
                 max(4.0, remaining_for_tool - 1.0),
             )
+            # 工具没写 display 时由循环合成一句给模型看的诊断串。它含工具名和
+            # 错误码，绝不能直接外发 —— 打上标记让兜底路径认出来。
+            display_synthetic = False
             try:
                 result = await asyncio.wait_for(
                     self.tool_registry.call(tool_name, tool_args, tool_context),
@@ -2020,6 +2485,7 @@ class AgentLoop:
                     error=f"tool_timeout:{tool_name}",
                     data={},
                 )
+                display_synthetic = True
                 _log.warning(
                     "agent_tool_timeout | trace=%s | step=%d | tool=%s | timeout=%.1fs",
                     ctx.trace_id, step_idx, tool_name, tool_timeout,
@@ -2030,12 +2496,15 @@ class AgentLoop:
             tool_calls_made += 1
             if not result.display and result.error:
                 result.display = f"{tool_name} 失败: {result.error}"
+                display_synthetic = True
             result_tool_name = tool_name
 
             # 工具失败后不再由本地 if-链偷偷换一个工具重跑：错误已经通过
             # _append_tool_result 回喂给模型，由模型自己决定下一步（换工具 / 换分区 /
             # 直接说明失败）。旧实现在同一个 step 里静默执行第二个工具，
             # 模型看不到这次调用，也无法否决它选的替代工具和拼出来的 query。
+            if result.ok:
+                succeeded_tool_signatures.add(tool_signature)
             if result.ok and ext_sig:
                 seen_external_fact_signatures.add(ext_sig)
                 successful_external_fact_tools += 1
@@ -2065,13 +2534,15 @@ class AgentLoop:
             if isinstance(result.data, dict) and result.data:
                 compact_data = self._compact_data(result.data)
 
-            step_payload = {
+            step_payload: dict[str, Any] = {
                 "step": step_idx,
                 "tool": result_tool_name,
                 "ok": result.ok,
                 "display": clip_text(result.display, 300),
                 "error": result.error,
             }
+            if display_synthetic:
+                step_payload["display_synthetic"] = True
             if compact_data:
                 step_payload["data"] = compact_data
             steps.append(step_payload)
@@ -2540,6 +3011,13 @@ class AgentLoop:
         timeout = min(20.0, max(3.0, remaining - 2.0))
         if timeout <= 2.5:
             return None
+        # 到这一行，这次 LLM 调用一定会发生 —— 无论后面走哪条 return，
+        # 本回合的延迟已经付掉了。原先只有「选中分区」和「超时」两条留日志，
+        # 另外三条静默 return None（模型选了同一分区 / 未知分区 / JSON 解不出）
+        # 一条都没有，于是无法回答「preflight 跑了多少次、多少次白跑」。
+        # 实测（storage/logs/yukiko.log，186 个 general_chat 回合）：
+        # 全部跑了 preflight，日志里却只看得见 99 个，另外 87 个静默。
+        started_at = time.monotonic()
         lines = [
             "你是 YuKiKo 的 Prompt Navigator 分区选择器。",
             '只输出 JSON: {"section_id":"分区ID","reason":"一句话原因","tool":"可选工具名","args":{}}。',
@@ -2602,22 +3080,55 @@ class AgentLoop:
                 timeout=timeout,
             )
         except Exception as exc:
+            # `asyncio.TimeoutError` 的 str() 是空的，所以显式打出异常类型 ——
+            # 否则日志尾部只剩一个空字段，看不出是超时还是别的错误。
             _log.info(
-                "navigator_timeout_section_retry_failed | trace=%s | step=%d | model=%s | %s",
+                "navigator_timeout_section_retry_failed | trace=%s | step=%d | model=%s"
+                " | elapsed=%.1fs | budget=%.1fs | exc=%s | %s",
                 ctx.trace_id,
                 step_idx,
                 self.navigator_retry_model or "-",
+                time.monotonic() - started_at,
+                timeout,
+                type(exc).__name__,
                 exc,
             )
             return None
+        elapsed = time.monotonic() - started_at
+
+        def _noop(outcome: str, detail: str = "") -> None:
+            """记一次「跑完但没改变任何东西」的 preflight。
+
+            这三种结果与超时不同：调用成功返回了，只是结论用不上。延迟照付，
+            所以必须和成功分区切换分开计数，否则 preflight 的收益会被高估。
+            """
+            _log.info(
+                "navigator_preflight_noop | trace=%s | step=%d | outcome=%s"
+                " | elapsed=%.1fs | active=%s%s",
+                ctx.trace_id,
+                step_idx,
+                outcome,
+                elapsed,
+                state.active_section,
+                f" | detail={detail}" if detail else "",
+            )
+
         payload = self._parse_json_object_from_text(str(raw or ""))
         if not isinstance(payload, dict):
+            _noop("unparseable_json", clip_text(str(raw or ""), 120) or "-")
             return None
         section_id = normalize_text(str(payload.get("section_id", "")))
         reason = normalize_text(str(payload.get("reason", ""))) or "full prompt timed out; tiny navigator selected this section"
-        if not section_id or section_id == state.active_section:
+        if not section_id:
+            _noop("missing_section_id")
+            return None
+        if section_id == state.active_section:
+            # 模型认为就该留在当前分区。这是最常见的一条，且完全合理 ——
+            # 但它意味着这次调用没产生任何决策，是 preflight 成本核算的关键项。
+            _noop("same_section")
             return None
         if section_id not in navigator.config.sections:
+            _noop("unknown_section", clip_text(section_id, 60))
             return None
         tool_name = normalize_text(
             str(
@@ -3556,46 +4067,94 @@ class AgentLoop:
         
         text_content = "\n".join(parts)
         
-        config_obj = getattr(self, "config", None)
-        agent_cfg = config_obj.get("agent", {}) if isinstance(config_obj, dict) else {}
-        vision_enabled = False
-        if isinstance(agent_cfg, dict):
-            vision_enabled = bool(agent_cfg.get("vision_enabled", False))
-            
-        if vision_enabled:
-            vision_blocks: list[dict[str, Any]] = []
-            
-            # Extract images from ctx.raw_segments
-            for seg in (ctx.raw_segments or []):
-                if isinstance(seg, dict) and seg.get("type") == "image":
-                    url = (seg.get("data") or {}).get("url", "")
-                    if url and url.startswith("http"):
-                        vision_blocks.append({"type": "image_url", "image_url": {"url": url}})
-                        
-            # Extract images from ctx.reply_media_segments
-            for seg in (ctx.reply_media_segments or []):
-                if isinstance(seg, dict) and seg.get("type") == "image":
-                    url = (seg.get("data") or {}).get("url", "")
-                    if url and url.startswith("http"):
-                        vision_blocks.append({"type": "image_url", "image_url": {"url": url}})
-            
-            # Deduplicate and limit to max 4 images
-            seen_urls = set()
-            unique_blocks = []
-            for block in vision_blocks:
-                url = block["image_url"]["url"]
-                if url not in seen_urls:
-                    seen_urls.add(url)
-                    unique_blocks.append(block)
-                    if len(unique_blocks) >= 4:
-                        break
-                        
-            if unique_blocks:
-                final_content: list[dict[str, Any]] = [{"type": "text", "text": text_content}]
-                final_content.extend(unique_blocks)
-                return final_content
-
+        # 原生看图的图片块**不在这里拼** —— 见 _compose_user_content()。
+        # 这里原本有一段自己从 raw_segments 取 url 塞 image_url 块的代码，已删除：
+        # 那些 url 是 QQ CDN 链接，实测对外不可达
+        #   HTTP 400 {"retcode":-5503022,"retmsg":"appid is not supported"}
+        #   HTTP 400 {"retcode":-5503007,"retmsg":"download url has expired"}
+        # 所以它只会让模型收到一堆死链，还不如不给。
+        # 现在走 core/tools_vision.py 的 build_native_vision_blocks()，
+        # 那边只用实测成功的取法（本地文件 61/61、NapCat get_image 45/45），
+        # 且保证块里的 url 一定是 data URI。
+        # 本函数保持**同步**是刻意的：tests/test_agent_smoke.py:188、
+        # tests/test_tool_call_leak_regression.py:357 会把它替换成同步 lambda，
+        # tests/test_dialog_and_sticker_regression.py:84 与
+        # scripts/agent_deep_selfcheck.py:165 直接同步调用它。
         return text_content
+
+    async def _compose_user_content(
+        self, ctx: AgentContext, model_client: Any
+    ) -> str | list[dict[str, Any]]:
+        """组装 user 消息内容：纯文本，或「文本 + 原生图片块」。
+
+        拆成独立的 async 方法而不是把 _build_user_message 改成 async，
+        是因为后者有四个同步调用方（两个测试替换成 lambda、一个直接调、
+        还有 scripts/agent_deep_selfcheck.py）—— 改签名会全破。
+        """
+
+        text_content = self._build_user_message(ctx)
+        # _build_user_message 理论上可能已经返回 list（历史签名允许），那就别再包一层
+        if not isinstance(text_content, str):
+            return text_content
+
+        executor = getattr(ctx, "tool_executor", None)
+        builder = getattr(executor, "build_native_vision_blocks", None)
+        if builder is None:
+            return text_content
+        # 模型不支持图片输入时不做无用功，也不白烧 get_image 的往返
+        supports_vision = getattr(model_client, "supports_vision_input", None)
+        if callable(supports_vision):
+            try:
+                if not supports_vision():
+                    return text_content
+            except Exception as exc:
+                _log.info(
+                    "native_vision_capability_probe_failed | trace=%s | exc=%s",
+                    ctx.trace_id,
+                    type(exc).__name__,
+                )
+                return text_content
+
+        try:
+            blocks, reason = await builder(
+                raw_segments=ctx.raw_segments,
+                reply_media_segments=ctx.reply_media_segments,
+                api_call=getattr(ctx, "api_call", None),
+            )
+        except Exception as exc:
+            # 原生看图是增强项，不能因为它失败就让整个回合挂掉 ——
+            # 退回纯文本，模型仍可显式调 analyze_image。
+            _log.warning(
+                "native_vision_blocks_error | trace=%s | exc=%s | err=%s",
+                ctx.trace_id,
+                type(exc).__name__,
+                clip_text(str(exc), 160) or "-",
+            )
+            return text_content
+
+        if not blocks:
+            if reason and reason not in {"no_image_segments", "vision_disabled"}:
+                _log.info(
+                    "native_vision_blocks_skipped | trace=%s | reason=%s",
+                    ctx.trace_id,
+                    reason,
+                )
+            return text_content
+
+        estimate = getattr(executor, "estimate_native_vision_tokens", None)
+        est_tokens = 0
+        if callable(estimate):
+            try:
+                est_tokens = int(estimate(blocks))
+            except Exception:
+                est_tokens = 0
+        _log.info(
+            "native_vision_attached | trace=%s | blocks=%d | est_tokens=%d",
+            ctx.trace_id,
+            len(blocks),
+            est_tokens,
+        )
+        return [{"type": "text", "text": text_content}, *blocks]
 
     @staticmethod
     def _has_animated_image_summary(rows: list[str] | None) -> bool:
@@ -5053,7 +5612,10 @@ class AgentLoop:
                     total_time_ms=self._elapsed(t0),
                     steps=steps,
                 )
-        # 工具失败但已经给出了可读原因时，直接把原因反馈给用户，避免二次 LLM 超时后丢失真实错误。
+        # 工具失败时，只有工具自己写的那句人话才可以直接转给用户（避免二次 LLM
+        # 超时后丢失真实原因）。循环里合成的 "<tool> 失败: <error>" 带 display_synthetic
+        # 标记，一律不外发；剩下的先剥机器标识符，剥完不成句的也不外发。
+        failure_categories = self._failure_categories_from_steps(steps)
         for step in reversed(steps):
             if bool(step.get("ok")):
                 continue
@@ -5065,10 +5627,20 @@ class AgentLoop:
                 continue
             if tool_name in {"policy_guard", "think", NAVIGATE_SECTION_TOOL}:
                 continue
-            if len(display) > 280:
-                display = clip_text(display, 280)
+            if bool(step.get("display_synthetic")) or not self._is_user_presentable_failure_text(display):
+                _log.warning(
+                    "agent_fallback_display_suppressed | trace=%s | tool=%s | category=%s | raw=%s",
+                    ctx.trace_id,
+                    tool_name,
+                    self._classify_tool_failure(str(step.get("error", ""))),
+                    clip_text(display, 120),
+                )
+                continue
+            safe_display = self._scrub_internal_state_text(display)
+            if len(safe_display) > 280:
+                safe_display = clip_text(safe_display, 280)
             return AgentResult(
-                reply_text=display,
+                reply_text=safe_display,
                 action="reply",
                 reason=f"agent_fallback_{reason}",
                 tool_calls_made=tool_calls_made,
@@ -5076,20 +5648,30 @@ class AgentLoop:
                 steps=steps,
             )
 
-        # 没有可用的步骤结果 → 用 AI 生成自然回复
-        failed_tools = [
-            f"{step.get('tool')}:{step.get('error')}"
-            for step in steps
-            if isinstance(step, dict) and step.get("tool") and step.get("ok") is False
-        ]
-        fail_hint = ", ".join(failed_tools[:4]) if failed_tools else reason
-        ai_reply = await self._ai_fallback_reply(
-            ctx, f"处理过程中失败({fail_hint})，没拿到最终结果"
+        # 没有可外发的步骤结果 → 按失败类别兜底。
+        # 预算已耗尽的原因（模型超时/报错）不再打第二次 LLM，直接用类别兜底句。
+        category_reply = (
+            self._failure_category_reply(failure_categories)
+            if failure_categories
+            else _pl.get_message(
+                "no_result",
+                "我这边刚刚没跑通，你换个说法或稍后再试，我继续处理。",
+            )
         )
-        fallback_text = ai_reply or _pl.get_message(
-            "no_result",
-            "我这边工具刚刚没跑通，你换个说法或稍后再试，我继续处理。",
-        )
+        ai_reply = ""
+        if reason not in self._NO_SECOND_LLM_FALLBACK_REASONS:
+            # 只传类别标签，不传工具名也不传错误码 —— 模型看不到内部状态就复述不出来。
+            situation = self._build_failure_situation_hint(failure_categories)
+            ai_reply = await self._ai_fallback_reply(ctx, situation)
+        else:
+            _log.info(
+                "agent_fallback_skip_second_llm | trace=%s | reason=%s | categories=%s",
+                ctx.trace_id,
+                reason,
+                ",".join(failure_categories) or "none",
+            )
+        # 出口再剥一次：模型即使凭上下文猜出工具名，也不让它出群。
+        fallback_text = self._scrub_internal_state_text(ai_reply) or category_reply
         video_url = self._last_success_video_url(steps)
         image_urls = self._last_success_image_urls(steps)
         image_url = image_urls[0] if image_urls else ""
@@ -5110,6 +5692,102 @@ class AgentLoop:
             total_time_ms=self._elapsed(t0),
             steps=steps,
         )
+
+    @classmethod
+    def _classify_tool_failure(cls, error: str) -> str:
+        """把 ToolCallResult.error 的机器码归到一个失败类别。
+
+        只看 error 字段（本仓自己写的 ASCII 机器码），不看 display。取不到就
+        返回 unknown —— 宁可说"没能完成"，也不把原始状态串带给用户。
+        """
+        code = normalize_text(error).lower()
+        # 只保留 ASCII 机器码部分：`tool_exception: HTTPSConnectionPool(...)` 这类
+        # 后半段是异常文本，不该参与分类。
+        code = " ".join(re.findall(r"[a-z0-9_:.-]+", code))
+        if not code:
+            return "unknown"
+        for category, markers in cls._TOOL_FAILURE_CATEGORY_MARKERS:
+            if any(marker in code for marker in markers):
+                return category
+        return "unknown"
+
+    @classmethod
+    def _failure_categories_from_steps(cls, steps: list[dict[str, Any]]) -> list[str]:
+        """按发生顺序取失败步骤的类别，去重后返回。"""
+        categories: list[str] = []
+        for step in steps:
+            if not isinstance(step, dict) or step.get("ok") is not False:
+                continue
+            category = cls._classify_tool_failure(str(step.get("error", "")))
+            if category not in categories:
+                categories.append(category)
+        return categories
+
+    @classmethod
+    def _failure_category_hint(cls, categories: list[str]) -> str:
+        """把类别列表转成喂给兜底 LLM 的短标签串（不含工具名、不含错误码）。"""
+        labels = [
+            cls._TOOL_FAILURE_CATEGORY_LABELS.get(category, cls._TOOL_FAILURE_CATEGORY_LABELS["unknown"])
+            for category in categories[:3]
+        ]
+        return "、".join(labels)
+
+    @classmethod
+    def _failure_category_reply(cls, categories: list[str]) -> str:
+        """按失败类别取一句给用户的话。零 LLM 调用，供预算已耗尽时使用。"""
+        category = categories[0] if categories else "unknown"
+        defaults = {
+            "timeout": "这件事我这边跑太久了，没等到结果。你稍后再让我试一次。",
+            "permission": "这件事我现在没权限做，得让管理员来。",
+            "missing_args": "我还缺点关键信息，你把要求再说具体一点我就能做。",
+            "blocked": "这个我不能做，换个方向我陪你继续。",
+            "unavailable": "这个能力我现在用不了，等能用了我再帮你弄。",
+            "not_found": "我找了一圈没找到，你换个说法或者给我多点线索。",
+            "upstream": "我要的东西没拿到，稍后再试一次应该就好。",
+            "unknown": "这件事我没做成，你换个说法我再来一次。",
+        }
+        return _pl.get_message(f"tool_failure_{category}", defaults[category])
+
+    @classmethod
+    def _scrub_internal_state_text(cls, text: str) -> str:
+        """从要发给用户的文本里剥掉机器标识符（工具名 / 错误码 / key=value）。
+
+        只按结构剥：含下划线的 ASCII 标记、`k=v` 状态串。URL 原样保留 ——
+        媒体链接要靠它投递。剥完的空洞由调用方判断是否已经不成句。
+        """
+        content = normalize_text(text)
+        if not content:
+            return ""
+        parts: list[str] = []
+        cursor = 0
+        for match in _RE_URL_EXTRACT.finditer(content):
+            parts.append(cls._scrub_machine_tokens(content[cursor : match.start()]))
+            parts.append(match.group(0))
+            cursor = match.end()
+        parts.append(cls._scrub_machine_tokens(content[cursor:]))
+        return _RE_WHITESPACE_2PLUS.sub(" ", "".join(parts)).strip()
+
+    @staticmethod
+    def _scrub_machine_tokens(chunk: str) -> str:
+        if not chunk:
+            return ""
+        cleaned = _RE_MACHINE_KEY_VALUE.sub("", chunk)
+        cleaned = _RE_MACHINE_IDENTIFIER.sub("", cleaned)
+        # 剥完常剩下 "失败: ，" 这类孤立标点，收一下。
+        cleaned = re.sub(r"[（(\[【]\s*[）)\]】]", "", cleaned)
+        cleaned = re.sub(r"[:：]\s*(?=[，。、！？\s]|$)", "", cleaned)
+        return cleaned
+
+    @classmethod
+    def _is_user_presentable_failure_text(cls, text: str) -> bool:
+        """剥掉机器标识符后还剩不剩一句人话。
+
+        阈值是字符数这种结构量，不是"这句话像不像内部状态"的语义判断。
+        """
+        scrubbed = cls._scrub_internal_state_text(text)
+        if not scrubbed:
+            return False
+        return len(_RE_CJK_CHAR.findall(scrubbed)) >= _MIN_CJK_FOR_USER_FACING_FAILURE
 
     @classmethod
     def _skip_raw_tool_display_in_fallback(cls, tool_name: str, text: str) -> bool:
@@ -5395,15 +6073,31 @@ class AgentLoop:
             return ""
         return content
 
+    @classmethod
+    def _build_failure_situation_hint(cls, categories: list[str]) -> str:
+        """给兜底 LLM 的"情况"描述：只有失败类别，没有工具名和错误码。"""
+        template = _pl.get_message(
+            "agent_fallback_situation",
+            "这件事没做成，原因类别是：{categories}。不要提任何工具名、错误码或内部组件。",
+        )
+        labels = cls._failure_category_hint(categories) or cls._TOOL_FAILURE_CATEGORY_LABELS["unknown"]
+        if "{categories}" in template:
+            return template.replace("{categories}", labels)
+        return f"{template}（{labels}）"
+
     async def _ai_fallback_reply(self, ctx: AgentContext, error_hint: str) -> str:
         """用一次快速 LLM 调用生成错误场景的自然回复，失败返回空字符串。"""
         try:
-            system = (
-                "你是 YuKiKo。"
-                "现在你在处理用户请求时遇到了问题，需要用简短自然的语气回复用户。"
+            system = _pl.get_message(
+                "agent_fallback_reply_system",
+                "你是 YuKiKo。你刚刚没把用户要的事做成，需要用简短自然的语气跟用户说一句。"
                 "不要用'抱歉'开头，不要太正式，像朋友聊天一样说。一句话就够了。"
                 "必须使用简体中文，不要输出英文段落。"
                 "禁止说自己是 IDE 助手或说无法扮演当前角色。"
+                "只说做不到、以及用户可以怎么换个方式；"
+                "绝对不要出现工具名、函数名、参数名、错误码、retcode、接口名、"
+                "后端组件名、模型名、开发者或维护者的名字，也不要说"
+                "'超时''接口报错''调用失败''代码要改'这类内部状态。",
             )
             memory_lines = [
                 f"- {clip_text(normalize_text(item), 80)}"
@@ -5431,6 +6125,20 @@ class AgentLoop:
                 ),
                 timeout=8,
             )
-            return normalize_text(raw).strip()
-        except Exception:
+            reply = normalize_text(raw).strip()
+            scrubbed = self._scrub_internal_state_text(reply)
+            if scrubbed != reply:
+                _log.warning(
+                    "agent_fallback_reply_scrubbed | trace=%s | raw=%s",
+                    ctx.trace_id,
+                    clip_text(reply, 120),
+                )
+            return scrubbed
+        except Exception as exc:
+            _log.warning(
+                "agent_fallback_reply_failed | trace=%s | %s: %s",
+                ctx.trace_id,
+                type(exc).__name__,
+                exc,
+            )
             return ""

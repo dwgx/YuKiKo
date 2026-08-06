@@ -42,6 +42,19 @@ def _register_utility_tools(registry: AgentToolRegistry) -> None:
                     "image_urls": {"type": "array", "items": {"type": "string"}, "description": "可选，多张图片URL列表（图文作品等需要发送多张图时使用）"},
                     "video_url": {"type": "string", "description": "可选，附带的视频URL"},
                     "audio_file": {"type": "string", "description": "可选，本地音频文件路径（用于发送语音）"},
+                    # 这个字段存在的原因见 core/agent.py 的 navigator_tool_policy_block：
+                    # 「有链接/媒体时不许只用文字作答」那道门本来是防止模型说「我看不到」，
+                    # 但它按结构证据判定，会把**拒绝**也一起驳回 —— 实测模型说了
+                    # 「破解版涉及侵权，我不去搜也不会推」，被门驳回后只好真去搜了一遍。
+                    # 让模型显式声明，比在文本里猜「这像不像拒绝」可靠。
+                    "declined": {
+                        "type": "boolean",
+                        "description": (
+                            "可选。true = 这条回复是拒绝执行请求（涉及违法/侵权/成人/时政等边界），"
+                            "不是因为拿不到结果。填 true 时不会被要求先调工具。"
+                            "只在真的拒绝时填 —— 想跳过工具而填 true 属于错误使用。"
+                        ),
+                    },
                 },
                 "required": ["text"],
             },

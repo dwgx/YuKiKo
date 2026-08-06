@@ -447,20 +447,49 @@ def _is_transient_send_error(exc: Exception) -> bool:
     return any(cue in err_lower for cue in transient_cues) or any(cue in err_text for cue in ("网络连接异常",))
 
 
-def _is_hard_send_channel_error(exc: Exception) -> bool:
-    """识别需要立即熔断发送通道的错误。"""
+def _is_unretryable_send_error(exc: Exception) -> bool:
+    """这一条消息不该重发，但**不代表发送通道坏了**。
+
+    NapCat 的 sendMsg 回调超时/失败属于「结果未知」：消息可能已经发出去了，
+    只是内核没把回调送回来。所以不能重发（会重复刷屏），
+    但也没有任何依据据此停掉整个 bot 的发送。
+
+    实测（storage/logs/yukiko.log，2026-08-05 ~ 08-06）：
+      报文 `EventChecker Failed: NTEvent serviceAndMethod:NodeIKernelMsgService/sendMsg
+      ListenerName:NodeIKernelMsgListener/onMsgInfoListUpdate` 共 31 次，
+      分布在 video(12) / upload_group_file(6) / 纯文本(8) / 无通道记录(8) —— 多种通道都会撞。
+      同期成功发送 215 次，说明通道并没有坏。
+    """
     err_text = _build_send_error_text(exc)
     err_lower = err_text.lower()
     err_compact = re.sub(r"\s+", "", err_lower)
     if not err_text:
         return False
-    if "kickedoffline" in err_lower or "登录已失效" in err_text:
-        return True
     if "timeout:ntevent" in err_compact and "nodeikernelmsgservice/sendmsg" in err_compact:
         return True
     if "nodeikernelmsglistener/onmsginfolistupdate" in err_compact and "sendmsg" in err_compact:
         return True
     return False
+
+
+def _is_hard_send_channel_error(exc: Exception) -> bool:
+    """识别**发送通道真的不可用**、必须停掉全 bot 发送的错误。
+
+    只有「账号掉线 / 登录失效」够得上这个判定 —— 那时候发什么都不会到。
+
+    这里原先还包含 sendMsg 回调失败那两条，那是把两个不同的决定混成了一个：
+      1. 这条消息别重发（对，避免重复刷屏）
+      2. 停掉所有群的发送 120 秒（没有依据）
+    原注释给的理由是「重试会导致重复刷屏」，那只支持第 1 条。
+    实测代价：11 个撞上该报文的回合**零交付**（7 个 delivered=False、
+    4 个连 send_final 都没有），而同期通道成功发送 215 次。
+    判定 1 现在归 `_is_unretryable_send_error()`。
+    """
+    err_text = _build_send_error_text(exc)
+    err_lower = err_text.lower()
+    if not err_text:
+        return False
+    return "kickedoffline" in err_lower or "登录已失效" in err_text
 
 
 def _is_payload_send_error(exc: Exception) -> bool:
@@ -1723,7 +1752,19 @@ def register_handlers(engine: YukikoEngine) -> None:
                 and not record_b64
                 and not audio_file
             )
-            if stale_plain_reply and (same_user_newer_turn or cancel_newer_turn):
+            # 只在**真被打断**时丢（新消息带明确的取消/更正意图）。
+            #
+            # 原来的条件是 `same_user_newer_turn or cancel_newer_turn` ——
+            # 同一个人在 bot 思考期间又说了一句话就丢掉整条回答。实测（2026-08-06
+            # 业主的群，15126 行日志）：**87 条已生成的回复被这样丢掉**，
+            # 占生成量的 26%，而实际发出去的只有 243 条。
+            # 根因是时间尺度不匹配：群里消息间隔 3-4 秒，而回合 p50 27 秒，
+            # 所以「思考期间对方又说了一句」几乎是必然事件，不是打断信号。
+            # 用户看到的现象就是「机器人老是不理人」—— 它明明决定要回、也写完了。
+            #
+            # `same_user_newer_turn` 仍保留给下面那条 send_allow_stale_trace 日志，
+            # 便于回看「发出去的回复里有多少是滞后的」。
+            if stale_plain_reply and cancel_newer_turn:
                 _log.info(
                     "send_drop_stale_plain_reply | trace=%s | latest=%s | conversation=%s | seq=%s | latest_seq=%s | text=%s",
                     payload.trace_id,
@@ -2847,6 +2888,10 @@ _app_helpers.bind_runtime_dependencies(
     _is_hard_send_channel_error=_is_hard_send_channel_error,
     _is_payload_send_error=_is_payload_send_error,
     _is_transient_send_error=_is_transient_send_error,
+    # 新加的发送错误判定也必须在这里注册。app_helpers.py 靠这份注入拿 app.py 的符号
+    # （见 CLAUDE.md 的循环导入规避说明），漏注册的表现是运行时 NameError，
+    # 而且只在真实发送路径上炸 —— 单独测 app.py 里的函数是测不出来的。
+    _is_unretryable_send_error=_is_unretryable_send_error,
     _maybe_block_group_send_on_error=_maybe_block_group_send_on_error,
     _resume_bot_send=_resume_bot_send,
     _suspend_bot_send=_suspend_bot_send,
