@@ -425,3 +425,25 @@
 4. **message_id 哈希非递增**：撤回消息不可恢复。
 5. **图片 URL 2h 过期**需刷新。
 6. **`messagePostFormat` 必须 array**；`enableLocalFile2Url=false` 时本地文件用 `file://` 引用最稳。
+
+---
+
+## §10 OpenCode / Zen 对照（外部架构参考，2026-08-08）
+
+> 用户发来 `opencode.ai/zen/go`（404）。主动解读为参考 OpenCode 架构，与 OpenClaw/Hermes 同级的对标研究。一手来源：opencode.ai 官网 / docs。
+
+**OpenCode 核心**（开源 AI 编程代理，195k stars）：终端/IDE/桌面三种形态；**Plan mode / Build mode 双模式**（Tab 切换，Plan 只建议不执行）；`/init` 生成 `AGENTS.md` 项目指令文件；`@` 模糊搜索文件引用进 prompt；`/undo`/`/redo` 回退；任意 LLM provider。
+
+**OpenCode Zen**（面向 coding agent 的精选模型服务）：团队测试 + 基准评测筛选的模型集合，按请求付费、零保留隐私。本质是**模型路由/质量精选**——省去用户在多 provider 间试错。
+
+**对 YuKiKo 的可借鉴判断**：
+
+| OpenCode 机制 | 是否借鉴 | 理由 |
+|---|---|---|
+| Plan/Build 双模式 | **部分借鉴** | YuKiKo 的 PromptNavigator 分区已承担"先选方向再执行"；可加"复杂任务先输出 plan 再执行"的提示强化 |
+| AGENTS.md 项目指令 | **已等价** | YuKiKo 的 `CLAUDE.md`/`config/prompts.yml` + 系统提示已是指令体系，无需引入 |
+| `@` 文件引用 | **不借鉴** | QQ 群聊场景无"本地项目文件"概念（除非接 group_files 工具取文件后引用） |
+| Zen 模型路由 | **思路借鉴** | YuKiKo 已有多 provider failover（`served_model_state()`）；Zen 的"质量评测 + 路由"思路可用来给 `services/` 的降级链做评测排序 |
+| `/undo`/`/redo` | **不借鉴** | 群聊消息不可撤回（QQ 限制），意义有限 |
+
+**结论**：OpenCode 对 YuKiKo 的增量价值有限——YuKiKo 的分区菜单/多 provider/指令体系已覆盖其核心。唯一可借鉴的是 **Zen 的"模型质量评测"思路**（为 failover 链打分排序），以及 **Plan-first 强化**（复杂任务先规划）。不引入 OpenCode 本体。
