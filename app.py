@@ -657,6 +657,20 @@ def _build_file_uri(path_like: Path | str) -> str:
     return build_napcat_file_reference(path_like)
 
 
+def _silk_duration_seconds_sync(path: Path) -> float:
+    """探测 silk 时长（秒）。ffprobe/ffmpeg 读不出 silk 时长（返回 0），
+    优先用 pilk.get_duration（毫秒），失败才回退 ffprobe。"""
+    try:
+        import pilk
+        return float(pilk.get_duration(str(path))) / 1000.0
+    except Exception:
+        pass
+    try:
+        return _probe_audio_duration_seconds_sync(path)
+    except Exception:
+        return 0.0
+
+
 def _silk_encode_for_record_sync(audio_path: Path, max_seconds: int) -> Path | None:
     """把音频转成 QQ 可播放的 silk，并截断到 max_seconds。
 
@@ -674,7 +688,7 @@ def _silk_encode_for_record_sync(audio_path: Path, max_seconds: int) -> Path | N
             if max_seconds <= 0:
                 return audio_path
             try:
-                dur = _probe_audio_duration_seconds_sync(audio_path)
+                dur = _silk_duration_seconds_sync(audio_path)
                 if dur > 0 and dur <= max_seconds + 0.8:
                     return audio_path
             except Exception:
@@ -693,7 +707,7 @@ def _silk_encode_for_record_sync(audio_path: Path, max_seconds: int) -> Path | N
         # 已有合规的 silk（如 music 层生成过）直接复用，避免重复编码。
         if silk_path.exists() and silk_path.stat().st_size >= 256:
             try:
-                dur = _probe_audio_duration_seconds_sync(silk_path)
+                dur = _silk_duration_seconds_sync(silk_path)
                 if max_seconds <= 0 or (dur > 0 and dur <= max_seconds + 0.8):
                     return silk_path
             except Exception:
