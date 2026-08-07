@@ -155,7 +155,12 @@ def _register_napcat_tools(registry: AgentToolRegistry) -> None:
     registry.register(
         ToolSchema(
             name="delete_message",
-            description="撤回一条消息（需要管理员权限或是自己发的消息）。\n使用场景: 用户说'撤回那条消息'、'删掉刚才的消息'时使用",
+            description=(
+                "撤回一条消息。\n"
+                "管理员(群主/群管理)可撤回群内任意消息；普通用户仅能撤回机器人自己发送的消息"
+                "（如机器人上一句说错的话）。\n"
+                "使用场景: 用户说'撤回那条消息'、'删掉刚才的消息'时使用"
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -1240,6 +1245,32 @@ async def _handle_delete_message(args: dict[str, Any], context: dict[str, Any]) 
     message_id = int(args.get("message_id", 0))
     if not message_id:
         return ToolCallResult(ok=False, error="missing message_id")
+    permission_level = normalize_text(str(context.get("permission_level", "user")))
+    is_admin = permission_level in {"super_admin", "group_admin"}
+    if not is_admin:
+        # 普通用户自助撤回：仅允许撤回机器人自己发送的消息。
+        api_call = context.get("api_call")
+        if not callable(api_call):
+            return ToolCallResult(ok=False, error="no_api_call_available")
+        try:
+            raw = await call_napcat_api(api_call, "get_msg", message_id=message_id)
+        except Exception as exc:
+            _log.warning("delete_message_owner_check_failed | message_id=%s | %s", message_id, exc)
+            return ToolCallResult(
+                ok=False,
+                error=f"delete_message:{exc}",
+                display=f"无法读取消息 {message_id} 校验归属，不能撤回。",
+            )
+        item = _unwrap_onebot_message_result(raw)
+        sender = item.get("sender", {}) if isinstance(item.get("sender"), dict) else {}
+        sender_id = normalize_text(str(sender.get("user_id", "")))
+        bot_id = normalize_text(str(context.get("bot_id", "")))
+        if not sender_id or not bot_id or sender_id != bot_id:
+            return ToolCallResult(
+                ok=False,
+                error="permission_denied:not_bot_own_message",
+                display="你只能撤回我自己发送的消息，无法撤回他人的消息。",
+            )
     await _record_recalled_message_from_message_id(
         message_id,
         context,
@@ -2191,7 +2222,7 @@ def _register_napcat_extended_tools(registry: AgentToolRegistry) -> None:
         ["user_id"], _handle_nc_get_user_status),
 
         ("translate_en2zh", "将英文文本翻译为中文(QQ内置翻译)。\n使用场景: 用户发了英文让你翻译时可以用",
-        {"words": ("array", "要翻译的英文文本数组，如 [\"hello\",\"world\"]")},
+        {"words": ("string", "要翻译的英文文本，单词/短语/整句均可，如 'good morning'")},
         ["words"], _handle_translate_en2zh),
 
         # ── 合并转发 ──
@@ -4043,11 +4074,21 @@ async def _handle_nc_get_user_status(args: dict[str, Any], context: dict[str, An
 
 
 async def _handle_translate_en2zh(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    words = args.get("words", [])
-    if not words:
-        return ToolCallResult(ok=False, error="missing words")
+    words = args.get("words", "")
+    # registry 的 string 类型强转会把 None/空容器转成 "None"/"[]" 等字面量串，
+    # 这些不是待翻译文本，直接视为缺参，避免把 junk 串当真去调翻译 API。
+    _JUNK_WORDS = {"none", "null", "[]", "{}", "()"}
     if isinstance(words, str):
-        words = [words]
+        text = normalize_text(words)
+        if not text or text.lower() in _JUNK_WORDS:
+            return ToolCallResult(ok=False, error="missing words")
+        words = [text]
+    elif isinstance(words, list):
+        words = [normalize_text(str(w)) for w in words if normalize_text(str(w))]
+        if not words:
+            return ToolCallResult(ok=False, error="missing words")
+    else:
+        return ToolCallResult(ok=False, error="missing words")
     result = await _napcat_api_call(context, "translate_en2zh", "翻译成功", words=words)
     if result.ok and result.data:
         result.display = f"翻译结果: {json.dumps(result.data, ensure_ascii=False)[:300]}"

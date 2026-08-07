@@ -534,15 +534,17 @@ async def _handle_parse_video(args: dict[str, Any], context: dict[str, Any]) -> 
     if not tool_executor:
         return ToolCallResult(ok=False, error="video_parser_unavailable", display="视频解析模块未初始化")
 
-    # URL 类型硬校验：避免把 pixiv/artwork 等非视频链接误送入 parse_video。
+    # URL 类型硬校验：避免把 pixiv/artwork、抖音用户主页等非视频链接误送入 parse_video。
+    # 用 _is_platform_video_detail_url（路径级判定）而不是 _is_supported_platform_video_url
+    # （仅域名判定），否则抖音用户主页 /user/xxx 这类非视频链接会误入解析流程烧掉近 10 秒。
     is_supported_video = False
     try:
+        detail_checker = getattr(tool_executor, "_is_platform_video_detail_url", None)
+        direct_checker = getattr(tool_executor, "_is_direct_video_url", None)
         is_supported_video = bool(
-            callable(getattr(tool_executor, "_is_supported_platform_video_url", None))
-            and tool_executor._is_supported_platform_video_url(url)
+            callable(detail_checker) and detail_checker(url)
         ) or bool(
-            callable(getattr(tool_executor, "_is_direct_video_url", None))
-            and tool_executor._is_direct_video_url(url)
+            callable(direct_checker) and direct_checker(url)
         )
     except Exception:
         is_supported_video = False

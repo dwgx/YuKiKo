@@ -2697,7 +2697,7 @@ class ToolVideoMixin:
             return False
         if host.endswith("v.douyin.com"):
             return True
-        blocked_cues = ("/search", "/hot", "/discover", "/challenge", "/topic")
+        blocked_cues = ("/search", "/hot", "/discover", "/challenge", "/topic", "/user")
         if any(cue in path for cue in blocked_cues):
             return False
         if "/video/" in path or "/note/" in path or "share/video" in path:
@@ -2955,10 +2955,14 @@ class ToolVideoMixin:
             return False
 
         if "douyin.com" in host or "iesdouyin.com" in host:
-            blocked_cues = ("/search", "/hot", "/discover", "/challenge", "/topic")
+            if host.endswith("v.douyin.com"):
+                return True
+            blocked_cues = ("/search", "/hot", "/discover", "/challenge", "/topic", "/user")
             if any(cue in path for cue in blocked_cues):
                 return False
             if "/video/" in path or "/note/" in path or "share/video" in path:
+                return True
+            if any(key in query for key in ("modal_id=", "aweme_id=", "item_id=")):
                 return True
             short_path = path.strip("/")
             if short_path and len(short_path) >= 6:

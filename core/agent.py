@@ -1269,6 +1269,10 @@ class AgentLoop:
         tool_name: str,
         tool_args: dict[str, Any],
     ) -> bool:
+        if tool_name == "delete_message":
+            # 自助撤回例外：普通用户可撤回机器人自己发送的消息。
+            # 归属校验在 handler（_handle_delete_message）内完成，这里只放行到 handler。
+            return True
         if tool_name != "set_group_ban":
             return False
         target_uid = normalize_text(str((tool_args or {}).get("user_id", "")))

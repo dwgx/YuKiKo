@@ -289,6 +289,9 @@ class AgentToolRegistry:
             return False
         if name == "set_group_ban":
             return True
+        if name == "delete_message":
+            # 自助撤回例外：普通用户可见，但 handler 内校验只能撤回机器人自己的消息。
+            return True
         if name in self._GROUP_ADMIN_TOOLS and not is_group_admin:
             return False
         return True
@@ -523,7 +526,16 @@ class AgentToolRegistry:
                 expected_type = normalize_text(str(props[key].get("type", ""))).lower()
 
             if key in self._STRICT_QQ_FIELDS:
-                qq_id = self._normalize_qq_id(sanitized[key])
+                raw_qq = sanitized[key]
+                if (
+                    isinstance(raw_qq, str)
+                    and not normalize_text(raw_qq)
+                    and key not in required
+                ):
+                    # 空串且非必填：视为"未传"，交给 handler 兜底
+                    # （如 get_qq_avatar 回退到当前用户），而不是报 invalid_qq。
+                    continue
+                qq_id = self._normalize_qq_id(raw_qq)
                 if qq_id is None:
                     return {}, f"invalid_{key}"
                 sanitized[key] = str(qq_id) if expected_type == "string" else qq_id
@@ -578,7 +590,11 @@ class AgentToolRegistry:
             )
             return ToolCallResult(ok=False, error="permission_denied:need_super_admin")
 
-        if name in self._GROUP_ADMIN_TOOLS and not is_group_admin and name != "set_group_ban":
+        if (
+            name in self._GROUP_ADMIN_TOOLS
+            and not is_group_admin
+            and name not in {"set_group_ban", "delete_message"}
+        ):
             _log.warning(
                 "tool_permission_denied | tool=%s | actor=%s | level=%s | need=group_admin",
                 name,

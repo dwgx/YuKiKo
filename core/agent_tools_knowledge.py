@@ -134,15 +134,20 @@ def _register_crawler_tools(registry: AgentToolRegistry) -> None:
             name="search_zhihu",
             description=(
                 "搜索知乎内容或获取知乎热榜。\n"
-                "mode=hot 获取热榜，mode=search 搜索内容，mode=answers 获取问题高赞回答。\n"
+                "mode=hot 获取热榜（无需其它参数）；mode=search 搜索内容（必须提供 query）；"
+                "mode=answers 获取问题高赞回答（必须提供 question_id）。\n"
                 "使用场景: 用户问知乎相关问题、想了解某个话题的讨论时使用。"
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "description": "模式: hot(热榜)/search(搜索)/answers(回答)"},
-                    "query": {"type": "string", "description": "搜索关键词(search/answers模式必填)"},
-                    "question_id": {"type": "string", "description": "知乎问题ID(answers模式)"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["hot", "search", "answers"],
+                        "description": "模式: hot(热榜)/search(搜索，需 query)/answers(回答，需 question_id)",
+                    },
+                    "query": {"type": "string", "description": "搜索关键词(search模式必填)"},
+                    "question_id": {"type": "string", "description": "知乎问题ID(answers模式必填)"},
                 },
                 "required": ["mode"],
             },
@@ -529,6 +534,30 @@ async def _handle_search_zhihu(args: dict[str, Any], context: dict[str, Any]) ->
     mode = str(args.get("mode", "hot")).strip().lower()
     query = str(args.get("query", "")).strip()
     question_id = str(args.get("question_id", "")).strip()
+    # registry 的 string 强转会把 null 变成 "None"，视为缺参而不是真的去搜 "None"。
+    if query.lower() in {"none", "null"}:
+        query = ""
+    if question_id.lower() in {"none", "null"}:
+        question_id = ""
+
+    if mode not in {"hot", "search", "answers"}:
+        return ToolCallResult(
+            ok=False,
+            error="invalid_mode",
+            display="search_zhihu 的 mode 只支持 hot/search/answers，请重试。",
+        )
+    if mode == "search" and not query:
+        return ToolCallResult(
+            ok=False,
+            error="missing_query",
+            display="search_zhihu 的 search 模式需要 query 参数。",
+        )
+    if mode == "answers" and not question_id:
+        return ToolCallResult(
+            ok=False,
+            error="missing_question_id",
+            display="search_zhihu 的 answers 模式需要 question_id 参数。",
+        )
 
     try:
         if mode == "hot":
