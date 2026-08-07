@@ -68,10 +68,10 @@ config:
     multi_image_max_count: 4
     multi_image_interval_ms: 350
     voice_send_max_seconds: 60
-    voice_send_try_full_first: true
+    voice_send_try_full_first: false
     voice_send_split_enable: true
     voice_send_split_max_segments: 8
-    voice_send_music_force_full: true
+    voice_send_music_force_full: false
     voice_send_music_disable_split: false
     video_send_strategy: direct_first
     napcat_media_stage_dir: ''
