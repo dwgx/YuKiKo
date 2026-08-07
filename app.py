@@ -727,6 +727,80 @@ async def _split_voice_audio_file(audio_path: Path, segment_seconds: int, max_se
     return await asyncio.to_thread(_split_voice_audio_file_sync, audio_path, segment_seconds, max_segments)
 
 
+# ── 队列取消通知：按会话去重，不按 pending 一刀切 ──
+# 原实现在 pending_count > 0 时直接静默。那个抑制条件恰好等于超时的高发条件：
+# 群越活跃 pending 越大，被 @ 的人越容易被静默，而群活跃正是超时最容易发生的时候。
+# 实测 trace=118886-25：用户明确 @ 了机器人并发了语音，trigger 判 directed=True、
+# queue_cancel_policy high_priority=True reply_to_bot=True，结果 pending=5 命中静默，
+# 从入队到取消 120 秒全程零输出 —— 用户视角是「机器人死了」，日志里却是「故意不说」。
+# 现在的判据只有结构事实：取消原因 / 这一回合是否被直接指向 / 同会话上一条通知过去了多久。
+_QUEUE_CANCEL_NOTICE_LAST_AT: dict[str, float] = {}
+_QUEUE_CANCEL_NOTICE_DEDUP_DEFAULT_SECONDS = 45.0
+_QUEUE_CANCEL_NOTICE_STATE_MAX_ENTRIES = 2000
+_QUEUE_CANCEL_NOTICE_REASONS = frozenset(
+    {
+        "process_timeout",
+        "process_error",
+        # TTL 过期的取消同样是「用户提了要求但什么都没收到」，真实群里出现过 13 次。
+        "message_ttl_expired",
+    }
+)
+_QUEUE_CANCEL_NOTICE_TEXTS = {
+    "process_timeout": "这条任务处理超时了，我先停下。你可以重试，或把问题拆成更短一步。",
+    "process_error": "这条任务执行失败了，我先停下。你可以重试一次。",
+    "message_ttl_expired": "这条消息排队太久已经过期，我没来得及处理。你可以再发一次。",
+}
+_QUEUE_CANCEL_NOTICE_FALLBACK_TEXT = "这条任务没能完成，我先停下。你可以重试一次。"
+
+
+def _queue_cancel_notice_text(reason: str) -> str:
+    return _QUEUE_CANCEL_NOTICE_TEXTS.get(str(reason), _QUEUE_CANCEL_NOTICE_FALLBACK_TEXT)
+
+
+def _should_send_queue_cancel_notice(
+    *,
+    conversation_id: str,
+    reason: str,
+    directed: bool,
+    dedup_window_seconds: Any = None,
+    now: float | None = None,
+) -> tuple[bool, str]:
+    """队列取消要不要给用户回一句。返回 (是否发送, 判定依据)。
+
+    `directed` 是结构事实（被 @ / 私聊 / 回复机器人），不是词义判断。
+    刻意不看 pending_count：队列里别的任务有多少，与当前这个用户是否需要反馈无关。
+    """
+
+    if str(reason) not in _QUEUE_CANCEL_NOTICE_REASONS:
+        return False, "reason_not_notifiable"
+
+    stamp = time.monotonic() if now is None else float(now)
+    key = str(conversation_id or "-")
+
+    if directed:
+        # 被直接指向的回合：pending 再多也要出声 —— pending 大恰恰是最需要反馈的时候。
+        _QUEUE_CANCEL_NOTICE_LAST_AT[key] = stamp
+        return True, "directed_turn"
+
+    try:
+        window = float(dedup_window_seconds)
+    except (TypeError, ValueError):
+        window = _QUEUE_CANCEL_NOTICE_DEDUP_DEFAULT_SECONDS
+    if window < 0:
+        window = _QUEUE_CANCEL_NOTICE_DEDUP_DEFAULT_SECONDS
+
+    last_at = _QUEUE_CANCEL_NOTICE_LAST_AT.get(key)
+    if window > 0 and isinstance(last_at, (int, float)) and stamp - float(last_at) < window:
+        return False, "dedup_window"
+
+    _QUEUE_CANCEL_NOTICE_LAST_AT[key] = stamp
+    if len(_QUEUE_CANCEL_NOTICE_LAST_AT) > _QUEUE_CANCEL_NOTICE_STATE_MAX_ENTRIES:
+        stale = sorted(_QUEUE_CANCEL_NOTICE_LAST_AT, key=_QUEUE_CANCEL_NOTICE_LAST_AT.get)
+        for old_key in stale[: len(_QUEUE_CANCEL_NOTICE_LAST_AT) // 2]:
+            _QUEUE_CANCEL_NOTICE_LAST_AT.pop(old_key, None)
+    return True, "dedup_window_elapsed"
+
+
 def create_engine() -> YukikoEngine:
     root = Path(__file__).resolve().parent
     return YukikoEngine.from_default_paths(project_root=root)
@@ -735,6 +809,7 @@ def create_engine() -> YukikoEngine:
 def register_handlers(engine: YukikoEngine) -> None:
     dispatcher = GroupQueueDispatcher(engine.config.get("queue", {}))
     _latest_queue_task_ctx: dict[str, dict[str, Any]] = {}
+    _platform_manager: Any = None
     _RUNTIME_WEBUI_BRIDGE["queue"] = dispatcher
     _RUNTIME_WEBUI_BRIDGE["latest_ctx"] = _latest_queue_task_ctx
     # 暴露给 WebUI: 运行中会话状态 + 主动中断能力
@@ -1342,6 +1417,7 @@ def register_handlers(engine: YukikoEngine) -> None:
     # 启动时验证各平台 cookie 有效性
     @nonebot.get_driver().on_startup
     async def _check_cookies_on_startup():
+        nonlocal _platform_manager
         try:
             await engine.async_init()
         except Exception as e:
@@ -1356,9 +1432,34 @@ def register_handlers(engine: YukikoEngine) -> None:
             _log.debug("cookie_check_skip | %s", e)
         # 登录离线消息回填：只读导入 memory，不做任何自动回复。
         asyncio.create_task(_run_login_backlog_import(reason="startup"))
+        # Phase 2 平台路径：配置 `platform.onebot11.access_token` 时双轨启用
+        # （OneBot11Adapter → engine 消息管线 → adapter 发送）。与 NoneBot 并存，
+        # 完整切换（关闭 NoneBot）待真机 smoke 后由 owner 决定。
+        try:
+            platform_cfg = engine.config.get("platform", {}) if isinstance(engine.config, dict) else {}
+            onebot_cfg = platform_cfg.get("onebot11", {}) if isinstance(platform_cfg, dict) else {}
+            if isinstance(onebot_cfg, dict) and onebot_cfg.get("access_token"):
+                from core.platform.bridge import register_onebot11_platform
+
+                enabled_cfg = dict(onebot_cfg)
+                enabled_cfg["enabled"] = True
+                _platform_manager = await register_onebot11_platform(
+                    engine,
+                    dispatcher,
+                    config=enabled_cfg,
+                    trace_builder=_build_trace_id,
+                )
+        except Exception as e:
+            _log.warning("platform_onebot11_startup_failed | %s", e)
 
     @nonebot.get_driver().on_shutdown
     async def _flush_memory_on_shutdown():
+        if _platform_manager is not None:
+            try:
+                await _platform_manager.stop()
+                _log.info("platform_stopped_on_shutdown | ok")
+            except Exception as e:
+                _log.warning("platform_stop_failed | %s", e)
         try:
             memory = getattr(engine, "memory", None)
             if memory is not None and hasattr(memory, "close") and callable(getattr(memory, "close")):
@@ -2536,17 +2637,43 @@ def register_handlers(engine: YukikoEngine) -> None:
                     and latest_ctx.get("completed_at")
                 ):
                     _latest_queue_task_ctx.pop(conversation_id, None)
-            if status == "cancelled" and reason in {"process_timeout", "process_error"}:
-                # 队列里还有后续任务时，避免对每条超时都刷屏报错。
-                if pending_count > 0:
+            if status == "cancelled" and reason in _QUEUE_CANCEL_NOTICE_REASONS:
+                # 防刷屏按会话去重，不再按 pending_count 一刀切（见 _should_send_queue_cancel_notice）。
+                # high_priority / reply_to_bot 在本函数体后面才赋值，但这个回调只会在
+                # dispatcher.submit(...) 之后触发，闭包取值发生在调用时，所以已绑定。
+                notice_directed = bool(high_priority or reply_to_bot)
+                notice_conversation = str(getattr(dispatch, "conversation_id", conversation_id))
+                allow_notice, notice_gate = _should_send_queue_cancel_notice(
+                    conversation_id=notice_conversation,
+                    reason=reason,
+                    directed=notice_directed,
+                    dedup_window_seconds=queue_cfg.get(
+                        "cancel_notice_dedup_seconds",
+                        _QUEUE_CANCEL_NOTICE_DEDUP_DEFAULT_SECONDS,
+                    ),
+                )
+                if not allow_notice:
                     engine.logger.info(
-                        "queue_error_notice_skip | trace=%s | conversation=%s | reason=%s | pending=%d",
+                        "queue_error_notice_skip | trace=%s | conversation=%s | reason=%s "
+                        "| gate=%s | directed=%s | pending=%d",
                         dispatch_trace,
-                        str(getattr(dispatch, "conversation_id", conversation_id)),
+                        notice_conversation,
                         reason,
+                        notice_gate,
+                        notice_directed,
                         pending_count,
                     )
                     return
+                engine.logger.info(
+                    "queue_error_notice_send | trace=%s | conversation=%s | reason=%s "
+                    "| gate=%s | directed=%s | pending=%d",
+                    dispatch_trace,
+                    notice_conversation,
+                    reason,
+                    notice_gate,
+                    notice_directed,
+                    pending_count,
+                )
                 msg = Message()
                 runtime_send_opts = _resolve_runtime_send_options()
                 msg += _build_reply_prefix(
@@ -2556,10 +2683,7 @@ def register_handlers(engine: YukikoEngine) -> None:
                     enable_quote=bool(runtime_send_opts["reply_with_quote"]),
                     enable_at=bool(runtime_send_opts["reply_with_at"]),
                 )
-                if reason == "process_timeout":
-                    msg += Message("这条任务处理超时了，我先停下。你可以重试，或把问题拆成更短一步。")
-                else:
-                    msg += Message("这条任务执行失败了，我先停下。你可以重试一次。")
+                msg += Message(_queue_cancel_notice_text(reason))
                 await _safe_send(bot=bot, event=event, message=msg)
 
         high_priority = bool(payload.mentioned or payload.is_private or text.startswith("/"))

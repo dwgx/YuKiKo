@@ -36,8 +36,17 @@ LOG_FILE = ROOT / "storage" / "logs" / "yukiko.log"
 # （把 999000001 加进白名单也没用，卡在发送而不是白名单。）
 #
 # 因此实测只能打真实群，而这会在群里留下可见消息。默认**不允许**，
-# 必须显式 --real-group 才跑，避免误刷屏。
-DEFAULT_PEER = "974118886"
+# 必须显式 --real-group <群号> 才跑，避免误刷屏。
+#
+# 2026-08-06 事故：这里曾把真实群 974118886 硬编码成 --real-group 的默认值，
+# 配合下面的 context_user_name="测试用户"，模型照着这个假身份称呼，
+# 「测试用户，这个不能帮你找哦」被投递进群并被群主引用回复，同一窗口
+# 20 条注入期间群友开始追问「这是ai吗」。所以：**不留默认群号**，
+# 群号必须每次手打，而且真发之前要把群号原样输回来确认。
+#
+# 另外 core/webui.py 现在会挡住「请求自带身份 + 目标不是配置声明的冒烟目标」的注入，
+# 所以这个脚本默认会被 403 拒绝 —— 想跑实测得先把群号写进 webui.smoke_test_peer。
+DEFAULT_PEER = ""
 TEST_USER = "3001001001"
 
 
@@ -215,12 +224,34 @@ def run_case(case: Case, token: str, port: str, peer: str) -> Result:
     return Result(case, ok, seconds, reply, tools, problems, trace)
 
 
+def confirm_real_target(peer: str, case_count: int, *, assume_yes: bool = False) -> bool:
+    """真发之前把目标群号亮出来，并要求把群号原样输回来。
+
+    y/n 会被肌肉记忆按掉，抄一遍群号不会。非交互环境（无 stdin）直接判为未确认。
+    """
+    print("=" * 60)
+    print(f"即将往**真实群 {peer}** 注入 {case_count} 条测试消息。")
+    print(f"回复会经 NapCat 真的发进 {peer}，群成员看得见。")
+    print("=" * 60)
+    if assume_yes:
+        print(f"--yes-i-know 已给，跳过确认，目标 {peer}")
+        return True
+    try:
+        answer = input(f"确认请把群号原样输入（{peer}），其它任意键取消: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer == peer
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", help="只跑某一组（chat/search/video/music/trends/safety/github）")
     ap.add_argument("--list", action="store_true", help="列出用例")
-    ap.add_argument("--real-group", metavar="GROUP_ID", nargs="?", const=DEFAULT_PEER,
-                    help="在真实群里跑（会留下可见消息）。不给这个参数就只做干跑")
+    # 故意不给 const/default：--real-group 必须带群号，省得手一滑打进上次那个群。
+    ap.add_argument("--real-group", metavar="GROUP_ID", default="",
+                    help="在真实群里跑（会留下可见消息），必须显式给群号。不给就只做干跑")
+    ap.add_argument("--yes-i-know", action="store_true",
+                    help="跳过二次确认（仅用于非交互环境，慎用）")
     ap.add_argument("--dry-run", action="store_true", help="只打印将要发送的内容，不真发")
     args = ap.parse_args()
 
@@ -235,17 +266,26 @@ def main() -> int:
         return 1
 
     if args.dry_run or not args.real_group:
-        print("干跑（不真发）。要实测请加 --real-group\n")
+        print("干跑（不真发）。要实测请加 --real-group <群号>\n")
         for c in cases:
             print(f"  [{c.group:7s}] {c.name:12s} -> {c.text}")
         print(f"\n共 {len(cases)} 条。实测命令:")
-        print(f"  .venv/bin/python scripts/tool_smoke_live.py --only {args.only or '<组名>'} --real-group")
+        print(
+            f"  .venv/bin/python scripts/tool_smoke_live.py --only {args.only or '<组名>'} --real-group <群号>"
+        )
         return 0
 
-    peer = args.real_group
+    peer = str(args.real_group).strip()
+    if not peer.isdigit():
+        print(f"--real-group 需要一个纯数字群号，收到 {peer!r}")
+        return 1
+
+    if not confirm_real_target(peer, len(cases), assume_yes=bool(args.yes_i_know)):
+        print("已取消，什么都没发。")
+        return 1
+
     token, port = read_token(), read_port()
     print(f"目标: 127.0.0.1:{port}   会话: group:{peer}")
-    print("注意: 回复会真的发进这个群\n")
     print(f"用例: {len(cases)}\n")
 
     results: list[Result] = []

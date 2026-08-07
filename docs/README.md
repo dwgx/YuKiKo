@@ -2,12 +2,15 @@
 
 ## 简体中文
 
+当前接手入口：[`../TAKEOVER-2026-08-07.md`](../TAKEOVER-2026-08-07.md)。旧 handoff 与长日志已移入 [`archive/`](archive/)，只作历史说明。
+
 | 文档 | 说明 |
 |------|------|
 | [部署与使用指南](zh-CN/GUIDE.md) | 完整部署、配置、运行、故障排查 |
 | [架构说明](zh-CN/ARCHITECTURE.md) | 消息链路、Router、Agent、Self-check 设计原理 |
 | [深度总结](zh-CN/PROJECT_DEEP_SUMMARY.md) | 项目架构深度分析（700+ 行） |
 | [发布运维手册](zh-CN/RELEASE_PLAYBOOK.md) | 发布/升级/回滚 SOP（1000+ 行） |
+| [接手改造背景](zh-CN/TAKEOVER_IMPROVEMENT_PLAN.md) | 历史设计与改造背景；当前状态以仓库根目录接手页为准 |
 
 ## English
 

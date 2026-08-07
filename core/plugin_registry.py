@@ -4,14 +4,50 @@
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import inspect
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 from utils.text import normalize_text
 from core.engine_types import PluginSetupContext  # noqa: F401
+
+# AstrBot Star 式声明式注册（对齐 @register_command / @register_regex）。
+# 按 fn.__module__ 隔离，加载时收集到 plugin 实例上。
+_COMMAND_HANDLERS: dict[str, dict[str, Any]] = {}
+_REGEX_HANDLERS: dict[str, list[tuple[re.Pattern[str], Any]]] = {}
+
+
+def register_command(command: str) -> Any:
+    """声明式命令 handler：`@register_command("ping")` 注册后，文本恰好等于命令时调用。
+
+    handler 签名 `(text: str, context: dict) -> str`。
+    """
+
+    def decorator(fn: Any) -> Any:
+        module = str(getattr(fn, "__module__", ""))
+        _COMMAND_HANDLERS.setdefault(module, {})[command] = fn
+        return fn
+
+    return decorator
+
+
+def register_regex(pattern: str) -> Any:
+    """声明式正则 handler：`@register_regex(r"^hi$")` 注册后，文本匹配正则时调用。
+
+    handler 签名 `(text: str, context: dict) -> str`。
+    """
+    compiled = re.compile(pattern)
+
+    def decorator(fn: Any) -> Any:
+        module = str(getattr(fn, "__module__", ""))
+        _REGEX_HANDLERS.setdefault(module, []).append((compiled, fn))
+        return fn
+
+    return decorator
 
 
 class PluginRegistry:
@@ -57,6 +93,9 @@ class PluginRegistry:
 
                 module = importlib.util.module_from_spec(spec)
                 sys.modules[module_name] = module
+                # 先清空该 module 的 Star 注册，防同进程重复加载累积重复 handler。
+                _COMMAND_HANDLERS.pop(module_name, None)
+                _REGEX_HANDLERS.pop(module_name, None)
                 spec.loader.exec_module(module)
                 plugin_cls = getattr(module, "Plugin", None)
                 if plugin_cls is None:
@@ -87,6 +126,9 @@ class PluginRegistry:
 
                             self.logger.warning("插件 %s 配置向导失败: %s", file.stem, exc)
                 plugin = plugin_cls()
+                # 收集模块级 Star 式注册（@register_command / @register_regex）
+                plugin._command_handlers = dict(_COMMAND_HANDLERS.get(module_name, {}))
+                plugin._regex_handlers = list(_REGEX_HANDLERS.get(module_name, []))
                 name = (
                     normalize_text(str(getattr(plugin, "name", file.stem))) or file.stem
                 )
@@ -310,6 +352,41 @@ class PluginRegistry:
             "yes" if meta.get("using_defaults") else "no",
             key_preview,
         )
+
+    async def dispatch(
+        self, name: str, text: str, context: dict[str, Any]
+    ) -> tuple[bool, str | None]:
+        """Star 式分派：先匹配 @register_command / @register_regex handler，命中返回 (True, result)。
+
+        handler 签名 `(text, context) -> str`，可以是 async 或同步。未命中返回 (False, None)。
+        """
+        plugin = self.plugins.get(name)
+        if plugin is None:
+            return False, None
+        cmd_handlers = getattr(plugin, "_command_handlers", {})
+        regex_handlers = getattr(plugin, "_regex_handlers", [])
+        text_stripped = normalize_text(text)
+        handler = cmd_handlers.get(text_stripped)
+        if handler is None:
+            for pattern, fn in regex_handlers:
+                if pattern.search(text):
+                    handler = fn
+                    break
+        if handler is None:
+            return False, None
+        try:
+            if asyncio.iscoroutinefunction(handler):
+                result = await handler(text, context)
+            else:
+                result = handler(text, context)
+        except Exception:
+            self.logger.warning(
+                "plugin_handler_error | plugin=%s | exc=%s",
+                name,
+                exc_info=True,
+            )
+            return True, None
+        return True, str(result) if result is not None else None
 
     async def call(self, name: str, message: str, context: dict[str, Any]) -> str:
         plugin = self.plugins.get(name)

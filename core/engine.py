@@ -25,6 +25,7 @@ from core.agent_tools import (
     register_sticker_tools,
 )
 
+from core.agent_checkpoint import AgentStepJournal
 from core.audit import AuditTrail
 from core.affinity import AffinityEngine
 from core.context_compat import (
@@ -40,12 +41,20 @@ from core.image import ImageEngine
 from core.knowledge import KnowledgeBase
 from core.knowledge_updater import KnowledgeUpdater
 from core.markdown import MarkdownRenderer
-from core.memory import MemoryEngine
+from core.mcp_client import MCPConnectorManager, MCPTrustStore
+from core.memory import MemoryEngine, budget_text_parts
+from core.memory_promotion import (
+    apply_operations,
+    consolidate_memory,
+    rank_promotion_candidates,
+)
 from core.paths import PathResolver
 from core.personality import PersonalityEngine
 from core.router import RouterDecision, RouterEngine, RouterInput
 from core.safety import SafetyEngine
 from core.search import SearchEngine
+from core.recall_intent import looks_like_recall_intent
+from core.skill_loader import SkillRegistry, register_skill_tools
 from core.sticker import StickerManager
 from core.thinking import ThinkingEngine
 from core.tools import ToolExecutor
@@ -176,11 +185,17 @@ class YukikoEngine:
         except Exception:
 
             self.logger.warning("enhanced_tools_register_failed", exc_info=True)
+        self.skill_registry = SkillRegistry(self.project_root / "skills")
+        register_skill_tools(self.agent_tool_registry, self.skill_registry)
+        agent_checkpoint_dir = self.storage_dir / "agent" / "checkpoints"
         self.agent = AgentLoop(
             model_client=self.model_client,
             tool_registry=self.agent_tool_registry,
             config=self.config,
             persona_text=self.personality.persona_text if hasattr(self, "personality") else "",
+            skill_registry=self.skill_registry,
+            step_journal=AgentStepJournal(self.storage_dir / "agent" / "steps.jsonl"),
+            checkpoint_dir=agent_checkpoint_dir,
         )
 
         # ── 爬虫 + 知识库 ──
@@ -217,6 +232,7 @@ class YukikoEngine:
                 len(self.sticker.get_unregistered()),
             )
         self._last_reply_state: dict[str, dict[str, Any]] = {}
+        self._promotion_counters: dict[str, int] = {}
         self._pending_fragments: dict[str, dict[str, Any]] = {}
         self._recent_directed_hints: dict[str, datetime] = {}
         self._recent_search_cache: dict[str, dict[str, Any]] = {}
@@ -260,6 +276,17 @@ class YukikoEngine:
         self._memory_media_capture_timeout_seconds = max(
             1.0, min(15.0, capture_timeout)
         )
+        # 记忆注入的 token 预算护栏（Phase 0.5b）：profile + 知识库 + 知识图谱三段
+        # 拼接上限，防止上下文失控。中文约 1 字 ≈ 1 token，800 字符约 400-800 token。
+        try:
+            profile_summary_max_chars = int(
+                memory_cfg.get("profile_summary_max_chars", 800)
+            )
+        except (TypeError, ValueError):
+            profile_summary_max_chars = 800
+        self._profile_summary_max_chars = max(
+            200, min(3000, profile_summary_max_chars)
+        )
         self._async_init_done = False
         self._async_init_lock = asyncio.Lock()
         self._reload_lock = asyncio.Lock()
@@ -282,6 +309,8 @@ class YukikoEngine:
             )
             await self.plugins.setup_all(setup_ctx)
             self.plugins.filter_internal()
+            # MCP 连接器（配置 `mcp.enabled` 启用）：把 trusted server 工具桥进 registry。
+            await self._init_mcp_connectors()
             # 表情包自动注册 (后台任务，不阻塞启动)
             sticker_cfg = self.config.get("sticker", {})
             if (
@@ -306,6 +335,68 @@ class YukikoEngine:
                     )
                 else:
                     self.logger.info("trend_fetch_disabled | 热搜抓取已禁用")
+
+    async def _init_mcp_connectors(self) -> None:
+        """配置启用时，把 trusted MCP server 的工具桥进 AgentToolRegistry。
+
+        配置：`mcp.enabled: true` + `mcp.servers: {name: {command/args/env}}`。
+        信任门持久化在 `storage/agent/mcp_trust.json`。连接失败只记日志，不阻塞启动。
+        """
+        mcp_cfg = self.config.get("mcp", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(mcp_cfg, dict) or not mcp_cfg.get("enabled"):
+            return
+        servers = mcp_cfg.get("servers")
+        if not isinstance(servers, dict) or not servers:
+            return
+        trust = MCPTrustStore(self.storage_dir / "agent" / "mcp_trust.json")
+        manager = MCPConnectorManager(
+            {"mcpServers": servers}, trust, self.agent_tool_registry
+        )
+        try:
+            registered = await manager.sync()
+            self._mcp_manager = manager
+            self.logger.info("mcp_connectors_synced | tools=%s", registered)
+        except Exception:
+            self.logger.warning("mcp_connectors_sync_failed", exc_info=True)
+            self._mcp_manager = None
+
+    async def _run_memory_promotion(self, user_id: str, conversation_id: str = "") -> dict[str, Any]:
+        """后台晋升：collect 候选 → rank（untrusted 排除）→ consolidate（模型）→ 写入 explicit_facts。
+
+        失败安全：模型 consolidate 失败不写（append_only），不影响主流程。低频调用
+        （配置 `memory.promotion_enable` 启用，每日快照后触发一次）。
+        """
+        try:
+            candidates_raw = self.memory.collect_promotion_candidates(user_id=user_id, limit=20)
+        except Exception:
+            self.logger.warning("memory_promotion_collect_failed | user=%s", user_id, exc_info=True)
+            return {"ok": False, "reason": "collect_failed"}
+        if not candidates_raw:
+            return {"ok": True, "promoted": 0}
+        # collect 已排除 untrusted，这里只按权重排序 + 丢 blocked，不强制 signal 阈值
+        #（候选来自该用户的 embeddings，本就是"值得考虑"的对话）。
+        ranked = [
+            c for c in rank_promotion_candidates(candidates_raw) if not c.is_blocked
+        ]
+        if not ranked:
+            return {"ok": True, "promoted": 0}
+        existing = self.memory.get_explicit_facts(user_id, limit=8)
+        try:
+            result = await consolidate_memory(ranked, existing, model_client=self.model_client)
+        except Exception:
+            self.logger.warning("memory_promotion_consolidate_failed | user=%s", user_id, exc_info=True)
+            return {"ok": False, "reason": "consolidate_failed"}
+        if not result.get("ok"):
+            return {"ok": False, "reason": result.get("error", "consolidate_failed")}
+        new_facts = apply_operations(result.get("operations", []), existing)
+        promoted = 0
+        for fact in new_facts:
+            if fact and fact not in existing:
+                self.memory.add_user_fact(user_id, fact, conversation_id)
+                promoted += 1
+        if promoted:
+            self.logger.info("memory_promotion_applied | user=%s | promoted=%d", user_id, promoted)
+        return {"ok": True, "promoted": promoted}
 
     async def _auto_register_stickers(self) -> None:
         """后台自动注册未识别的表情包 (不阻塞主流程)。"""
@@ -1456,22 +1547,33 @@ class YukikoEngine:
                 memory_context
                 + [f"[当前用户近期]{item}" for item in current_user_recent]
             )[-22:]
+        # 车道 2：显式回溯意图（「我记得/你之前说…」）时强化检索，命中更多相关记忆。
+        recall_intent = bool(allow_memory and looks_like_recall_intent(text))
         related_memories = (
             self.memory.search_related(
                 message.conversation_id,
                 text,
                 roles=("user",),
                 user_id=message.user_id,
+                top_k=8 if recall_intent else None,
             )
             if allow_memory
             else []
         )
-        user_profile_summary = (
+        if recall_intent:
+            self.logger.info(
+                "recall_intent_lane2 | trace=%s | user=%s | hits=%d",
+                getattr(message, "trace_id", "-"),
+                message.user_id,
+                len(related_memories),
+            )
+        profile_text = (
             self.memory.get_user_profile_summary(message.user_id)
             if allow_memory
             else ""
         )
         # 知识库中关于此用户的已学知识
+        kb_text = ""
         if allow_memory and hasattr(self, "knowledge_base") and message.user_id:
             try:
                 user_kb = self.knowledge_base.search(
@@ -1484,18 +1586,24 @@ class YukikoEngine:
                         if content:
                             facts.append(content[:80])
                     if facts:
-                        user_profile_summary += f" 知识库记录: {'；'.join(facts)}。"
+                        kb_text = f"知识库记录: {'；'.join(facts)}。"
             except Exception:
                 pass
 
         # 知识图谱中关于此用户的结构化知识 (knowledge_store)
+        ks_text = ""
         if allow_memory and hasattr(self.memory, "knowledge_get_user_summary") and message.user_id:
             try:
                 ks_summary = self.memory.knowledge_get_user_summary(message.user_id, limit=10)
                 if ks_summary:
-                    user_profile_summary += f" {ks_summary}"
+                    ks_text = str(ks_summary)
             except Exception:
                 pass
+        # 三段按优先级预算（profile 优先，知识库次之，图谱最后裁），防上下文失控。
+        user_profile_summary = budget_text_parts(
+            [profile_text, kb_text, ks_text],
+            max_chars=self._profile_summary_max_chars,
+        )
 
         preferred_name = (
             self.memory.get_preferred_name(message.user_id) if allow_memory else ""
@@ -2427,6 +2535,10 @@ class YukikoEngine:
                 message_text=text,
                 original_message_text=message.text,
                 explicit_bot_addressed=explicit_bot_addressed,
+                # followup 轮（bot 刚提问、用户无 @ 回复）也是指向性：不显式传
+                # was_directed 会退化成结构推断，把 followup 误判为旁听 → 超时时静默不回。
+                was_directed=explicit_bot_addressed
+                or bool(getattr(trigger, "followup_candidate", False)),
                 message_id=message.message_id,
                 reply_to_message_id=message.reply_to_message_id,
                 # 工具直发路径的敏感词过滤。send_group_message 这类工具绕开
@@ -4107,6 +4219,10 @@ class YukikoEngine:
     async def _run_plugin(
         self, name: str, message: str, context: dict[str, Any]
     ) -> str:
+        # Star 式分派优先：@register_command / @register_regex 命中则用，否则走 handle fallback。
+        handled, result = await self.plugins.dispatch(name, message, context)
+        if handled:
+            return result or ""
         return await self.plugins.call(name, message, context)
 
     @staticmethod
@@ -5651,6 +5767,19 @@ class YukikoEngine:
             # write_daily_snapshot 是同步 I/O，放到线程池避免阻塞事件循环
             loop = asyncio.get_running_loop()
             loop.run_in_executor(None, self.memory.write_daily_snapshot)
+            # 记忆晋升（Phase 0.5a）：默认启用 + 每 50 条消息节流触发，模型 consolidate 候选进 explicit_facts。
+            promotion_enable = bool(
+                self.config.get("memory", {}).get("promotion_enable", True)
+            )
+            if promotion_enable and message.user_id:
+                uid = str(message.user_id)
+                counter = self._promotion_counters.get(uid, 0) + 1
+                self._promotion_counters[uid] = counter
+                if counter >= 50:
+                    self._promotion_counters[uid] = 0
+                    asyncio.create_task(
+                        self._run_memory_promotion(uid, message.conversation_id)
+                    )
 
         # ── 对话摘要归档 (MemGPT archival): 每 N 条消息生成摘要 ──
         if bool(self.config.get("bot", {}).get("allow_memory", True)):

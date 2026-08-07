@@ -141,9 +141,27 @@ class MemoryWritesAuditStreamTests(unittest.TestCase):
                 memory_dir=root / "memory",
                 audit=trail,
             )
-            for _ in range(3):
-                memory.add_message("group:42", "10001", "user", "重复的一句话", user_name="小明")
+            # 写入侧已按 (conversation_id, user_id, role, content) 去重
+            # （INSERT OR IGNORE + idx_embeddings_unique），add_message 重复只会落一行。
+            # 为了构造 compact 要清理的重复前提，先卸唯一索引再直接插重复行。
+            memory.add_message("group:42", "10001", "user", "重复的一句话", user_name="小明")
             memory._flush_vector_buffer()
+            with memory._connect() as conn:
+                conn.execute("DROP INDEX IF EXISTS idx_embeddings_unique;")
+                for _ in range(2):
+                    conn.execute(
+                        "INSERT INTO embeddings "
+                        "(conversation_id, user_id, role, content, embedding, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?);",
+                        (
+                            "group:42",
+                            "10001",
+                            "user",
+                            "重复的一句话",
+                            json.dumps([0.0] * 64),
+                            datetime.now(UTC).isoformat(),
+                        ),
+                    )
 
             ok, _, payload = memory.compact_memory_records(
                 conversation_id="group:42",

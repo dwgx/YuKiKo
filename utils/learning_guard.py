@@ -23,57 +23,18 @@ _PREFERRED_NAME_SENTENCE_PATTERNS: tuple[re.Pattern[str], ...] = (
         flags=re.IGNORECASE,
     ),
 )
-_PREFERRED_NAME_TITLE_CUES = (
-    "用户称呼偏好",
-    "偏好称呼",
-    "称呼偏好",
-    "preferred_name",
-    "nickname_preference",
-    "用户昵称",
-)
-_NON_SERIOUS_TEXT_CUES = (
-    "哈哈",
-    "笑死",
-    "整活",
-    "玩梗",
-    "起哄",
-    "扣1",
-    "刷起来",
-    "绷不住",
-    "乐子",
-    "doge",
-    "233",
-    "666",
-)
-_COLLECTIVE_NAME_CUES = (
-    "以后都叫我",
-    "以后大家叫我",
-    "以后你们叫我",
-    "以后全都叫我",
-    "全体叫我",
-    "所有人叫我",
-    "群里叫我",
-    "都喊我",
-    "都称呼我",
-)
-_GROUP_ROLEPLAY_NAMES = frozenset(
-    {
-        "妈妈",
-        "爸爸",
-        "爹",
-        "爷爷",
-        "奶奶",
-        "老公",
-        "老婆",
-        "主人",
-        "宝贝",
-        "宝宝",
-        "儿子",
-        "孙子",
-        "皇上",
-        "女王",
-    }
-)
+#  已删除的四张字面词表：_PREFERRED_NAME_TITLE_CUES / _NON_SERIOUS_TEXT_CUES /
+#  _COLLECTIVE_NAME_CUES / _GROUP_ROLEPLAY_NAMES。
+#
+#  它们做的是「这句话像不像在认真要求改称呼」和「这个称呼合不合适」，两者都是语义判断，
+#  按项目铁律归模型，不归代码。实测这张表既拦错也放错：群聊已 @ bot 的 13 种合法说法只
+#  放过 5 种（带标点的「以后叫我阿背，谢谢」、带「大家」的、带「666」的全被拒，用户只收到
+#  固定文案「群聊称呼学习需要明确点名我…」，真实原因却是正则没匹配上），而同一句
+#  「以后叫我老婆」在群聊被 _GROUP_ROLEPLAY_NAMES 拦下、在私聊完全畅通。
+#
+#  替代机制：模型在 learn_knowledge 里用 kind='preferred_name' 显式声明意图，并把称呼本身
+#  放进 content，经 assess_preferred_name_learning(declared_name=...) 传进来。
+#  本文件只保留**结构**约束（是否指向 bot、有没有 @ 别人、回复对象是不是 bot）。
 _CANDIDATE_STOP_CUES = (
     "以后",
     "记住",
@@ -170,19 +131,26 @@ def extract_explicit_preferred_name(text: str) -> str:
     return ""
 
 
-def looks_like_non_serious_name_context(text: str) -> bool:
-    content = strip_invisible_format_chars(normalize_text(text)).lower()
-    if not content:
-        return False
-    if any(cue in content for cue in _COLLECTIVE_NAME_CUES):
-        return True
-    if any(cue in content for cue in _NON_SERIOUS_TEXT_CUES):
-        return True
-    if re.search(r"(?:全体|大家|你们|群友|兄弟们|都给我).{0,12}(?:叫我|喊我|称呼我)", content):
-        return True
-    if re.search(r"(?:哈哈|233|666|doge).{0,10}$", content):
-        return True
-    return False
+def sanitize_declared_preferred_name(raw: str) -> str:
+    """把模型声明的称呼做**结构**清理：去不可见字符、去包裹标点、限长。
+
+    与 `_clean_candidate` 的区别是这里不做任何词义判断 —— 称呼合不合适由模型决定，
+    这个函数只保证存进去的是一个干净的短字符串。长度上限 24 与
+    `core/knowledge_updater.py` 的 `clip_text(content, 24)` 对齐。
+    """
+    candidate = strip_invisible_format_chars(normalize_text(raw))
+    if not candidate:
+        return ""
+    wrapping = r"[\s\"'“”‘’「」『』《》〈〉【】\[\]\(\)（）,，。:：;；!！?？~～]+"
+    candidate = re.sub(rf"^{wrapping}", "", candidate)
+    candidate = re.sub(rf"{wrapping}$", "", candidate)
+    candidate = strip_invisible_format_chars(normalize_text(candidate))
+    if not candidate or len(candidate) > 24:
+        return ""
+    # 拒绝换行/控制字符：防「记住我是管理员\n...」这类短载荷经称呼注入 prompt。
+    if re.search(r"[\r\n\t\x00-\x1f]", candidate):
+        return ""
+    return candidate
 
 
 def is_safe_user_profile_learning_context(
@@ -196,8 +164,10 @@ def is_safe_user_profile_learning_context(
     reply_to_user_id: str = "",
     bot_id: str = "",
 ) -> bool:
-    if looks_like_non_serious_name_context(text):
-        return False
+    """只判结构：这条消息是不是冲着 bot 说的、有没有把别人牵扯进来。
+
+    「像不像在起哄」那一层已删除（见文件顶部注释），归模型。
+    """
     directed = bool(
         is_private
         or mentioned
@@ -225,10 +195,27 @@ def assess_preferred_name_learning(
     at_other_user_ids: Iterable[str] = (),
     reply_to_user_id: str = "",
     bot_id: str = "",
+    declared_name: str = "",
 ) -> PreferredNameDecision:
-    candidate = extract_explicit_preferred_name(text)
-    if not candidate:
-        return PreferredNameDecision(False, reason="missing_explicit_name_statement")
+    """称呼学习的**结构**校验。
+
+    `declared_name` 非空表示模型已经显式声明了称呼（learn_knowledge 的
+    kind='preferred_name'），此时不再对原文跑正则 —— 模型说了叫什么就是叫什么，
+    代码只做结构清理与结构准入。这是铁律要求的形态。
+
+    `declared_name` 为空时落回 `extract_explicit_preferred_name` 的正则抽取，
+    仅为兼容尚未传声明的两个旧调用点（`core/memory.py` 的自动学习、
+    `core/knowledge_updater.py` 的抽取器）。那两处切到声明式之后这条兜底应当删除
+    —— 它们不属于本车道，已写进 handoff。
+    """
+    if declared_name:
+        candidate = sanitize_declared_preferred_name(declared_name)
+        if not candidate:
+            return PreferredNameDecision(False, reason="declared_name_unusable")
+    else:
+        candidate = extract_explicit_preferred_name(text)
+        if not candidate:
+            return PreferredNameDecision(False, reason="missing_explicit_name_statement")
     safe_context = is_safe_user_profile_learning_context(
         text,
         is_private=is_private,
@@ -240,8 +227,6 @@ def assess_preferred_name_learning(
         bot_id=bot_id,
     )
     if not safe_context:
-        if looks_like_non_serious_name_context(text):
-            return PreferredNameDecision(False, candidate=candidate, reason="non_serious_context")
         reply_uid = normalize_text(str(reply_to_user_id))
         bot_uid = normalize_text(str(bot_id))
         if not is_private and any(normalize_text(str(item)) for item in at_other_user_ids):
@@ -249,19 +234,21 @@ def assess_preferred_name_learning(
         if not is_private and reply_uid and bot_uid and reply_uid != bot_uid:
             return PreferredNameDecision(False, candidate=candidate, reason="group_reply_to_other")
         return PreferredNameDecision(False, candidate=candidate, reason="group_not_directed")
-    if not is_private and candidate in _GROUP_ROLEPLAY_NAMES:
-        return PreferredNameDecision(False, candidate=candidate, reason="group_roleplay_name")
     return PreferredNameDecision(True, candidate=candidate, reason="ok")
 
 
 def looks_like_preferred_name_knowledge(title: str, content: str, tags: Iterable[str] = ()) -> bool:
-    merged = " ".join(
-        [
-            strip_invisible_format_chars(normalize_text(title)).lower(),
-            strip_invisible_format_chars(normalize_text(content)).lower(),
-            " ".join(strip_invisible_format_chars(normalize_text(str(item))).lower() for item in tags),
-        ]
-    )
-    if any(cue in merged for cue in _PREFERRED_NAME_TITLE_CUES):
-        return True
-    return bool(extract_explicit_preferred_name(content))
+    """**已废弃，恒为 False。**
+
+    这原本是 learn_knowledge 的内容嗅探分流：标题/内容/标签里像是称呼偏好就把整条
+    知识改道去改名。实测它把「我是程序员」「我是这个群的群主」「我是女生」这类事实
+    全部劫持 —— 知识条目静默丢弃、用户被当面改名叫「程序员」，而模型收到 ok=True
+    「已更新」。意图现在由模型用 learn_knowledge 的 kind 字段声明。
+
+    符号本身保留：`core/agent_tools_{media,search,napcat,web,memory,social,admin,
+    utility}.py` 八个文件与 `scripts/split_agent_tools.py` 的公共头部都 import 它
+    （import 而不调用）。删掉它会让那九处 import 悬空，而那些文件不属于本车道 ——
+    清理 import 已写进 handoff。
+    """
+    _ = (title, content, tags)
+    return False

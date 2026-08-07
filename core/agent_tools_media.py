@@ -22,7 +22,7 @@ from core.recalled_messages import (
     build_conversation_id as _build_recall_conversation_id,
     record_recalled_message as _record_recalled_message,
 )
-from utils.learning_guard import assess_preferred_name_learning, looks_like_preferred_name_knowledge
+from utils.learning_guard import assess_preferred_name_learning
 from utils.process_compat import macos_subprocess_kwargs, resolve_executable_for_spawn
 from utils.text import clip_text, normalize_matching_text, normalize_text, tokenize
 

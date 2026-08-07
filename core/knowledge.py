@@ -493,8 +493,13 @@ class KnowledgeBase:
             # 否则它们抛的 OperationalError 会被误判成「FTS 不可用」而重跑一次全表 LIKE。
             rows = None
 
-        if rows is None:
-            # LIKE 兜底
+        if not rows:
+            # LIKE 兜底。条件是 `not rows` 而不是 `rows is None`：
+            # 建表用 tokenize='unicode61'，它不切 CJK，整段连续汉字算 1 个 token，
+            # 于是中文查询在 FTS 上**零命中而不报错** —— rows 是 []，不是 None。
+            # 原来的 `rows is None` 因此走不到兜底，直接返回空。
+            # 实测 19 条真实中文查询 12 条零命中（MATCH '申通'=0，LIKE '%申通%'=2）。
+            # tokenize 换 trigram 是更大的改动，这里只补兜底条件。
             like_q = f"%{query}%"
             if category:
                 sql = (
@@ -514,6 +519,46 @@ class KnowledgeBase:
                 rows = conn.execute(sql, (like_q, like_q, like_q, now, limit)).fetchall()
 
         entries = [self._row_to_entry(r) for r in rows]
+        self.touch([e.id for e in entries], now=now)
+        return self._rerank_entries(entries, limit=limit)
+
+    def search_by_tag(self, tag: str, category: str = "", limit: int = 10) -> list[KnowledgeEntry]:
+        """按标签精确检索（`user:<id>` / `conversation:<id>` / `group:<id>` 这类作用域标签）。
+
+        为什么必须是独立接口而不是复用 search()：标签含冒号，FTS5 会把 `user:123`
+        解析成「列过滤器 user」并抛 OperationalError，于是它**只能**靠 search() 的
+        LIKE 兜底分支命中 tags 列 —— 一条误打误撞的路径。search() 的兜底条件一变
+        （见同文件 search() 里 `not rows` 的注释），这条路就断了，表现为
+        「搜索修好了、反而忘了用户偏好」。所以作用域检索在这里显式落地，
+        不再依赖 FTS 抛异常。
+
+        tags 列是 JSON 数组文本，用参数化 LIKE 匹配 `"<tag>"` 带引号的完整字面量，
+        避免 `user:1` 命中 `user:10001`。SQL 一律参数化，不做字符串拼接。
+        """
+        needle = normalize_text(tag)
+        if not needle:
+            return []
+        conn = self._get_conn()
+        now = time.time()
+        # json.dumps 保证与写入侧 (add(): json.dumps(tags)) 的转义规则一致。
+        like_tag = f"%{json.dumps(needle, ensure_ascii=False)}%"
+        if category:
+            sql = (
+                "SELECT * FROM knowledge WHERE category=? AND tags LIKE ? "
+                "AND (expires_at=0 OR expires_at>?) "
+                "ORDER BY created_at DESC LIMIT ?"
+            )
+            rows = conn.execute(sql, (category, like_tag, now, limit)).fetchall()
+        else:
+            sql = (
+                "SELECT * FROM knowledge WHERE tags LIKE ? "
+                "AND (expires_at=0 OR expires_at>?) "
+                "ORDER BY created_at DESC LIMIT ?"
+            )
+            rows = conn.execute(sql, (like_tag, now, limit)).fetchall()
+        entries = [self._row_to_entry(r) for r in rows]
+        # 精确到标签，再按标签字面量核一遍：LIKE 只是索引用的粗筛。
+        entries = [e for e in entries if any(normalize_text(str(t)) == needle for t in (e.tags or []))]
         self.touch([e.id for e in entries], now=now)
         return self._rerank_entries(entries, limit=limit)
 

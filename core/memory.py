@@ -14,7 +14,7 @@ _log = logging.getLogger("yukiko.memory")
 
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +60,37 @@ SYSTEM_NOISE_KEYWORDS = frozenset(
 INVALID_PREFERRED_NAMES = frozenset({"你", "我", "他", "她", "它", "ta"})
 
 
+def budget_text_parts(parts: list[str], max_chars: int, separator: str = " ") -> str:
+    """按顺序累加文本段，超预算时截断当前段并停止（记忆注入的 token 预算护栏）。
+
+    对应 docs/zh-CN/RECONSTRUCTION-BLUEPRINT.md §4.6 第 4 条：多段拼接必须设上限。
+    段顺序即优先级——前面的段（用户画像）优先保留，后面的段（知识库/图谱）超出即裁。
+    """
+    if max_chars <= 0:
+        return ""
+    out: list[str] = []
+    used = 0
+    first = True
+    for part in parts:
+        text = (part or "").strip()
+        if not text:
+            continue
+        # 分隔符也计入预算，保证 join 后的总长 <= max_chars。
+        sep_len = 0 if first else len(separator)
+        remaining = max_chars - used - sep_len
+        if remaining <= 0:
+            break
+        if len(text) <= remaining:
+            out.append(text)
+            used += sep_len + len(text)
+        else:
+            out.append(text[:remaining].rstrip())
+            used += sep_len + remaining
+            break
+        first = False
+    return separator.join(out)
+
+
 @dataclass(slots=True)
 class MemoryMessage:
     role: str
@@ -102,6 +133,20 @@ class MemoryEngine:
         self.summary_every_n_messages = max(1, int(config.get("summary_every_n_messages", 20)))
         self.vector_dim = max(16, int(config.get("vector_dim", 64)))
         self.retrieve_top_k = max(1, int(config.get("retrieve_top_k", 5)))
+        # 相似度下限：原先 search_related 把 score 丢进 `_` 只按 top_k 截断，
+        # 实测 query='封我这个人' 的 top3 是 0.354 / 0.000 / 0.000 —— 两条零重叠
+        # 照样进 prompt。
+        #
+        # 0.05 是量出来的，不是拍的：在真实库 872 行上拿真实 user 消息当 query
+        # 复算 671 个 top5 分数，分布是「264 个恰好 0（39.3%）→ (0, 0.10) 区间
+        # 一个都没有 → 最小非零值 0.1026」。空隙在 (0, 0.1026)，0.05 落在正中间，
+        # 砍掉全部零重叠且一个真命中都不误伤。
+        # 不要把它调到 0.15：那会连带砍掉实测存在的 7 个 0.1026~0.1336 的弱命中。
+        # <=0 表示关掉此门。
+        try:
+            self.retrieve_min_score = float(config.get("retrieve_min_score", 0.05))
+        except (TypeError, ValueError):
+            self.retrieve_min_score = 0.05
         self.privacy_filter = bool(config.get("privacy_filter", False))
         self.enable_media_memory = bool(config.get("media_memory_enable", True))
         self.media_memory_max_data_uri_chars = max(
@@ -189,7 +234,7 @@ class MemoryEngine:
         self._thread_state: dict[str, dict[str, Any]] = self._load_thread_state()
 
         self.db_path = self.vector_dir / "memory.db"
-        self._vector_buffer: list[tuple[str, str, str, str, str, str]] = []
+        self._vector_buffer: list[tuple[str, str, str, str, str, str, str]] = []
         self._vector_buffer_limit = 10  # 攒 10 条再批量写入
         if self.enable_vector_memory or self.enable_media_memory:
             self._init_vector_db()
@@ -358,22 +403,43 @@ class MemoryEngine:
         self._flush_thread_state()
 
     def close(self) -> None:
-        """关闭 memory 引擎（刷盘并释放当前线程的 SQLite 连接）。"""
+        """刷盘并关掉当前线程上属于**本实例数据库**的连接。
+
+        原实现关的是 `_db_local.conn`（当前线程唯一那条），多实例场景下会把
+        别的库的连接一起关掉。其他线程的连接仍然泄漏 —— thread-local 没有集中
+        登记，与 knowledge 侧保持一致，本次不动这一点。
+        """
         self.flush()
-        conn = getattr(_db_local, "conn", None)
+        conns = getattr(_db_local, "conns", None)
+        if not conns:
+            return
+        conn = conns.pop(str(self.db_path), None)
         if conn is None:
             return
         try:
             conn.close()
         except Exception:
             pass
-        _db_local.conn = None
 
     def _connect(self) -> sqlite3.Connection:
-        if not hasattr(_db_local, "conn") or _db_local.conn is None:
-            _db_local.conn = sqlite3.connect(self.db_path, timeout=30.0)
-            _db_local.conn.execute("PRAGMA journal_mode=WAL;")
-        return _db_local.conn
+        """按 (线程, db_path) 取连接。
+
+        原实现只按线程缓存（`_db_local.conn`），而 `_db_local` 是**模块级**的：
+        同一线程里构造第二个 MemoryEngine 会直接复用第一个的连接，
+        于是所有读写都静默落到**第一个库**上。写法照搬 `core/knowledge.py::_get_conn`
+        （那边已按 path 键控），不另造第二种。
+        """
+        conns = getattr(_db_local, "conns", None)
+        if conns is None:
+            conns = {}
+            _db_local.conns = conns
+        key = str(self.db_path)
+        conn = conns.get(key)
+        if conn is None:
+            conn = sqlite3.connect(key, timeout=30.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conns[key] = conn
+        return conn
 
     def _init_vector_db(self) -> None:
         with self._connect() as conn:
@@ -386,7 +452,8 @@ class MemoryEngine:
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
                     embedding TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    origin_class TEXT NOT NULL DEFAULT 'untrusted'
                 );
                 """
             )
@@ -492,6 +559,105 @@ class MemoryEngine:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_cs_conversation_id ON conversation_summaries(conversation_id);"
             )
+            # ── episodic 结构化范例（Phase 0.5b 类型学补强） ──
+            # 记录「有效回复」的 query→reply 对，供后续 few-shot 注入。LangMem 类型学里
+            # YuKiKo 最弱的是 episodic：只有文本摘要没有「上次怎么处理有效」的结构化范例。
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS episodic_examples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    reply TEXT NOT NULL,
+                    source TEXT,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_episodic_examples_user ON episodic_examples(user_id);"
+            )
+        self._migrate_embeddings_dedupe()
+        self._migrate_add_origin_class()
+
+    def _migrate_add_origin_class(self) -> None:
+        """给已存在的 embeddings 表补 `origin_class` 列（Phase 0 来源分级）。
+
+        CREATE TABLE IF NOT EXISTS 对已存在表不生效，所以旧库要靠 ALTER TABLE。
+        幂等：列已存在时跳过。缺列时旧行默认 `untrusted`，避免历史数据凭空
+        被当成可信——宁可保守标低。
+        """
+        try:
+            with self._connect() as conn:
+                cols = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(embeddings);").fetchall()
+                }
+                if "origin_class" in cols:
+                    return
+                conn.execute(
+                    "ALTER TABLE embeddings ADD COLUMN origin_class TEXT NOT NULL DEFAULT 'untrusted';"
+                )
+        except Exception:
+            _log.warning("embeddings_origin_class_migration_failed", exc_info=True)
+
+    def _migrate_embeddings_dedupe(self) -> int:
+        """清理 embeddings 里的完全重复行，然后建唯一索引挡住后续重复。
+
+        实测线上库同一句错误话术存了 37 次，`top_k=5` 很容易被同一句刷满。
+        存量重复不清掉唯一索引根本建不起来，所以清理和建索引必须在同一次迁移里：
+        先按去重键保留最早一行（MIN(id)，最早那条的 created_at 才是首次出现时间），
+        再建索引。
+
+        去重键含 `user_id`，与 `compact_memory_records`「相同会话+用户+角色+内容」
+        的定义一致。实测真实库 872 行：不含 user_id 能多删 16 行（21.2% vs 19.4%），
+        但那 16 行是**不同人说了同一句话**（「你是谁」来自 3 个不同 QQ 号、
+        「搜一下稻香这首歌」来自 2 个），删掉就丢了「谁问过」这个事实。
+        要治的 37 次重复全部同一说话人，含 user_id 一样治得住。
+        `user_id` 是 `TEXT NOT NULL` 且实测无空值，不会踩 SQLite 唯一索引对 NULL
+        互不相等的坑。
+
+        返回删掉的行数。索引已存在时是纯 no-op。
+        """
+        removed = 0
+        try:
+            with self._connect() as conn:
+                has_index = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_embeddings_unique';"
+                ).fetchone()
+                if has_index:
+                    # 旧索引不含 origin_class：同内容先以 untrusted 入库会挡掉后续 user
+                    # 来源插入。检测到旧版就 DROP 重建为含 origin_class。
+                    index_sql = conn.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_embeddings_unique';"
+                    ).fetchone()
+                    if index_sql and "origin_class" not in str(index_sql[0] or ""):
+                        conn.execute("DROP INDEX idx_embeddings_unique;")
+                        has_index = None
+                    else:
+                        return 0
+                cur = conn.execute(
+                    """
+                    DELETE FROM embeddings
+                    WHERE id NOT IN (
+                        SELECT MIN(id) FROM embeddings
+                        GROUP BY conversation_id, user_id, role, content, origin_class
+                    );
+                    """
+                )
+                removed = int(cur.rowcount or 0)
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_unique "
+                    "ON embeddings(conversation_id, user_id, role, content, origin_class);"
+                )
+        except Exception:
+            # 迁移失败不能让引擎起不来：没有唯一索引只是继续存重复，功能仍可用。
+            _log.warning("embeddings_dedupe_migration_failed", exc_info=True)
+            return 0
+        if removed:
+            _log.info("embeddings_dedupe_migrated | removed=%d", removed)
+        return removed
 
     # ── 知识存储 CRUD ──
 
@@ -760,6 +926,7 @@ class MemoryEngine:
         role: str,
         content: str,
         ts: datetime,
+        origin_class: str = "untrusted",
     ) -> None:
         if not self.enable_vector_memory:
             return
@@ -771,25 +938,32 @@ class MemoryEngine:
             content,
             json.dumps(embedding, ensure_ascii=False),
             ts.isoformat(),
+            origin_class,
         ))
         if len(self._vector_buffer) >= self._vector_buffer_limit:
             self._flush_vector_buffer()
 
     def _flush_vector_buffer(self) -> None:
-        """批量写入 embedding 缓冲区到 SQLite。"""
+        """批量写入 embedding 缓冲区到 SQLite。
+
+        `INSERT OR IGNORE` 配合 `idx_embeddings_unique`（见 `_migrate_embeddings_dedupe`）
+        做写入去重：同一会话里**同一说话人**同一 role 的同一句话只留最早一条，
+        否则 `top_k` 会被同一句重复内容刷满。不同人说同一句话仍各留一行。
+        """
         if not self._vector_buffer:
             return
         try:
             with self._connect() as conn:
                 conn.executemany(
                     """
-                    INSERT INTO embeddings (conversation_id, user_id, role, content, embedding, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?);
+                    INSERT OR IGNORE INTO embeddings
+                        (conversation_id, user_id, role, content, embedding, created_at, origin_class)
+                    VALUES (?, ?, ?, ?, ?, ?, ?);
                     """,
                     self._vector_buffer,
                 )
         except Exception:
-            pass
+            _log.warning("vector_buffer_flush_failed | rows=%d", len(self._vector_buffer), exc_info=True)
         self._vector_buffer.clear()
 
     def add_message(
@@ -815,7 +989,8 @@ class MemoryEngine:
         self._history[conversation_id].append(
             MemoryMessage(role=role, user_id=user_id, user_name=clean_user_name, content=text, timestamp=ts)
         )
-        self._store_vector(conversation_id, user_id, role, text, ts)
+        origin_class = self._classify_origin(metadata)
+        self._store_vector(conversation_id, user_id, role, text, ts, origin_class=origin_class)
 
         day_key = ts.astimezone().date().isoformat()
         self._daily_records[day_key].append((role, user_id, clean_user_name, text))
@@ -1116,6 +1291,31 @@ class MemoryEngine:
     # 替代物已经在同一句 summary 里：`常聊关键词：...` 是真实词频（结构事实），
     # 模型自己看见 python / bug 就能判断对方懂技术，无需代码替它下结论。
 
+    @staticmethod
+    def _classify_origin(metadata: dict[str, Any] | None) -> str:
+        """判定消息来源的可信度级别（provenance，对应 OpenClaw 的记忆来源分级）。
+
+        这是**结构事实**判定，不是语义判断：只看有没有指向 bot、是不是私聊。
+        owner / agent / system 在显式写入路径（set_preferred_name / add_user_fact /
+        learn_knowledge 带 actor）由调用方决定；这里只区分普通对话者 user 与
+        群聊未指向的 untrusted。untrusted 结构性排除出 Curated 层（见
+        `_update_user_profile` 的门控），无论被召回多少次都不晋升。
+        """
+        meta = metadata if isinstance(metadata, dict) else {}
+        # owner/agent/system 由写入方 actor 声明（结构事实，不是语义判断）。
+        actor = normalize_text(str(meta.get("actor", ""))).lower()
+        if actor.startswith("owner"):
+            return "owner"
+        if actor.startswith("agent"):
+            return "agent"
+        if actor.startswith("system"):
+            return "system"
+        if bool(meta.get("is_private", False)):
+            return "user"
+        if bool(meta.get("mentioned", False)) or bool(meta.get("explicit_bot_addressed", False)):
+            return "user"
+        return "untrusted"
+
     def _update_user_profile(
         self,
         user_id: str,
@@ -1127,6 +1327,7 @@ class MemoryEngine:
     ) -> None:
         profile = self._user_profiles.get(user_id, {})
         message_meta = metadata if isinstance(metadata, dict) else {}
+        origin_class = self._classify_origin(message_meta)
         profile_text = self._normalize_profile_text(text)
         message_count = int(profile.get("message_count", 0)) + 1
         total_chars = int(profile.get("total_chars", 0)) + len(profile_text)
@@ -1178,7 +1379,8 @@ class MemoryEngine:
         preferred_name = normalize_text(str(profile.get("preferred_name", "")))
         preferred_name_updated_at = normalize_text(str(profile.get("preferred_name_updated_at", "")))
         detected_preferred_name = ""
-        if self.heuristic_rules_enable:
+        # untrusted（群聊未指向 bot 的发言）不产生可晋升的策展记忆：不自动学称呼/指令/事实。
+        if self.heuristic_rules_enable and origin_class != "untrusted":
             raw_preferred_name = self._extract_preferred_name(text)
             if raw_preferred_name:
                 decision = assess_preferred_name_learning(
@@ -1203,7 +1405,11 @@ class MemoryEngine:
         agent_directives = profile.get("agent_directives", [])
         if not isinstance(agent_directives, list):
             agent_directives = []
-        detected_directive = self._extract_agent_directive(text) if self.heuristic_rules_enable else ""
+        detected_directive = (
+            self._extract_agent_directive(text)
+            if self.heuristic_rules_enable and origin_class != "untrusted"
+            else ""
+        )
         if detected_directive:
             dedup_directives = [normalize_text(str(row)) for row in agent_directives if normalize_text(str(row))]
             if detected_directive in dedup_directives:
@@ -1213,7 +1419,11 @@ class MemoryEngine:
         explicit_facts = profile.get("explicit_facts", [])
         if not isinstance(explicit_facts, list):
             explicit_facts = []
-        detected_fact = self._extract_explicit_fact(text) if self.heuristic_rules_enable else ""
+        detected_fact = (
+            self._extract_explicit_fact(text)
+            if self.heuristic_rules_enable and origin_class != "untrusted"
+            else ""
+        )
         if detected_fact:
             dedup_facts: list[dict[str, Any]] = []
             fact_key = normalize_text(detected_fact).lower()
@@ -1491,22 +1701,29 @@ class MemoryEngine:
         )
 
     def get_preferred_name(self, user_id: str, fallback_name: str = "") -> str:
-        """获取稳定称呼：preferred_name > user_id 短标识 > display_name > fallback。"""
+        """获取稳定称呼：preferred_name > fallback（实时昵称）> display_name > user_id 短标识。
+
+        原实现把「纯数字 user_id → 用户XXXX」这一支放在 display_name / fallback **之前**，
+        而 QQ 号必然匹配 `\\d{4,20}`，于是后面两支是死代码：实测 39 个真实档案
+        39/39 都返回「用户XXXX」，`136666451`（display_name=帝王）被叫成「用户6451」。
+        数字短标识只是「什么名字都拿不到」时的最后兜底，必须排在最后。
+        """
         uid = normalize_text(str(user_id))
         profile = self._user_profiles.get(uid, {})
         if isinstance(profile, dict):
             preferred = normalize_text(str(profile.get("preferred_name", "")))
             if preferred and preferred.lower() not in INVALID_PREFERRED_NAMES:
                 return preferred
-        if uid and re.fullmatch(r"\d{4,20}", uid):
-            return f"用户{uid[-4:]}"
+        # fallback 是调用方传进来的实时昵称（群名片 / QQ 昵称），比落库的 display_name 新。
+        fallback = normalize_text(fallback_name)
+        if fallback:
+            return fallback
         if isinstance(profile, dict):
             display = normalize_text(str(profile.get("display_name", "")))
             if display:
                 return display
-        fallback = normalize_text(fallback_name)
-        if fallback:
-            return fallback
+        if uid and re.fullmatch(r"\d{4,20}", uid):
+            return f"用户{uid[-4:]}"
         return "某人"
 
     def get_display_name(self, user_id: str) -> str:
@@ -1578,6 +1795,8 @@ class MemoryEngine:
             profile["display_name"] = self._user_display_names.get(uid, "")
         profile["preferred_name"] = name
         profile["preferred_name_updated_at"] = now
+        # provenance：显式改名是 agent 来源（可信，进 Curated 层）。
+        profile["origin_class"] = "agent"
         self._user_profiles[uid] = profile
         if normalize_text(str(profile.get("display_name", ""))):
             self._user_display_names[uid] = normalize_text(str(profile.get("display_name", "")))
@@ -1627,6 +1846,130 @@ class MemoryEngine:
         for fact in facts:
             clean_directives.append(f"用户明确记忆: {fact}")
         return clean_directives[-20:]
+
+    def add_episodic_example(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+        query: str,
+        reply: str,
+        source: str = "",
+    ) -> int:
+        """记录一条 episodic 结构化范例（有效回复），供后续 few-shot 注入。
+
+        LangMem 类型学里 YuKiKo 最弱的是 episodic —— 只有文本摘要，没有
+        「上次怎么处理有效」的结构化范例。这里的 query→reply 对就是范例。
+        source 标来源（如 agent / webui / feedback），写入失败不抛、记 warning。
+        """
+        conv = normalize_text(conversation_id)
+        uid = normalize_text(user_id)
+        q = normalize_text(query)
+        r = normalize_text(reply)
+        if not conv or not q or not r:
+            return 0
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "INSERT INTO episodic_examples "
+                    "(conversation_id, user_id, query, reply, source, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?);",
+                    (
+                        conv,
+                        uid,
+                        q,
+                        r,
+                        normalize_text(source),
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+            return int(cur.lastrowid)
+        except Exception:
+            _log.warning("episodic_example_write_failed", exc_info=True)
+            return 0
+
+    def get_episodic_examples(
+        self,
+        *,
+        conversation_id: str = "",
+        user_id: str = "",
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """取最近 episodic 范例（可选按会话/用户过滤），供注入时按需取。"""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if conversation_id:
+            clauses.append("conversation_id = ?")
+            params.append(normalize_text(conversation_id))
+        if user_id:
+            clauses.append("user_id = ?")
+            params.append(normalize_text(user_id))
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT id, conversation_id, user_id, query, reply, source, created_at
+                    FROM episodic_examples
+                    {where_sql}
+                    ORDER BY id DESC LIMIT ?;
+                    """,
+                    (*params, max(1, int(limit))),
+                ).fetchall()
+        except Exception:
+            return []
+        return [
+            {
+                "id": int(row[0]),
+                "conversation_id": str(row[1] or ""),
+                "user_id": str(row[2] or ""),
+                "query": str(row[3] or ""),
+                "reply": str(row[4] or ""),
+                "source": str(row[5] or ""),
+                "created_at": str(row[6] or ""),
+            }
+            for row in rows
+        ]
+
+    def collect_promotion_candidates(
+        self, *, user_id: str = "", limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """从 embeddings 收集晋升候选（排除 untrusted 来源），供晋升门 rank/consolidate。
+
+        返回 dict 列表：content/origin_class/session_kind/conversation_id/user_id/created_at。
+        untrusted（群聊未指向）结构性排除，不进入晋升候选池。
+        """
+        clauses = ["origin_class != ?"]
+        params: list[Any] = ["untrusted"]
+        if user_id:
+            clauses.append("user_id = ?")
+            params.append(normalize_text(user_id))
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"SELECT conversation_id, user_id, content, origin_class, created_at "
+                    f"FROM embeddings WHERE {' AND '.join(clauses)} "
+                    f"ORDER BY id DESC LIMIT ?",
+                    (*params, max(1, int(limit))),
+                ).fetchall()
+        except Exception:
+            return []
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            content = normalize_text(str(row[2] or ""))
+            if not content:
+                continue
+            out.append(
+                {
+                    "content": content,
+                    "origin_class": str(row[3] or "untrusted"),
+                    "session_kind": "interactive",
+                    "conversation_id": str(row[0] or ""),
+                    "user_id": str(row[1] or ""),
+                    "created_at": str(row[4] or ""),
+                }
+            )
+        return out
 
     def add_user_fact(self, user_id: str, fact: str, conversation_id: str = "") -> bool:
         """Agent 主动为用户记录事实（如图片分析结果、用户身份信息等）。"""
@@ -2502,6 +2845,8 @@ class MemoryEngine:
         top_k: int | None = None,
         roles: tuple[str, ...] | None = None,
         user_id: str = "",
+        trace_id: str = "",
+        min_score: float | None = None,
     ) -> list[str]:
         if not self.enable_vector_memory or not query.strip():
             return []
@@ -2555,15 +2900,29 @@ class MemoryEngine:
             scored.append((score, str(content)))
 
         scored.sort(key=lambda item: item[0], reverse=True)
+        floor = self.retrieve_min_score if min_score is None else float(min_score)
+        dropped = sum(1 for score, _ in scored if floor > 0 and score < floor)
         seen: set[str] = set()
         results: list[str] = []
-        for _, content in scored:
+        for score, content in scored:
+            # 下限门：已按分数降序，命中下限即可停。宁可返回空列表，也不拿 0.000 充数。
+            if floor > 0 and score < floor:
+                break
             if content in seen:
                 continue
             seen.add(content)
             results.append(content)
             if len(results) >= k:
                 break
+        _log.info(
+            "memory_related_hit | trace=%s | pool=%d | hits=%d | top=%.3f | floor=%.3f | floor_dropped=%d",
+            trace_id or "-",
+            len(scored),
+            len(results),
+            scored[0][0] if scored else 0.0,
+            floor,
+            dropped,
+        )
         return results
 
     @staticmethod

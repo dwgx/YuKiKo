@@ -291,7 +291,7 @@ python scripts/project_takeover_selfcheck.py
 - `scripts/agent_deep_selfcheck.py`
 - 关键回归测试（本地关键词回归、群聊上下文回归、记忆集成回归、模型降级回归）
 
-接管改造说明见：[`docs/zh-CN/TAKEOVER_IMPROVEMENT_PLAN.md`](docs/zh-CN/TAKEOVER_IMPROVEMENT_PLAN.md)
+当前接手状态见：[`TAKEOVER-2026-08-07.md`](TAKEOVER-2026-08-07.md)。设计/改造背景见：[`docs/zh-CN/TAKEOVER_IMPROVEMENT_PLAN.md`](docs/zh-CN/TAKEOVER_IMPROVEMENT_PLAN.md)
 
 ## 🔍 常见问题
 
@@ -377,6 +377,7 @@ YuKiKo/
 | [繁體中文指南](docs/zh-TW/GUIDE.md) | 部署與設定 |
 | [NapCat/Linux/WebUI 更新說明](docs/zh-TW/NAPCAT_LINUX_WEBUI_UPDATE.md) | NapCat 深度整合、運維命令、部署加速 |
 | [插件开发指南](docs/PLUGIN_GUIDE.md) | 插件配置与开发 |
+| [当前接手状态](TAKEOVER-2026-08-07.md) | 当前工作树、证据等级、阻塞与最小接手命令 |
 
 ## 📄 License
 

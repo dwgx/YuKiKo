@@ -21,7 +21,7 @@ from core.recalled_messages import (
     build_conversation_id as _build_recall_conversation_id,
     record_recalled_message as _record_recalled_message,
 )
-from utils.learning_guard import assess_preferred_name_learning, looks_like_preferred_name_knowledge
+from utils.learning_guard import assess_preferred_name_learning
 from utils.text import clip_text, normalize_matching_text, normalize_text, tokenize
 
 _log = logging.getLogger("yukiko.agent_tools")
@@ -34,6 +34,12 @@ _WIKI_CONFIDENCE = 0.6
 # 模型自己声明的安全判定取值。判据归 prompt 措辞，不归本文件的词表。
 _SAFETY_REVIEW_REJECT = frozenset({"unsafe", "harmful", "abusive", "reject", "block", "unsafe_content"})
 _SAFETY_REVIEW_PASS = frozenset({"safe", "ok", "clean", "benign"})
+
+# learn_knowledge 的 kind 取值。**与 core/knowledge_updater.py 抽取器提示里的那套枚举
+# 逐字一致**（fact|preference|music_preference|preferred_name|correction）——
+# 两条入库路径对同一个词的理解必须相同，否则模型在两处学到的用法会互相矛盾。
+# 这不是词表：它是模型声明意图的取值域，不是「消息含某词 → 做某事」。
+_LEARN_KNOWLEDGE_KINDS = frozenset({"fact", "preference", "music_preference", "preferred_name", "correction"})
 
 
 def _kb_record_audit(kb: Any, event: str, **fields: Any) -> None:
@@ -199,6 +205,19 @@ def _register_crawler_tools(registry: AgentToolRegistry) -> None:
                 "properties": {
                     "title": {"type": "string", "description": "知识标题/名称"},
                     "content": {"type": "string", "description": "知识内容"},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "preference", "music_preference", "preferred_name", "correction"],
+                        "description": (
+                            "这条要记的是什么性质，由你判断后声明，代码不再猜：\n"
+                            "fact=客观事实（默认）；preference=用户的偏好；"
+                            "music_preference=音乐口味；\n"
+                            "preferred_name=用户要求你改口怎么称呼他本人 —— "
+                            "只有这个值会去改称呼，content 直接写称呼本身（如「阿背」），不要写整句话；\n"
+                            "correction=对同标题旧值的更正。\n"
+                            "注意：「我是程序员」「我是女生」这类是 fact，不是 preferred_name。"
+                        ),
+                    },
                     "category": {"type": "string", "description": "分类: fact/meme/learned"},
                     "tags": {"type": "string", "description": "标签(逗号分隔)"},
                     "confidence": {
@@ -222,9 +241,18 @@ def _register_crawler_tools(registry: AgentToolRegistry) -> None:
                 {
                     "title": "群主生日",
                     "content": "群主生日是 3 月 5 日",
+                    "kind": "fact",
                     "category": "fact",
                     "tags": "群主,生日",
                     "confidence": 0.9,
+                    "safety_review": "safe",
+                },
+                # 改称呼长什么样：content 只写称呼本身。这条示例是 kind 语义的主要载体 ——
+                # 「我是程序员」这类事实必须走上面的 fact，不能落到这里。
+                {
+                    "title": "用户称呼偏好",
+                    "content": "阿背",
+                    "kind": "preferred_name",
                     "safety_review": "safe",
                 },
                 {
@@ -589,6 +617,7 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
     current_user_id = normalize_text(str(context.get("user_id", "")))
     current_conversation_id = normalize_text(str(context.get("conversation_id", "")))
     current_group_id = normalize_text(str(context.get("group_id", "")))
+    is_cross_scope_reader = _has_cross_user_profile_access(context)
 
     def _build_query_variants(raw_query: str) -> list[str]:
         base = normalize_text(raw_query)
@@ -610,65 +639,33 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
 
         _add(base)
 
+        # 只做结构归一化：把标点换成空格。哪些词「重要」是语义判断，
+        # 原来那张 22 词中文 stop_words 表（喜欢/音乐/查一下/什么/…）已删除 ——
+        # 检索关键词由模型调用时自己填 query，它本来就能填。
         compact = re.sub(r"[，。！？!?,.;；:：\"'“”‘’（）()【】\[\]<>]+", " ", base)
         compact = normalize_text(compact)
         _add(compact)
 
-        stop_words = {
-            "喜欢",
-            "最喜欢",
-            "歌曲",
-            "音乐",
-            "听",
-            "听歌",
-            "查询",
-            "搜索",
-            "查",
-            "查下",
-            "查一下",
-            "相关",
-            "内容",
-            "信息",
-            "什么",
-            "哪个",
-            "是谁",
-            "有吗",
-            "一下",
-            "给我",
-            "帮我",
-            "用户",
-            "user",
-        }
-
-        user_id = normalize_text(str(context.get("user_id", "")))
-        user_name_tokens = set(tokenize(normalize_text(str(context.get("user_name", "")))))
-
-        core_terms: list[str] = []
-        for token in tokenize(compact):
-            if token in stop_words:
-                continue
-            if token in user_name_tokens:
-                continue
-            if user_id and token == user_id:
-                continue
-            if token.isdigit() and len(token) < 4:
-                continue
-            core_terms.append(token)
-            if len(core_terms) >= 6:
-                break
-
-        if core_terms:
-            _add(" ".join(core_terms))
-            for term in core_terms[:4]:
-                _add(term)
-
-        if user_id:
-            # 配合 user:<id> 标签做用户画像类检索。
-            _add(f"user:{user_id}")
-            if core_terms:
-                _add(f"user:{user_id} {' '.join(core_terms[:3])}")
-
+        # `user:<id>` **不再**混进语义变体队列。
+        # 原来无条件把它追加到末尾：语义变体在 FTS 上中文零命中，而 `user:<id>` 含冒号
+        # 会走 tags 匹配，于是唯一能命中的变体永远是「本人画像」——
+        # 实测 8 条中文 query（抑郁症 / 哈尔滨暴雨 / 图灵机是什么 / 量子力学…）
+        # 8/8 返回同一条 music_preference，字面相关度 0，而模型收到 ok=True 会据此发言。
+        # 作用域检索改走 kb.search_by_tag() 的显式接口，见下面的 _fetch_profile_entries。
         return variants[:10]
+
+    def _fetch_profile_entries() -> list[Any]:
+        """当前用户的画像类条目，按标签精确取，与 query 相关度无关。"""
+        if not current_user_id:
+            return []
+        fetch = getattr(kb, "search_by_tag", None)
+        if not callable(fetch):
+            return []
+        try:
+            return list(fetch(f"user:{current_user_id}", category=category or "", limit=4) or [])
+        except Exception:
+            _log.warning("knowledge_profile_fetch_failed | user=%s", current_user_id, exc_info=True)
+            return []
 
     def _normalize_entry_tags(entry: Any) -> set[str]:
         raw_tags = getattr(entry, "tags", [])
@@ -694,6 +691,32 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
             score += 20
         return score
 
+    def _is_readable_scope(entry: Any) -> bool:
+        """作用域标签是硬边界，不是排序权重。
+
+        原实现只在 _scope_score 里给 user:/conversation:/group: 加分（+100/+40/+20），
+        排完照样把全部条目返回给模型 —— 实测 permission_level='user' 查
+        `user:999888777` 拿到别人的「我有抑郁症在吃舍曲林」「以后叫我小柯」。
+        标签是写入时打的结构事实，这里按结构事实**丢弃**越界条目，不是降权。
+        super_admin 例外，与 remember_user_fact / recall_about_user 用的
+        _has_cross_user_profile_access 同一判据。
+        """
+        if is_cross_scope_reader:
+            return True
+        tags = _normalize_entry_tags(entry)
+        owner_tags = {tag for tag in tags if tag.startswith("user:")}
+        if owner_tags and (not current_user_id or f"user:{current_user_id}".lower() not in owner_tags):
+            return False
+        conv_tags = {tag for tag in tags if tag.startswith("conversation:")}
+        if conv_tags and (
+            not current_conversation_id or f"conversation:{current_conversation_id}".lower() not in conv_tags
+        ):
+            return False
+        group_tags = {tag for tag in tags if tag.startswith("group:")}
+        if group_tags and (not current_group_id or f"group:{current_group_id}".lower() not in group_tags):
+            return False
+        return True
+
     try:
         query_variants = _build_query_variants(query)
         category_variants: list[str] = [category] if category else [""]
@@ -702,6 +725,7 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
 
         entries: list[Any] = []
         seen_ids: set[int] = set()
+        dropped_out_of_scope = 0
         for cat in category_variants:
             for q in query_variants:
                 try:
@@ -712,6 +736,10 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
                     rid = int(getattr(row, "id", 0) or 0)
                     if rid and rid in seen_ids:
                         continue
+                    # 越界条目在去重登记之前就丢掉，且**不占** limit 名额。
+                    if not _is_readable_scope(row):
+                        dropped_out_of_scope += 1
+                        continue
                     if rid:
                         seen_ids.add(rid)
                     entries.append(row)
@@ -719,6 +747,24 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
                     break
             if len(entries) >= 8:
                 break
+
+        # 画像条目单独取，不与 query 相关度混算，见 _fetch_profile_entries 注释。
+        profile_ids: set[int] = set()
+        for row in _fetch_profile_entries():
+            rid = int(getattr(row, "id", 0) or 0)
+            if rid and rid in seen_ids:
+                profile_ids.add(rid)
+                continue
+            if rid:
+                seen_ids.add(rid)
+                profile_ids.add(rid)
+            entries.append(row)
+
+        if dropped_out_of_scope:
+            _log.info(
+                "knowledge_search_scope_filtered | user=%s | dropped=%d | kept=%d",
+                current_user_id, dropped_out_of_scope, len(entries),
+            )
 
         if entries:
             entries = sorted(
@@ -733,33 +779,48 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
         if not entries:
             return ToolCallResult(
                 ok=True,
-                data={"count": 0, "query_variants": query_variants},
+                data={
+                    "count": 0,
+                    "query_variants": query_variants,
+                    "dropped_out_of_scope": dropped_out_of_scope,
+                },
                 display=f"知识库中未找到 '{query}' 相关内容",
             )
 
         lines = [f"【知识库搜索: {query}】"]
         result_rows: list[dict[str, Any]] = []
         scoped_hits = 0
+        query_matched = 0
         for e in entries:
             cat_tag = f"[{e.category}]" if e.category else ""
             scope_score = _scope_score(e)
             if scope_score >= 100:
                 scoped_hits += 1
+            entry_id = int(getattr(e, "id", 0) or 0)
+            # 画像条目是按 user: 标签取的，与 query 无关。标出来源，否则模型会把
+            # 「你最喜欢宋岳庭-上帝为何要这样」当成「抑郁症」这个 query 的检索命中。
+            from_profile = bool(entry_id and entry_id in profile_ids)
+            if not from_profile:
+                query_matched += 1
             scope_tag = " (当前用户)" if scope_score >= 100 else ""
-            lines.append(f"- {cat_tag} {e.title}{scope_tag}")
+            origin_tag = " (本人画像，与本次查询无关)" if from_profile else ""
+            lines.append(f"- {cat_tag} {e.title}{scope_tag}{origin_tag}")
             if e.content:
                 lines.append(f"  {clip_text(e.content, 200)}")
             tags = [normalize_text(str(item)) for item in (getattr(e, "tags", []) or []) if normalize_text(str(item))]
             result_rows.append(
                 {
-                    "id": int(getattr(e, "id", 0) or 0),
+                    "id": entry_id,
                     "category": normalize_text(str(getattr(e, "category", ""))),
                     "title": normalize_text(str(getattr(e, "title", ""))),
                     "content": normalize_text(str(getattr(e, "content", ""))),
                     "source": normalize_text(str(getattr(e, "source", ""))),
                     "tags": tags,
+                    "from_profile": from_profile,
                 }
             )
+        if not query_matched:
+            lines.insert(1, f"（没有与 '{query}' 字面相关的条目，以下只是本人画像记录）")
         return ToolCallResult(
             ok=True,
             data={
@@ -767,6 +828,9 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
                 "results": result_rows,
                 "query_variants": query_variants,
                 "scoped_hits": scoped_hits,
+                "query_matched": query_matched,
+                "profile_only": query_matched == 0,
+                "dropped_out_of_scope": dropped_out_of_scope,
             },
             display="\n".join(lines),
         )
@@ -797,6 +861,10 @@ async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any])
     content = normalize_text(str(args.get("content", "")))
     if not content:
         content = normalize_text(str(args.get("text", "")))
+    # kind 是模型声明的性质，不填按 fact 走普通入库 —— 任何未声明的调用都不会被改道去改名。
+    kind = normalize_text(str(args.get("kind", ""))).lower() or "fact"
+    if kind not in _LEARN_KNOWLEDGE_KINDS:
+        kind = "fact"
     category = str(args.get("category", "learned")).strip()
     tags_value = args.get("tags", "")
     tags: list[str] = []
@@ -814,7 +882,14 @@ async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any])
         return ToolCallResult(ok=False, error="missing title")
     if not content:
         return ToolCallResult(ok=False, error="missing content")
-    if looks_like_preferred_name_knowledge(title, content, tags):
+    # 意图由模型声明，不再嗅探内容。原来这里是
+    # `if looks_like_preferred_name_knowledge(title, content, tags):` ——
+    # 一张字面正则表，实测把「我是程序员」「我叫小柯」「我是这个群的群主」「我是女生」
+    # 这类事实全部劫持成改名请求：知识条目**静默丢弃**、用户被当面改口叫「程序员」，
+    # 而模型收到 ok=True「已更新用户偏好称呼」，于是对用户说「记住了」却查不到。
+    # 枚举与 core/knowledge_updater.py 的抽取器同一套（fact/preference/
+    # music_preference/preferred_name/correction）。
+    if kind == "preferred_name":
         cfg = context.get("config", {})
         bot_cfg = cfg.get("bot", {}) if isinstance(cfg, dict) and isinstance(cfg.get("bot"), dict) else {}
         bot_aliases = [bot_cfg.get("name", ""), *(bot_cfg.get("nicknames", []) or []), "yuki", "yukiko", "雪"]
@@ -830,6 +905,10 @@ async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any])
             at_other_user_ids=context.get("at_other_user_ids", []) or [],
             reply_to_user_id=normalize_text(str(context.get("reply_to_user_id", ""))),
             bot_id=normalize_text(str(context.get("bot_id", ""))),
+            # 称呼取模型写进 content 的声明值，不再对原文跑正则：
+            # 正则要求整句以「叫我X」收尾，实测带标点、带「大家」、带「666」就抽不出来，
+            # 用户只会收到「群聊称呼学习需要明确点名我…」这句与真实原因无关的文案。
+            declared_name=content,
         )
         if not decision.allow:
             return ToolCallResult(
@@ -913,7 +992,10 @@ async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any])
             content=content,
             tags=normalized_tags,
             confidence=confidence,
-            is_correction=bool(args.get("is_correction", False)),
+            # kind='correction' 与 is_correction=True 等价，与 core/knowledge_updater.py
+            # 的 `is_correction = bool(item.get("is_correction") or kind == "correction")` 对齐，
+            # 否则模型声明了 correction 却仍被当成低把握新值而覆盖不了旧值。
+            is_correction=bool(args.get("is_correction", False)) or kind == "correction",
         )
         action = result.get("action") if isinstance(result, dict) else None
         entry_id = result.get("id") if isinstance(result, dict) else None

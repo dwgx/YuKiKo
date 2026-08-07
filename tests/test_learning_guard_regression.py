@@ -116,6 +116,8 @@ class LearningGuardRegressionTests(unittest.TestCase):
 
     def test_memory_only_learns_safe_preferred_name(self) -> None:
         memory = self._make_memory()
+        # 未指向 bot（结构门不过）：不学。「妈妈/老婆」这类称呼合不合适归模型，
+        # 不再靠 _GROUP_ROLEPLAY_NAMES 词表判断 —— 那条词表已删除。
         memory.add_message(
             conversation_id="group:1",
             user_id="u1",
@@ -125,13 +127,14 @@ class LearningGuardRegressionTests(unittest.TestCase):
             timestamp=datetime.now(timezone.utc),
             metadata={
                 "is_private": False,
-                "mentioned": True,
-                "explicit_bot_addressed": True,
+                "mentioned": False,
+                "explicit_bot_addressed": False,
                 "bot_id": "bot",
             },
         )
         self.assertEqual(memory.get_preferred_name("u1", fallback_name="背影"), "背影")
 
+        # 指向 bot 且结构安全：学。
         memory.add_message(
             conversation_id="group:1",
             user_id="u1",
@@ -154,7 +157,9 @@ class LearningGuardRegressionTests(unittest.TestCase):
 
         result = asyncio.run(
             _handle_learn_knowledge(
-                {"title": "用户称呼偏好", "content": "以后叫我阿背"},
+                # 改名由模型声明 kind='preferred_name' + content 直接写称呼本身；
+                # 不再对原文跑正则嗅探（带标点/带「大家」/带「666」会被正则误拒）。
+                {"title": "用户称呼偏好", "content": "阿背", "kind": "preferred_name"},
                 {
                     "knowledge_base": kb,
                     "memory_engine": memory,
@@ -198,8 +203,10 @@ class LearningGuardRegressionTests(unittest.TestCase):
             )
         )
 
-        self.assertFalse(result.ok)
-        self.assertEqual(kb.add_calls, 0)
+        # 未声明 kind → 作为普通知识入库，绝不触发改名；内容嗅探式改名分流已删除。
+        self.assertTrue(result.ok)
+        self.assertEqual(len(kb.upserts), 1, "未声明 kind 的调用应作为普通知识写入知识库")
+        self.assertEqual(memory.get_preferred_name("u1", fallback_name="背影"), "背影", "入库不应触发改名")
 
     def test_knowledge_updater_blocks_group_profile_learning_without_safe_context(self) -> None:
         updater = KnowledgeUpdater(

@@ -1,5 +1,7 @@
 # 下一窗口工作计划
 
+> **历史计划 / archive，不是当前 handoff。** 当前接手状态统一看 [`TAKEOVER-2026-08-07.md`](TAKEOVER-2026-08-07.md)。本文件保留旧会话的实验设计与推理；其中的测试计数、运行状态、待办顺序和“已修完”结论可能已被后续工作树改动取代。
+
 > 分支 `refactor/prompt-driven-intent`,基线 `b38cc06`,当前 50 个提交。
 > 测试不变量:**0 failed**(通过数会随新增测试涨,不要写死)。
 > 两个自检脚本必须 exit 0:`scripts/agent_deep_selfcheck.py`、`scripts/project_takeover_selfcheck.py`。

@@ -42,7 +42,7 @@ _VIDEO_DOMAINS = (
 )
 
 NAVIGATE_SECTION_TOOL = "navigate_section"
-CONTROL_TOOLS = ("think", "final_answer", NAVIGATE_SECTION_TOOL)
+CONTROL_TOOLS = ("think", "final_answer", NAVIGATE_SECTION_TOOL, "read_skill")
 
 
 @dataclass(slots=True)

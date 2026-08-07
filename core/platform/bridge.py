@@ -1,0 +1,111 @@
+"""Phase 2 接线：把 OneBot11Adapter 接进 engine 消息管线。
+
+事件 → 简化 EngineMessage → `engine.handle_message()` → 回复 → `adapter.send_by_session`。
+
+这是 NoneBot 主路径之外的可选平台路径（配置 `platform.onebot11.enabled` 启用）。
+完整替换 app.py 的 NoneBot 绑定（含媒体/回复/发送保护全量对齐）需真机验证后再切。
+对应 docs/zh-CN/RECONSTRUCTION-BLUEPRINT.md §4.4（2）（4）。
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+from typing import Any
+
+from core.engine_types import EngineMessage, EngineResponse
+from core.platform.components import MessageChain, Plain
+from core.platform.manager import PlatformManager
+from core.platform.onebot11 import OneBot11Adapter
+
+_log = logging.getLogger("yukiko.platform.bridge")
+
+
+def _event_to_engine_message(
+    event: dict[str, Any],
+    *,
+    dispatcher: Any,
+    bot_id: str,
+    trace_builder: Any,
+) -> EngineMessage:
+    conversation_id = str(event.get("conversation_id", ""))
+    seq = dispatcher.next_seq(conversation_id)
+    trace_id = trace_builder(conversation_id=conversation_id, seq=seq)
+    return EngineMessage(
+        conversation_id=conversation_id,
+        user_id=str(event.get("user_id", "")),
+        user_name="",
+        text=str(event.get("text", "")),
+        message_id=str(event.get("message_id", "")),
+        seq=seq,
+        raw_segments=[],
+        queue_depth=dispatcher.pending_count(conversation_id),
+        mentioned=False,
+        is_private=bool(event.get("is_private", False)),
+        timestamp=datetime.now(UTC),
+        group_id=int(event.get("group_id", 0) or 0),
+        bot_id=bot_id,
+        at_other_user_ids=[],
+        trace_id=trace_id,
+        event_payload={},
+    )
+
+
+async def _reply_to_session(adapter: OneBot11Adapter, session_id: str, response: EngineResponse) -> None:
+    text = str(getattr(response, "text", "") or "")
+    if not text:
+        return
+    await adapter.send_by_session(session_id, MessageChain([Plain(text)]))
+
+
+async def register_onebot11_platform(
+    engine: Any,
+    dispatcher: Any,
+    *,
+    config: dict[str, Any] | None = None,
+    trace_builder: Any = None,
+) -> PlatformManager | None:
+    """创建并启动 OneBot11Adapter 平台路径（事件 → engine 消息管线）。
+
+    `config` 含 host/port/access_token/bot_id；未配置 `platform.onebot11.enabled=true`
+    时不启动（避免无真机时改变生产路径）。返回 PlatformManager（可 stop）。
+    """
+    cfg = dict(config or {})
+    if not cfg.get("enabled"):
+        _log.info("onebot11_platform_disabled | config gate off")
+        return None
+
+    def _default_trace_builder(conversation_id: str, seq: int) -> str:
+        return f"platform-{conversation_id}-{seq}"
+
+    builder = trace_builder or _default_trace_builder
+    adapter = OneBot11Adapter(
+        {
+            "host": cfg.get("host", "0.0.0.0"),
+            "port": int(cfg.get("port", 8082)),
+            "access_token": cfg.get("access_token", ""),
+            "bot_id": cfg.get("bot_id", ""),
+        }
+    )
+    bot_id = str(cfg.get("bot_id", ""))
+
+    async def message_handler(event: dict[str, Any]) -> None:
+        try:
+            payload = _event_to_engine_message(
+                event, dispatcher=dispatcher, bot_id=bot_id, trace_builder=builder
+            )
+            response: EngineResponse = await engine.handle_message(payload)
+            await _reply_to_session(adapter, str(event.get("conversation_id", "")), response)
+        except Exception:
+            _log.warning("platform_message_error", exc_info=True)
+
+    adapter.message_handler = message_handler
+    manager = PlatformManager()
+    manager.register("onebot11", adapter)
+    await manager.start()
+    _log.info(
+        "onebot11_platform_started | host=%s | port=%d",
+        cfg.get("host", "0.0.0.0"),
+        int(cfg.get("port", 8082)),
+    )
+    return manager

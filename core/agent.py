@@ -22,10 +22,13 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
+from core.agent_checkpoint import AgentTurnCheckpoint
 from core.agent_tools import AgentToolRegistry, ToolCallResult
 from core import prompt_loader as _pl
 from core.prompt_navigator import NAVIGATE_SECTION_TOOL, NavigatorState, PromptNavigator
 from core.prompt_policy import PromptPolicy
+from core.loop_guard import LoopGuard, ToolCallRecord, hash_call, hash_result
+from core.tool_call_repair import repair_tool_call
 from services.model_client import ModelClient
 from utils.intent import (
     looks_like_qq_profile_analysis_request as _shared_qq_profile_request,
@@ -74,6 +77,12 @@ _RE_MACHINE_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+(?::
 _RE_MACHINE_KEY_VALUE = re.compile(r"\b[A-Za-z][A-Za-z0-9_]*\s*=\s*-?[A-Za-z0-9_.:-]+")
 # 剥掉机器标识符后至少还要剩这么多汉字，才算得上一句能发给用户的话。
 _MIN_CJK_FOR_USER_FACING_FAILURE = 6
+
+# 内部编排步：不是模型对外做的事，只是循环自己记的账。
+# `policy_guard` 是本地策略拦截，`think` 是模型自言自语，`navigate_section` 是换分区。
+# 判「本回合有没有真的工具失败」时必须排除它们，否则 policy_guard 每次拦一下
+# 就会被算成一次失败，空 final_answer 永远走不到「模型主动沉默」那条路。
+_INTERNAL_STEP_TOOLS = frozenset({"policy_guard", "think", NAVIGATE_SECTION_TOOL})
 # 弱模型防护: 匹配所有标点/符号/空白 (用于检测纯标点垃圾)
 _RE_PUNCTUATION_CJK = re.compile(
     r"[\s\u3000-\u303f\uff01-\uff0f\uff1a-\uff20\uff3b-\uff40\uff5b-\uff65"
@@ -132,6 +141,16 @@ class AgentContext:
     message_text: str
     original_message_text: str = ""
     explicit_bot_addressed: bool = False
+    # 本回合是不是「有人在跟机器人说话」。纯结构事实，engine 侧应显式传
+    # `explicit_bot_addressed or trigger.followup_candidate`。
+    # None = engine 没告诉我们 → `AgentLoop._is_directed_turn()` 用
+    # is_private / mentioned / explicit_bot_addressed / 引用了机器人的消息
+    # 这四个已有结构事实推断。
+    #
+    # 为什么需要它：旁听探测轮（群友互相聊天）里模型判定不该插话，紧接着
+    # LLM 超时，兜底就把「这次没拿到有效结果，你补充一点信息我再来」发进群 ——
+    # 群友根本没跟机器人说话。非指向轮的兜底一律不外发。
+    was_directed: bool | None = None
     message_id: str = ""
     reply_to_message_id: str = ""
     raw_segments: list[dict[str, Any]] = field(default_factory=list)
@@ -357,10 +376,16 @@ class AgentLoop:
         tool_registry: AgentToolRegistry,
         config: dict[str, Any],
         persona_text: str = "",
+        skill_registry: Any = None,
+        step_journal: Any = None,
+        checkpoint_dir: Any = None,
     ):
         self.model_client = model_client
         self.tool_registry = tool_registry
         self.persona_text = persona_text
+        self.skill_registry = skill_registry
+        self.step_journal = step_journal
+        self.checkpoint_dir = checkpoint_dir
         self.config: dict[str, Any] = {}
         self.max_steps = 8
         self.max_tokens = 4096
@@ -376,12 +401,19 @@ class AgentLoop:
         self.llm_step_timeout_seconds_after_tool = 32
         self.navigator_obvious_tool_timeout_seconds = 5.0
         self.navigator_preflight_plain_text = False
+        self.navigator_preflight_timeout_seconds = 8.0
+        self.navigator_post_timeout_retry_seconds = 5.0
+        self.navigator_chain_wall_clock_seconds = 55.0
         self.navigator_retry_model = ""
         self.total_timeout_seconds = 0
         self.queue_timeout_margin_seconds = 8
         self.prompt_policy = PromptPolicy.from_config({})
         self._admin_ids: set[str] = set()
         self._pending_high_risk_actions: dict[str, dict[str, Any]] = {}
+        # Claude Code 式 PreToolUse 审批钩子：外部可注册 `(ctx, tool_name, tool_args) -> str`，
+        # 返回非空字符串 = 阻止该工具并回喂这段说明。内置高风险守卫作为机制保留，
+        # 钩子是额外的可插拔审批层。
+        self._pre_tool_hooks: list[Any] = []
         self.high_risk_control_enable = True
         self.high_risk_default_require_confirmation = True
         self.high_risk_categories: set[str] = {"admin"}
@@ -508,6 +540,24 @@ class AgentLoop:
         self.navigator_preflight_plain_text = bool(
             agent_cfg.get("navigator_preflight_plain_text", False)
         )
+        # preflight 的小 prompt 预算。原先是硬编码的 `min(20.0, …)`，实测
+        # （storage/logs/yukiko.log）**有收益**的 preflight 均值只有 8.6s，而
+        # 51 次超时的均值 17.9s、37 次返回 same_section 的均值 9.4s ——
+        # 合计 562 秒纯白等。压到 8s 基本不损失命中，砍掉的是长尾白等。
+        self.navigator_preflight_timeout_seconds = self._clamp_float_cfg(
+            agent_cfg.get("navigator_preflight_timeout_seconds", 8.0), 3.0, 30.0, 8.0
+        )
+        # 主 LLM 已经超时 = provider 当前不可用，同一个 provider 上再要 20 秒
+        # 只是把用户的等待翻倍。实测 trace 118886-14：20s preflight + 45s 主调用
+        # + 20s retry = 85 秒，用户只拿到一句「我这边处理超时了」。
+        self.navigator_post_timeout_retry_seconds = self._clamp_float_cfg(
+            agent_cfg.get("navigator_post_timeout_retry_seconds", 5.0), 0.0, 30.0, 5.0
+        )
+        # 一整条 preflight → 主调用 → retry 链的统一墙钟上限。没有它，三段
+        # 各自独立看 `remaining`，20/45/20 就这么叠成 85 秒。
+        self.navigator_chain_wall_clock_seconds = self._clamp_float_cfg(
+            agent_cfg.get("navigator_chain_wall_clock_seconds", 55.0), 10.0, 300.0, 55.0
+        )
         self.navigator_retry_model = normalize_text(
             str(agent_cfg.get("navigator_retry_model", "") or "")
         )
@@ -585,6 +635,52 @@ class AgentLoop:
     def _is_explicit_bot_addressed(self, ctx: "AgentContext") -> bool:
         """是否明确在和机器人说话（用于高风险管理工具额外护栏）。"""
         return bool(ctx.is_private or ctx.mentioned)
+
+    @staticmethod
+    def _resolve_navigator_retry_timeout(
+        remaining: float, budget_cap: float | None
+    ) -> float:
+        """小 prompt 重试的实际预算；`<= 0` 表示别调了。
+
+        `budget_cap` 是调用点给的这一段的上限（preflight 一档、主调用超时后
+        一档），`remaining` 是本回合墙钟剩余。取两者较小值，留 2 秒余量给
+        解析和后续步骤。原先这里硬编码 `min(20.0, …)`，preflight 与超时后
+        retry 共用同一个 20 秒 —— 于是 20 + 45 + 20 叠成 85 秒。
+        """
+        cap = 20.0 if budget_cap is None else float(budget_cap)
+        if cap <= 0:
+            return 0.0
+        timeout = min(cap, max(0.0, remaining - 2.0))
+        # 低于 2.5 秒的调用几乎必然超时，白付一次延迟，不如直接跳过。
+        return timeout if timeout > 2.5 else 0.0
+
+    @staticmethod
+    def _clamp_float_cfg(raw: Any, low: float, high: float, default: float) -> float:
+        """读一个秒数型配置并夹到 [low, high]；读不出数就用 default。"""
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return default
+        if value != value:  # NaN
+            return default
+        return max(low, min(high, value))
+
+    @staticmethod
+    def _is_directed_turn(ctx: AgentContext) -> bool:
+        """本回合有没有人在跟机器人说话。全是结构事实，不看词义。
+
+        engine 显式给了 `was_directed` 就听它的；没给（None）时用四个已有结构
+        事实推断：私聊 / 被 @ / engine 已判定 explicit_bot_addressed / 引用了
+        机器人自己的消息。都不成立 = 旁听探测轮。
+        """
+        explicit = getattr(ctx, "was_directed", None)
+        if explicit is not None:
+            return bool(explicit)
+        if ctx.is_private or ctx.mentioned or ctx.explicit_bot_addressed:
+            return True
+        # 引用机器人自己的发言 = 在跟机器人接话，属于指向。
+        bot_id = normalize_text(str(ctx.bot_id))
+        return bool(bot_id) and normalize_text(str(ctx.reply_to_user_id)) == bot_id
 
     @staticmethod
     def _compile_regex_patterns(values: Any) -> tuple[re.Pattern[str], ...]:
@@ -907,6 +1003,28 @@ class AgentLoop:
             return json.loads(text)
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
+
+        # Hermes 式第三级兜底：模型可能把 JSON 包在 ```json ... ``` markdown 块里。
+        md_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL)
+        if md_match:
+            candidate = md_match.group(1).strip()
+            if candidate:
+                try:
+                    parsed_md = json.loads(candidate)
+                    if isinstance(parsed_md, dict):
+                        AgentLoop._malformed_args_recovered_total += 1
+                        _log.info(
+                            "agent_tool_args_markdown_extracted | trace=%s | step=%d | tool=%s",
+                            trace_id,
+                            step_idx,
+                            tool_name,
+                        )
+                        return parsed_md
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+                # markdown 里可能是串接 JSON（如 `{}{"keyword": "z"}`）——让 raw_decode
+                # 跑在提取出的 candidate 上，而不是带 ``` 围栏的原始文本。
+                text = candidate
 
         merged: dict[str, Any] = {}
         decoder = json.JSONDecoder()
@@ -1233,6 +1351,34 @@ class AgentLoop:
         )
         return "这个操作要在目标群里由那个群的管理员发起，我不能跨群执行。"
 
+    def register_pre_tool_hook(self, hook: Any) -> None:
+        """注册 PreToolUse 审批钩子（Claude Code hooks 风格）。
+
+        hook 签名 `(ctx, tool_name, tool_args) -> str`：返回非空字符串 = 阻止该工具
+        并回喂该字符串作为说明；返回空字符串 = 放行。异常钩子被跳过并记日志。
+        """
+        if callable(hook):
+            self._pre_tool_hooks.append(hook)
+
+    def _run_pre_tool_hooks(
+        self, ctx: AgentContext, tool_name: str, tool_args: dict[str, Any]
+    ) -> str:
+        """按注册顺序跑所有审批钩子；第一个非空返回即阻止。"""
+        for hook in self._pre_tool_hooks:
+            try:
+                block_message = hook(ctx, tool_name, tool_args)
+            except Exception:
+                _log.warning(
+                    "pre_tool_hook_error | trace=%s | tool=%s",
+                    getattr(ctx, "trace_id", "-"),
+                    tool_name,
+                    exc_info=True,
+                )
+                continue
+            if block_message:
+                return str(block_message)
+        return ""
+
     def _guard_high_risk_tool_call(
         self, ctx: AgentContext, tool_name: str, tool_args: dict[str, Any]
     ) -> str:
@@ -1361,6 +1507,14 @@ class AgentLoop:
         # 成功次数，不是调用次数。
         succeeded_tool_signatures: set[str] = set()
         consecutive_tool_errors: dict[str, int] = {}
+        # OpenClaw 式实时 loop 检测：同参数同结果连续空转分级止损。
+        # 阈值按 max_steps 校准（默认 8）：warning=2 / critical=4 / circuit=8，
+        # 保证单回合内 critical/circuit 真实可达，不是死代码。
+        loop_guard = LoopGuard(
+            warning=max(2, self.max_steps // 3),
+            critical=max(3, self.max_steps // 2),
+            circuit_breaker=max(4, self.max_steps),
+        )
         consecutive_think_count = 0
         # 追踪工具已发送的媒体（避免 final_answer 重复发送）
         tool_sent_media: set[str] = set()
@@ -1368,11 +1522,39 @@ class AgentLoop:
         has_media = bool(ctx.media_summary) or bool(ctx.reply_media_summary)
         total_timeout = self._resolve_total_timeout_seconds(ctx, has_media)
         deadline_ts = t0 + total_timeout
+        # preflight → 主 LLM → 超时后 retry 这三段的**统一**墙钟上限。
+        # 原先三段各自只看 `remaining`（对齐总预算 / queue 超时），于是
+        # 20 + 45 + 20 独立叠加成 85 秒（实测 trace 118886-14）。
+        chain_deadline_ts = min(
+            deadline_ts, t0 + float(self.navigator_chain_wall_clock_seconds)
+        )
         strict_tool_policy_blocked = False
 
         # 工具超时不计入步骤预算（最多 3 次免费），避免慢工具浪费推理机会
         _tool_timeout_free_budget = 3
         step_idx = -1
+        # 回合 checkpoint：超时重试时从上次保存的 step_idx/messages/steps 恢复。
+        checkpoint = (
+            AgentTurnCheckpoint(self.checkpoint_dir)
+            if getattr(self, "checkpoint_dir", None)
+            else None
+        )
+        if checkpoint is not None:
+            restored = checkpoint.load(ctx.trace_id)
+            if restored:
+                restored_messages = restored.get("messages")
+                if isinstance(restored_messages, list) and restored_messages:
+                    messages = restored_messages
+                    if messages and messages[0].get("role") == "system":
+                        messages[0] = {"role": "system", "content": system_prompt}
+                restored_steps = restored.get("steps")
+                if isinstance(restored_steps, list):
+                    steps = restored_steps
+                step_idx = int(restored.get("step_idx", -1))
+                _log.info(
+                    "agent_turn_restored | trace=%s | step_idx=%d | steps=%d | msgs=%d",
+                    ctx.trace_id, step_idx, len(steps), len(messages),
+                )
         while step_idx < self.max_steps - 1:
             step_idx += 1
             # 总超时保护
@@ -1409,7 +1591,8 @@ class AgentLoop:
                     step_idx=step_idx,
                     tool_calls_made=tool_calls_made,
                     steps=steps,
-                    remaining=remaining,
+                    remaining=min(remaining, chain_deadline_ts - time.monotonic()),
+                    budget_cap=self.navigator_preflight_timeout_seconds,
                 )
                 preflight_elapsed = time.monotonic() - preflight_started_at
             if preflight_section:
@@ -1445,6 +1628,16 @@ class AgentLoop:
                         llm_budget, float(self.llm_step_timeout_seconds_after_tool)
                     )
                 llm_timeout = min(llm_budget, max(6.0, remaining - 1.5))
+                if tool_calls_made == 0:
+                    # 第一步还归 preflight→主调用→retry 这条链管：把已经花掉的
+                    # preflight 时间从链预算里扣掉，主调用不能独立再要满 45 秒。
+                    chain_left = chain_deadline_ts - time.monotonic()
+                    # 链预算再紧也要给主调用留点时间，否则等于取消它 ——
+                    # 一次都没试比超时更糟。但这个地板**不能反过来抬高**
+                    # 已经算出来的 llm_timeout（配置故意给小预算时要听配置），
+                    # 所以地板本身也被 llm_timeout 夹住。
+                    floor = min(6.0, llm_timeout)
+                    llm_timeout = max(floor, min(llm_timeout, chain_left))
                 # 分区已经有明确证据时，不等满 llm_budget：早点超时进小 prompt 重试，
                 # 由模型在该分区的真实工具里挑一个，而不是本地 if-链替它挑。
                 if (
@@ -1502,7 +1695,7 @@ class AgentLoop:
                         )
                     _log.info(
                         "agent_llm_step_latency | trace=%s | step=%d | elapsed=%.1fs "
-                        "| tools=%d | native=%s",
+                        "| tools=%d | native=%s | outcome=ok",
                         ctx.trace_id,
                         step_idx,
                         time.monotonic() - llm_started_at,
@@ -1510,6 +1703,18 @@ class AgentLoop:
                         native_tool_calling,
                     )
                 except asyncio.TimeoutError:
+                    # 这条 latency 日志此前**只在成功分支**记录，超时样本被系统性
+                    # 排除：实测 n=108 max=39.8s 让人得出「45s 阈值很安全」，同期
+                    # 却真有 7 次 45s 超时。少了这条，下一个人会再次读出假结论。
+                    _log.info(
+                        "agent_llm_step_latency | trace=%s | step=%d | elapsed=%.1fs "
+                        "| tools=%d | native=%s | outcome=timeout",
+                        ctx.trace_id,
+                        step_idx,
+                        time.monotonic() - llm_started_at,
+                        len(schemas),
+                        native_tool_calling,
+                    )
                     _log.warning(
                         "agent_llm_timeout | trace=%s | step=%d | timeout=%.1fs "
                         "| elapsed=%.1fs",
@@ -1528,12 +1733,18 @@ class AgentLoop:
                             retry_tool[0],
                         )
                     else:
+                        # 主 LLM 刚刚超时，同一个 provider 上再要 20 秒只是把
+                        # 用户的等待翻倍。这一段单独一档小预算，并且仍受
+                        # 整条链的墙钟上限约束。
                         retry_tool = await self._navigator_timeout_tool_retry(
                             ctx=ctx,
                             step_idx=step_idx,
                             tool_calls_made=tool_calls_made,
                             steps=steps,
-                            remaining=remaining,
+                            remaining=min(
+                                remaining, chain_deadline_ts - time.monotonic()
+                            ),
+                            budget_cap=self.navigator_post_timeout_retry_seconds,
                         )
                     if retry_tool:
                         tool_name_retry, tool_args_retry = retry_tool
@@ -1558,7 +1769,10 @@ class AgentLoop:
                             step_idx=step_idx,
                             tool_calls_made=tool_calls_made,
                             steps=steps,
-                            remaining=remaining,
+                            remaining=min(
+                                remaining, chain_deadline_ts - time.monotonic()
+                            ),
+                            budget_cap=self.navigator_post_timeout_retry_seconds,
                         )
                     if retry_section:
                         if retry_section[2]:
@@ -1591,6 +1805,10 @@ class AgentLoop:
                             ctx, steps, tool_calls_made, t0, "llm_timeout"
                         )
                     elif not synthetic_tool_call:
+                        if not self._is_directed_turn(ctx):
+                            return self._undirected_silent_result(
+                                ctx, steps, tool_calls_made, t0, "llm_timeout"
+                            )
                         fallback = _pl.get_message(
                             "llm_timeout_fallback",
                             "我这边处理超时了。你可以把问题再精简一点，我马上继续。",
@@ -1604,6 +1822,10 @@ class AgentLoop:
                     if not synthetic_tool_call and parsed is None:
                         if steps:
                             return await self._build_fallback_result(
+                                ctx, steps, tool_calls_made, t0, "llm_timeout"
+                            )
+                        if not self._is_directed_turn(ctx):
+                            return self._undirected_silent_result(
                                 ctx, steps, tool_calls_made, t0, "llm_timeout"
                             )
                         fallback = _pl.get_message(
@@ -1644,7 +1866,13 @@ class AgentLoop:
                             ctx, steps, tool_calls_made, t0, "llm_error"
                         )
                     else:
-                        # undirected 场景可按配置静默，默认不静默，避免用户感知“装死”。
+                        # 旁听探测轮：没人跟机器人说话，内部故障文案不进群。
+                        # 原先这条静默还要 `allow_silent_on_llm_error`（默认 False）
+                        # 才生效，于是默认配置下群友闲聊也会收到一句错误文案。
+                        if not self._is_directed_turn(ctx):
+                            return self._undirected_silent_result(
+                                ctx, steps, tool_calls_made, t0, "llm_error"
+                            )
                         if (
                             self.allow_silent_on_llm_error
                             and not ctx.mentioned
@@ -2076,19 +2304,26 @@ class AgentLoop:
                                 }
                             )
                             continue
-                # 工具型任务保护：明显应先调工具的请求，禁止 0 工具直接 final_answer。
-                # 但如果 bot 已经用 think 推理过并决定不回复（空 text），允许通过。
-                has_thought = any(s.get("tool") == "think" for s in steps)
-                user_msg_clean = normalize_text(ctx.message_text)
+                # 空 final_answer 的归属判定。
+                #
+                # 「要不要在这个群里说话」是模型的决定，表达方式就是交一个空
+                # final_answer（CLAUDE.md）。原先这里额外要求 `has_thought`、
+                # `not ctx.mentioned`、`not ctx.is_private`、`len(msg) <= 4`
+                # 四个条件才认这次沉默 —— 这四个都跟「模型想不想沉默」无关。
+                # 实测（2026-08-06 真实群日志）239 条 final_answer 里 60 条 text 为空，
+                # 而 agent_intentional_silence 全天只有 5 次：至少 55 次模型选择的沉默
+                # 被改写成一句道歉发进群。
+                #
+                # 唯一该看的结构事实是：本回合有没有真的工具失败。
+                # 有失败步 → 空 final_answer 可能是「工具挂了没话说」→ 走兜底；
+                # 无失败步（含零工具调用）→ 空 final_answer 就是模型选择沉默 → 保持空。
+                failed_steps = self._real_tool_failure_count(steps)
                 intentional_silence = (
-                    has_thought
-                    and not text
+                    not text
                     and not image_url
                     and not video_url
                     and not audio_file
-                    and not ctx.mentioned
-                    and not ctx.is_private
-                    and len(user_msg_clean) <= 4
+                    and failed_steps == 0
                 )
                 if tool_name == "final_answer":
                     # 某些模型会把真正的工具调用 JSON 包在 final_answer.text 里，尝试恢复。
@@ -2139,10 +2374,24 @@ class AgentLoop:
                         )
                 if tool_name == "final_answer":
                     if not text and not image_url and not video_url and not audio_file:
-                        # bot 用 think 推理后决定不回复 → 保持空文本（intentional silence）
-                        # 其他情况（没 think 过就空 final_answer）→ AI 生成兜底
-                        if not intentional_silence:
-                            text = self._last_success_display(steps)
+                        if intentional_silence:
+                            _log.info(
+                                "agent_intentional_silence | trace=%s | step=%d | steps=%d",
+                                ctx.trace_id,
+                                step_idx,
+                                len(steps),
+                            )
+                        else:
+                            # 有真失败步才允许代码替模型造话。记一条日志，
+                            # 让「模型沉默」和「代码造话」以后可以分开聚合。
+                            _log.info(
+                                "agent_fallback_over_empty_final | trace=%s | failed_steps=%d",
+                                ctx.trace_id,
+                                failed_steps,
+                            )
+                            text = self._scrub_internal_state_text(
+                                self._last_success_display(steps)
+                            )
                             if not text:
                                 text = await self._ai_fallback_reply(
                                     ctx,
@@ -2344,9 +2593,82 @@ class AgentLoop:
                     steps=steps,
                 )
 
+            # validate-then-repair：先做通用修复（P0/P2，透明标记），再走猜参兜底。
+            tool_schema_obj = (
+                self.tool_registry.get_schema(tool_name)
+                if hasattr(self.tool_registry, "get_schema")
+                else None
+            )
+            tool_schema = getattr(tool_schema_obj, "parameters", None) if tool_schema_obj is not None else None
+            tool_args, repairs = repair_tool_call(tool_args, schema=tool_schema, tool_name=tool_name)
+            if repairs:
+                _log.info(
+                    "agent_tool_args_repaired | trace=%s | step=%d | tool=%s | repairs=%s",
+                    ctx.trace_id, step_idx, tool_name, ",".join(repairs),
+                )
             # 自动补全缺失参数
             tool_args = self._normalize_tool_args(tool_name, tool_args, ctx)
+            # PreToolUse 审批钩子：任一钩子返回非空说明即阻止该工具。
+            pre_tool_block = self._run_pre_tool_hooks(ctx, tool_name, tool_args)
+            if pre_tool_block:
+                steps.append(
+                    {
+                        "step": step_idx,
+                        "tool": tool_name,
+                        "ok": False,
+                        "error": "pre_tool_hook_block",
+                    }
+                )
+                guard_payload = self._build_guard_feedback_payload(
+                    tool_name=tool_name,
+                    steps=steps,
+                    reason_key="pre_tool_hook_block",
+                    reason_text=clip_text(pre_tool_block, 500),
+                )
+                _log.info(
+                    "agent_pre_tool_hook_block | trace=%s | step=%d | tool=%s",
+                    ctx.trace_id, step_idx, tool_name,
+                )
+                self._append_tool_result(
+                    messages, parsed, assistant_msg, response_text, guard_payload
+                )
+                continue
             tool_signature = f"{tool_name}|{self._build_args_signature(tool_args)}"
+            # OpenClaw 式实时 loop 检测：同参数同结果连续空转，warn 记日志、critical/circuit 阻断。
+            loop_level, loop_streak = loop_guard.veto_if_looping(
+                tool_name, hash_call(tool_name, tool_args)
+            )
+            if loop_level in ("critical", "circuit"):
+                steps.append(
+                    {
+                        "step": step_idx,
+                        "tool": tool_name,
+                        "ok": False,
+                        "error": f"loop_guard:{loop_level}:{loop_streak}",
+                    }
+                )
+                guard_payload = self._build_guard_feedback_payload(
+                    tool_name=tool_name,
+                    steps=steps,
+                    reason_key="loop_guard_loop",
+                    reason_text=(
+                        "检测到同一工具和参数连续空转多次，结果没有进展。"
+                        "请换一个工具或直接 final_answer，不要重复相同调用。"
+                    ),
+                )
+                _log.info(
+                    "agent_loop_guard | trace=%s | step=%d | tool=%s | level=%s | streak=%d",
+                    ctx.trace_id, step_idx, tool_name, loop_level, loop_streak,
+                )
+                self._append_tool_result(
+                    messages, parsed, assistant_msg, response_text, guard_payload
+                )
+                continue
+            if loop_level == "warn":
+                _log.warning(
+                    "agent_loop_guard_warn | trace=%s | step=%d | tool=%s | streak=%d",
+                    ctx.trace_id, step_idx, tool_name, loop_streak,
+                )
             if self.repeat_tool_guard_enable:
                 repeated_tool_counts[tool_signature] = (
                     repeated_tool_counts.get(tool_signature, 0) + 1
@@ -2513,6 +2835,44 @@ class AgentLoop:
                 consecutive_tool_errors[result_tool_name] = 0
             else:
                 consecutive_tool_errors[result_tool_name] = consecutive_tool_errors.get(result_tool_name, 0) + 1
+            # 记录稳定指纹供 loop 检测：同参数同结果（含 ok/display/error）才算空转。
+            loop_guard.observe(
+                ToolCallRecord(
+                    name=result_tool_name,
+                    args_hash=hash_call(result_tool_name, tool_args),
+                    result_hash=hash_result(
+                        {
+                            "ok": result.ok,
+                            "display": result.display,
+                            "error": result.error,
+                        }
+                    ),
+                )
+            )
+            # 轻量 checkpoint：每步工具调用落 journal（若配置了 step_journal），供诊断/恢复。
+            if getattr(self, "step_journal", None) is not None:
+                try:
+                    self.step_journal.record(
+                        trace_id=ctx.trace_id,
+                        step=step_idx,
+                        tool=result_tool_name,
+                        ok=result.ok,
+                        error=result.error or "",
+                        elapsed_ms=self._elapsed(t0),
+                    )
+                except Exception:
+                    pass
+            # 完整恢复 checkpoint：每步保存 step_idx/messages/steps，超时重试可续跑。
+            if checkpoint is not None:
+                try:
+                    checkpoint.save(
+                        trace_id=ctx.trace_id,
+                        step_idx=step_idx,
+                        messages=messages,
+                        steps=steps,
+                    )
+                except Exception:
+                    pass
 
             # 记录 side-effect 发送工具已发送的媒体 URL
             if result.ok and result_tool_name in self._SIDE_EFFECT_SEND_TOOLS:
@@ -2566,6 +2926,13 @@ class AgentLoop:
             }
             if result.error:
                 tool_result_msg["tool_result"]["error"] = result.error
+            if not result.ok and result.error:
+                # Hermes 式错误回喂：让模型根据 error 自纠重调，而不是代码侧猜参。
+                # _normalize_tool_args 仍保留为最后防线，但优先引导模型自己改。
+                tool_result_msg["tool_result"]["retry_instruction"] = (
+                    "工具调用失败。请阅读上方 error 定位原因，用正确的参数重新调用该工具；"
+                    "如果参数确实无法满足，直接向用户说明失败和替代方案。不要臆造工具结果。"
+                )
             if compact_data:
                 tool_result_msg["tool_result"]["data"] = compact_data
 
@@ -2810,6 +3177,7 @@ class AgentLoop:
         tool_calls_made: int,
         steps: list[dict[str, Any]],
         remaining: float,
+        budget_cap: float | None = None,
     ) -> tuple[str, dict[str, Any]] | None:
         """Ask a tiny prompt for the next tool when the active section stalls.
 
@@ -2846,8 +3214,8 @@ class AgentLoop:
         ]
         if not domain_tools:
             return None
-        timeout = min(20.0, max(3.0, remaining - 2.0))
-        if timeout <= 2.5:
+        timeout = self._resolve_navigator_retry_timeout(remaining, budget_cap)
+        if timeout <= 0:
             return None
         tool_docs = ""
         try:
@@ -2991,6 +3359,7 @@ class AgentLoop:
         tool_calls_made: int,
         steps: list[dict[str, Any]],
         remaining: float,
+        budget_cap: float | None = None,
     ) -> tuple[str, str, str, dict[str, Any]] | None:
         """Use a tiny LLM router prompt when the full Agent prompt stalls before any tool.
 
@@ -3008,8 +3377,8 @@ class AgentLoop:
         navigator = self._load_prompt_navigator()
         if not navigator.enabled:
             return None
-        timeout = min(20.0, max(3.0, remaining - 2.0))
-        if timeout <= 2.5:
+        timeout = self._resolve_navigator_retry_timeout(remaining, budget_cap)
+        if timeout <= 0:
             return None
         # 到这一行，这次 LLM 调用一定会发生 —— 无论后面走哪条 return，
         # 本回合的延迟已经付掉了。原先只有「选中分区」和「超时」两条留日志，
@@ -3451,6 +3820,20 @@ class AgentLoop:
             prompt += f"## 工具优先级\n{tool_priority_text}\n\n"
         if navigator_prompt:
             prompt += f"{navigator_prompt}\n\n"
+        # 渐进式披露：只注入技能目录（name+description），全文由 read_skill 命中后读取。
+        if getattr(self, "skill_registry", None) is not None:
+            try:
+                if self.skill_registry.load():
+                    skill_catalog = self.skill_registry.describe()
+                    if skill_catalog:
+                        prompt += (
+                            "## 可用技能\n"
+                            f"{skill_catalog}\n\n"
+                            "技能详细步骤需用 read_skill 工具读取全文后再执行。\n\n"
+                        )
+            except Exception:
+                # 技能目录异常不应影响主流程。
+                _log.warning("skill_catalog_render_failed", exc_info=True)
         if selected_tool_hints:
             prompt += (
                 "## 工具细粒度提示（按本轮可用工具）\n"
@@ -5298,12 +5681,38 @@ class AgentLoop:
         return result
 
     @staticmethod
+    def _real_tool_failure_count(steps: list[dict[str, Any]]) -> int:
+        """本回合真正失败/被拦的**外部**工具步数量。
+
+        纯结构判定，不看文本语义：
+        - `_INTERNAL_STEP_TOOLS` 里的编排步一律不算（它们没有 `ok` 字段，
+          算进去会让每一轮都像是有失败）；
+        - 有 `ok` 字段就以它为准；
+        - 没有 `ok` 但带 `error` / `blocked` 的（权限拦截、unknown_tool 等）
+          说明这次工具没跑成，算失败。
+        """
+        failures = 0
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            tool_name = normalize_text(str(step.get("tool", ""))).lower()
+            if not tool_name or tool_name in _INTERNAL_STEP_TOOLS:
+                continue
+            if "ok" in step:
+                if not bool(step.get("ok")):
+                    failures += 1
+                continue
+            if step.get("error") or step.get("blocked"):
+                failures += 1
+        return failures
+
+    @staticmethod
     def _last_success_display(steps: list[dict[str, Any]]) -> str:
         for step in reversed(steps):
             if not bool(step.get("ok")):
                 continue
             tool_name = normalize_text(str(step.get("tool", ""))).lower()
-            if tool_name in {"policy_guard", "think", NAVIGATE_SECTION_TOOL}:
+            if tool_name in _INTERNAL_STEP_TOOLS:
                 continue
             display = normalize_text(str(step.get("display", "")))
             if display:
@@ -5570,6 +5979,30 @@ class AgentLoop:
 
         return None
 
+    def _undirected_silent_result(
+        self,
+        ctx: AgentContext,
+        steps: list[dict[str, Any]],
+        tool_calls_made: int,
+        t0: float,
+        reason: str,
+    ) -> AgentResult:
+        """非指向轮次的兜底出口：只记日志，不外发任何文本或媒体。"""
+        _log.info(
+            "agent_undirected_fallback_silent | trace=%s | reason=%s | steps=%d",
+            ctx.trace_id,
+            reason,
+            len(steps),
+        )
+        return AgentResult(
+            reply_text="",
+            action="reply",
+            reason="agent_undirected_silent",
+            tool_calls_made=tool_calls_made,
+            total_time_ms=self._elapsed(t0),
+            steps=steps,
+        )
+
     async def _build_fallback_result(
         self,
         ctx: AgentContext,
@@ -5579,13 +6012,18 @@ class AgentLoop:
         reason: str,
     ) -> AgentResult:
         """从已有步骤中提取最佳回复作为兜底。"""
+        # 旁听探测轮的兜底一律不外发：没人跟机器人说话，内部故障文案更没理由进群。
+        if not self._is_directed_turn(ctx):
+            return self._undirected_silent_result(
+                ctx, steps, tool_calls_made, t0, reason
+            )
         # 找最后一个可直接面向用户展示的步骤。
         for step in reversed(steps):
             display = normalize_text(str(step.get("display", "")))
             if not display or not bool(step.get("ok")):
                 continue
             tool_name = normalize_text(str(step.get("tool", ""))).lower()
-            if tool_name in {"policy_guard", "think", NAVIGATE_SECTION_TOOL}:
+            if tool_name in _INTERNAL_STEP_TOOLS:
                 continue
             if self._skip_raw_tool_display_in_fallback(tool_name, display):
                 continue
@@ -5625,7 +6063,7 @@ class AgentLoop:
             tool_name = normalize_text(str(step.get("tool", ""))).lower()
             if self._skip_raw_tool_display_in_fallback(tool_name, display):
                 continue
-            if tool_name in {"policy_guard", "think", NAVIGATE_SECTION_TOOL}:
+            if tool_name in _INTERNAL_STEP_TOOLS:
                 continue
             if bool(step.get("display_synthetic")) or not self._is_user_presentable_failure_text(display):
                 _log.warning(
@@ -5758,14 +6196,23 @@ class AgentLoop:
         content = normalize_text(text)
         if not content:
             return ""
+        rewritten = cls._rewrite_outside_urls(content, cls._scrub_machine_tokens)
+        return _RE_WHITESPACE_2PLUS.sub(" ", rewritten).strip()
+
+    @staticmethod
+    def _rewrite_outside_urls(content: str, rewrite: Any) -> str:
+        """把 `rewrite` 只作用在 URL 之外的片段上，URL 原样保留。
+
+        媒体链接要靠 URL 原文投递，任何按结构剥字符的清洗都不能伸进 URL 里。
+        """
         parts: list[str] = []
         cursor = 0
         for match in _RE_URL_EXTRACT.finditer(content):
-            parts.append(cls._scrub_machine_tokens(content[cursor : match.start()]))
+            parts.append(rewrite(content[cursor : match.start()]))
             parts.append(match.group(0))
             cursor = match.end()
-        parts.append(cls._scrub_machine_tokens(content[cursor:]))
-        return _RE_WHITESPACE_2PLUS.sub(" ", "".join(parts)).strip()
+        parts.append(rewrite(content[cursor:]))
+        return "".join(parts)
 
     @staticmethod
     def _scrub_machine_tokens(chunk: str) -> str:
@@ -6051,7 +6498,13 @@ class AgentLoop:
         content = normalize_text(text)
         if not content:
             return ""
-        content = _RE_LOCAL_FILE_REF.sub("[本地文件路径已隐藏，发送层会直接投递]", content)
+        # `_RE_LOCAL_FILE_REF` 带 `(?i)`，它的 Windows 盘符分支 `[A-Z]:[\\/]` 会把
+        # 任意 `https://…` 里的 `s://…` 当成 `s:` 盘的路径吃掉，只剩一个 `http`。
+        # 所以这条替换必须只作用在 URL 之外 —— 图片/视频链接要靠原文投递。
+        content = cls._rewrite_outside_urls(
+            content,
+            lambda chunk: _RE_LOCAL_FILE_REF.sub("[本地文件路径已隐藏，发送层会直接投递]", chunk),
+        )
         content = _RE_SYNTHETIC_USER_PREFIX.sub("", content).strip()
         if cls._looks_like_english_refusal_text(content):
             return "这个请求我不能帮你处理（涉及不当或露骨内容）。你可以换个健康、合规的话题，我继续帮你。"
@@ -6071,7 +6524,11 @@ class AgentLoop:
             and ('"tool"' in trimmed or '"function"' in trimmed or '"name"' in trimmed)
         ):
             return ""
-        return content
+        # 模型自己写的 final_answer 此前从不过这道清洗，于是
+        # `analyze_image 执行超时（>45s）` 被当正文发进群（实测日志 L961，
+        # 群友引用可见）。清洗器本来就能剥掉它（输出 `执行超时（>45s）`），
+        # 只是没接上。按结构剥机器标识符 / k=v，URL 原样保留。
+        return cls._scrub_internal_state_text(content)
 
     @classmethod
     def _build_failure_situation_hint(cls, categories: list[str]) -> str:

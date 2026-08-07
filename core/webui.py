@@ -3307,6 +3307,84 @@ async def chat_send_text(request: Request):
     return {"ok": True, "message_id": message_id}
 
 
+def _configured_smoke_test_peers(engine: Any) -> set[str]:
+    """读配置里显式声明的冒烟测试目标（可用逗号或列表给多个）。默认空 = 一个都不允许。"""
+    cfg = getattr(engine, "config", None)
+    webui_cfg = cfg.get("webui", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(webui_cfg, dict):
+        webui_cfg = {}
+    raw = webui_cfg.get("smoke_test_peer", "")
+    if isinstance(raw, (list, tuple, set)):
+        candidates = [str(item) for item in raw]
+    else:
+        candidates = str(raw or "").replace("，", ",").split(",")
+    return {normalize_text(item) for item in candidates if normalize_text(item)}
+
+
+async def _verify_claimed_identity(
+    *,
+    engine: Any,
+    chat_type: str,
+    peer_id: str,
+    context_user_id: str,
+    context_user_name: str,
+    bot_id: str,
+    trace_id: str,
+) -> str:
+    """请求自带身份（context_user_name）时，确认这个身份在目标会话里真实存在。
+
+    2026-08-06 事故：冒烟脚本用 `context_user_id=3001001001` /
+    `context_user_name="测试用户"` 打真实群 974118886，模型照着这个假身份称呼，
+    「测试用户，这个不能帮你找哦」被投递进群并被群主引用回复，同窗口群友开始
+    追问「这是ai吗」。合成身份进真实群是污染，不是测试。
+
+    判据全是结构事实：群成员表里有没有这个 user_id / 私聊 peer 是不是他本人 /
+    目标群是否在配置里被显式声明为冒烟目标。不看昵称文本，不做词义判断。
+    返回空串表示放行，否则返回拒绝原因。
+    """
+    if not context_user_name:
+        return ""
+
+    cfg = getattr(engine, "config", None)
+    webui_cfg = cfg.get("webui", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(webui_cfg, dict):
+        webui_cfg = {}
+    if not bool(webui_cfg.get("synthetic_identity_guard", True)):
+        return ""
+
+    if peer_id in _configured_smoke_test_peers(engine):
+        return ""
+
+    if chat_type == "private":
+        if context_user_id and context_user_id != peer_id:
+            return "private_peer_mismatch"
+        return ""
+
+    if not context_user_id.isdigit():
+        return "context_user_id_not_numeric"
+
+    try:
+        info = await _onebot_call(
+            "get_group_member_info",
+            bot_id=bot_id,
+            group_id=int(peer_id),
+            user_id=int(context_user_id),
+        )
+    except Exception as exc:
+        _log.warning(
+            "webui_identity_member_lookup_failed | trace=%s | peer=%s | user=%s | error=%s",
+            trace_id,
+            peer_id,
+            context_user_id,
+            clip_text(normalize_text(str(exc)), 180),
+        )
+        return "member_lookup_failed"
+
+    if not isinstance(info, dict) or not normalize_text(str(info.get("user_id", ""))):
+        return "not_a_group_member"
+    return ""
+
+
 @router.post("/chat/agent-text", dependencies=[Depends(_check_auth)])
 async def chat_agent_text(request: Request):
     body = await request.json()
@@ -3360,6 +3438,30 @@ async def chat_agent_text(request: Request):
     async def runtime_api_call(api: str, **kwargs: Any) -> Any:
         payload = await call_napcat_bot_api(bot_runtime, api, **kwargs)
         return _unwrap_onebot_payload(payload)
+
+    identity_reject = await _verify_claimed_identity(
+        engine=_engine,
+        chat_type=resolved_type,
+        peer_id=peer_id,
+        context_user_id=context_user_id,
+        context_user_name=context_user_name,
+        bot_id=bot_id,
+        trace_id=trace_id,
+    )
+    if identity_reject:
+        _log.warning(
+            "webui_synthetic_identity_rejected | trace=%s | chat=%s | peer=%s | user=%s | reason=%s",
+            trace_id,
+            resolved_type,
+            peer_id,
+            context_user_id or "-",
+            identity_reject,
+        )
+        raise HTTPException(
+            403,
+            "拒绝投递：请求自带的身份无法在目标会话中验证"
+            f"（{identity_reject}）。要往真实会话注入合成身份，请把该会话号写进 webui.smoke_test_peer。",
+        )
 
     resolved_reply_user_id = context_user_id
     resolved_reply_user_name = context_user_name

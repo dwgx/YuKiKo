@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Current takeover entry
+
+Read [`TAKEOVER-2026-08-07.md`](TAKEOVER-2026-08-07.md) before relying on any status, test count,
+live-run claim, or next-step order. [`HANDOFF.md`](HANDOFF.md) is only the short router to that page;
+the older long handoff is archived under `docs/archive/`. Do not treat historical logs in
+`MIGRATION_TODO.md` or `NEXT-SESSION-PLAN.md` as current verification.
+
 ## Overview
 
 YuKiKo is a NoneBot2 + OneBot V11 QQ bot (Python 3.11+) with an LLM agent, **~179 built-in

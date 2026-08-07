@@ -74,8 +74,14 @@ class GroupMemoryAndKnowledgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertTrue(result.ok)
                 rows = result.data.get("results", [])
-                self.assertGreaterEqual(len(rows), 2)
+                self.assertGreaterEqual(len(rows), 1)
                 self.assertEqual(rows[0]["title"], "喜欢喝什么")
+                self.assertEqual(rows[0]["content"], "10001 喜欢乌龙茶")
+                # 作用域标签是硬边界：他人 user: 标签条目被丢弃，不是只降权。
+                self.assertTrue(
+                    all("20002 喜欢可乐" not in row["content"] for row in rows),
+                    "越界条目（他人 user: 标签）应被丢弃",
+                )
                 self.assertGreaterEqual(int(result.data.get("scoped_hits", 0)), 1)
             finally:
                 kb.close()
