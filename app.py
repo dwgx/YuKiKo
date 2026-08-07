@@ -657,6 +657,87 @@ def _build_file_uri(path_like: Path | str) -> str:
     return build_napcat_file_reference(path_like)
 
 
+def _silk_encode_for_record_sync(audio_path: Path, max_seconds: int) -> Path | None:
+    """把音频转成 QQ 可播放的 silk，并截断到 max_seconds。
+
+    QQ 语音消息必须是 silk 编码（NapCat 对 mp3 record 不保证自动转码，
+    实际点歌直发 mp3 在 QQ 端点开无法播放）。这里用 ffmpeg 解出 PCM，
+    再用 pilk/pysilk 编码成 silk。输入已是合规 silk 时直接复用。
+    返回 None 表示转换失败（调用方回退原文件）。
+    """
+    try:
+        if audio_path is None or not audio_path.exists() or not audio_path.is_file():
+            return None
+        if not _FFMPEG_BIN:
+            return None
+        if audio_path.suffix.lower() == ".silk":
+            if max_seconds <= 0:
+                return audio_path
+            try:
+                dur = _probe_audio_duration_seconds_sync(audio_path)
+                if dur > 0 and dur <= max_seconds + 0.8:
+                    return audio_path
+            except Exception:
+                pass
+            # 超长 silk：尝试 ffmpeg 解码重转（silk 解码可能不支持，失败则回退原文件）。
+        try:
+            import pilk
+            encoder = pilk
+        except ImportError:
+            try:
+                import pysilk as encoder  # type: ignore[no-redef]
+            except ImportError:
+                _log.warning("voice_silk_encode_skip | no pilk/pysilk")
+                return None
+        silk_path = audio_path.with_suffix(".silk")
+        # 已有合规的 silk（如 music 层生成过）直接复用，避免重复编码。
+        if silk_path.exists() and silk_path.stat().st_size >= 256:
+            try:
+                dur = _probe_audio_duration_seconds_sync(silk_path)
+                if max_seconds <= 0 or (dur > 0 and dur <= max_seconds + 0.8):
+                    return silk_path
+            except Exception:
+                pass
+        pcm_path = audio_path.with_suffix(".silk_src.pcm")
+        try:
+            cmd = [
+                _FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "warning",
+                "-i", str(audio_path), "-vn", "-ac", "1", "-ar", "24000", "-f", "s16le",
+            ]
+            if max_seconds > 0:
+                cmd += ["-t", str(max_seconds)]
+            cmd.append(str(pcm_path))
+            proc = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
+            if proc.returncode != 0 or not pcm_path.exists() or pcm_path.stat().st_size < 256:
+                return None
+            try:
+                encoder.encode(str(pcm_path), str(silk_path), sample_rate=24000, tencent=True)
+            except TypeError:
+                try:
+                    encoder.encode(str(pcm_path), str(silk_path), 24000, True)
+                except TypeError:
+                    with pcm_path.open("rb") as src, silk_path.open("wb") as dst:
+                        encoder.encode(src, dst, 24000, True)
+            if not silk_path.exists() or silk_path.stat().st_size < 256:
+                return None
+            _log.info(
+                "voice_silk_encode_ok | src=%s | silk=%s | size=%d",
+                audio_path.name,
+                silk_path.name,
+                silk_path.stat().st_size,
+            )
+            return silk_path
+        finally:
+            pcm_path.unlink(missing_ok=True)
+    except Exception as exc:
+        _log.warning("voice_silk_encode_fail | %s", exc)
+        return None
+
+
+async def _silk_encode_for_record(audio_path: Path, max_seconds: int) -> Path | None:
+    return await asyncio.to_thread(_silk_encode_for_record_sync, audio_path, max_seconds)
+
+
 def _split_voice_audio_file_sync(audio_path: Path, segment_seconds: int, max_segments: int) -> list[Path]:
     """把长音频切成多个小段，供 record 分段发送。"""
     if segment_seconds <= 0 or max_segments <= 0:
@@ -2015,7 +2096,18 @@ def register_handlers(engine: YukikoEngine) -> None:
                             original_duration = await asyncio.to_thread(_probe_audio_duration_seconds_sync, effective_audio_path)
                             is_long_audio = original_duration > float(voice_send_max_seconds) + 0.8
 
-                        full_audio_uri = _build_file_uri(effective_audio_path if effective_audio_path is not None else audio_source)
+                        # QQ 语音必须 silk 编码：发送前把源音频转成 silk（截断到 max_seconds），
+                        # 否则 mp3 直发在 QQ 端点开无法播放（NapCat 不保证自动转码）。
+                        record_audio_path = effective_audio_path
+                        if effective_audio_path is not None:
+                            silk_candidate = await _silk_encode_for_record(
+                                effective_audio_path, voice_send_max_seconds
+                            )
+                            if silk_candidate is not None:
+                                record_audio_path = silk_candidate
+                        full_audio_uri = _build_file_uri(
+                            record_audio_path if record_audio_path is not None else audio_source
+                        )
                         try_full_for_current = voice_send_try_full_first
                         split_enable_for_current = voice_send_split_enable
                         if is_music_voice_action and voice_send_music_force_full:
@@ -2067,7 +2159,12 @@ def register_handlers(engine: YukikoEngine) -> None:
                                 split_ok = True
                                 split_sent_count = 0
                                 for part_idx, part_path in enumerate(split_parts, start=1):
-                                    part_uri = _build_file_uri(part_path)
+                                    part_silk = await _silk_encode_for_record(
+                                        part_path, segment_seconds
+                                    )
+                                    part_uri = _build_file_uri(
+                                        part_silk if part_silk is not None else part_path
+                                    )
                                     part_ok = await send_msg(Message(MessageSegment.record(file=part_uri)))
                                     if not part_ok:
                                         split_ok = False
@@ -2127,7 +2224,16 @@ def register_handlers(engine: YukikoEngine) -> None:
                                     trimmed,
                                 )
 
-                            fallback_uri = _build_file_uri(send_audio_path if send_audio_path is not None else audio_source)
+                            fallback_silk = None
+                            if send_audio_path is not None:
+                                fallback_silk = await _silk_encode_for_record(
+                                    send_audio_path, voice_send_max_seconds
+                                )
+                            fallback_uri = _build_file_uri(
+                                fallback_silk
+                                if fallback_silk is not None
+                                else (send_audio_path if send_audio_path is not None else audio_source)
+                            )
                             # 已完整尝试过同一路径则不重复发送。
                             if fallback_uri and (not tried_full_direct or fallback_uri != full_audio_uri):
                                 sent_voice = await send_msg(Message(MessageSegment.record(file=fallback_uri)))
