@@ -61,8 +61,16 @@ class AgentToolRegistry:
         "set_qq_avatar",
         "set_online_status",
         "set_self_longnick",
+        "set_qq_profile",
         "create_skill",
         "test_in_sandbox",
+        # QZone 查询族：用 owner 配置的 QZone cookie 查**任意 QQ 号**的空间/相册/原图，
+        # 是跨用户数据通道，普通用户不得用 owner 凭证当 oracle。
+        "get_qzone_profile",
+        "get_qzone_moods",
+        "get_qzone_albums",
+        "analyze_qzone",
+        "get_qzone_photos",
     }
 
     # 群管理员 + 超级管理员可用 — 群内管理操作
@@ -96,7 +104,6 @@ class AgentToolRegistry:
         "delete_group_folder",
         "set_group_add_request",
         "set_friend_add_request",
-        "set_qq_profile",
         "upload_group_file",
         "upload_private_file",
     }
@@ -404,6 +411,16 @@ class AgentToolRegistry:
         if not expected_type:
             return value, True
         if expected_type == "string":
+            if value is None:
+                # None 不应被 str() 成 "None" 当真值传进 handler（会触发空 API 调用/写库）。
+                # 转空串，交给必填检查或 handler 的空值兜底处理。
+                return "", True
+            if isinstance(value, list):
+                # LLM 常把声明为 string 的数组参数发成真数组；转成逗号分隔串，
+                # 避免 str(list) 产出 "['a', 'b']" 这种带引号的脏值（tags/emotions 等）。
+                return ", ".join(
+                    normalize_text(str(item)) for item in value if normalize_text(str(item))
+                ), True
             return str(value), True
         if expected_type == "integer":
             if isinstance(value, bool):

@@ -174,12 +174,16 @@ class MutationToolsAreEitherGatedOrExplicitlyExemptTests(unittest.TestCase):
             "delete_group_folder",
             "set_group_add_request",
             "set_friend_add_request",
-            "set_qq_profile",
             "upload_group_file",
             "upload_private_file",
         ):
             with self.subTest(name=name):
                 self.assertIn(name, AgentToolRegistry._GROUP_ADMIN_TOOLS, name)
+
+    def test_set_qq_profile_is_super_admin(self) -> None:
+        """set_qq_profile 改机器人全局身份，与 set_qq_avatar/set_online_status 同级。"""
+        self.assertIn("set_qq_profile", AgentToolRegistry._SUPER_ADMIN_TOOLS)
+        self.assertNotIn("set_qq_profile", AgentToolRegistry._GROUP_ADMIN_TOOLS)
 
 
 class UploadPathAllowlistIsSharedTests(unittest.TestCase):

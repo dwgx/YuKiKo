@@ -924,6 +924,24 @@ async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any])
     # 而模型收到 ok=True「已更新用户偏好称呼」，于是对用户说「记住了」却查不到。
     # 枚举与 core/knowledge_updater.py 的抽取器同一套（fact/preference/
     # music_preference/preferred_name/correction）。
+    #
+    # 安全门提前：模型声明的 safety_review=unsafe 拒绝所有 kind，包括 preferred_name，
+    # 防止 unsafe 内容借"改称呼"路径绕过安全门。
+    safety_review = _resolve_safety_review(args)
+    if safety_review == "unsafe":
+        _kb_record_audit(
+            kb,
+            "knowledge_write_rejected",
+            title=title,
+            category=category,
+            reason="safety_review_unsafe",
+            declared_by="model",
+        )
+        return ToolCallResult(
+            ok=False,
+            error="unsafe_knowledge_content",
+            display="按你自己的安全判定，这条内容不写入知识库。",
+        )
     if kind == "preferred_name":
         cfg = context.get("config", {})
         bot_cfg = cfg.get("bot", {}) if isinstance(cfg, dict) and isinstance(cfg.get("bot"), dict) else {}
@@ -969,22 +987,6 @@ async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any])
             ok=True,
             data=payload or {},
             display=f"已更新用户偏好称呼: {preferred_name or decision.candidate}",
-        )
-    # 安全门：拒绝机制保留，判据换成模型声明的 safety_review（原来是硬编码脏词表）。
-    safety_review = _resolve_safety_review(args)
-    if safety_review == "unsafe":
-        _kb_record_audit(
-            kb,
-            "knowledge_write_rejected",
-            title=title,
-            category=category,
-            reason="safety_review_unsafe",
-            declared_by="model",
-        )
-        return ToolCallResult(
-            ok=False,
-            error="unsafe_knowledge_content",
-            display="按你自己的安全判定，这条内容不写入知识库。",
         )
     if category not in ("fact", "meme", "learned"):
         category = "learned"

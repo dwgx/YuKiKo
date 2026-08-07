@@ -287,6 +287,7 @@ def _qzone_mood_payload(mood: Any) -> dict[str, Any]:
         "create_time": str(getattr(mood, "create_time", "")),
         "comment_count": int(getattr(mood, "comment_count", 0) or 0),
         "like_count": int(getattr(mood, "like_count", 0) or 0),
+        "forward_count": int(getattr(mood, "forward_count", 0) or 0),
         "pic_urls": list(getattr(mood, "pic_urls", []) or []),
         "video_url": str(getattr(mood, "video_url", "")),
         "video_cover_url": str(getattr(mood, "video_cover_url", "")),

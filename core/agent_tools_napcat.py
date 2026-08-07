@@ -967,12 +967,26 @@ def _summarize_credential_payload(payload: Any, domain: str) -> dict[str, Any]:
 
     has_csrf = any(body.get(key) not in (None, "", 0) for key in _CSRF_PAYLOAD_KEYS)
 
+    def _has_rkey(body: dict[str, Any]) -> bool:
+        for key, value in body.items():
+            if "rkey" in normalize_text(str(key)).lower():
+                return True
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict) and any(
+                        "rkey" in normalize_text(str(ik)).lower() for ik in item
+                    ):
+                        return True
+        return False
+
     summary: dict[str, Any] = {
         "redacted": True,
         "cookies_present": bool(cookie_keys),
         "cookie_key_count": len(cookie_keys),
         "cookie_keys": cookie_keys[:_MAX_REPORTED_COOKIE_KEYS],
         "csrf_token_present": has_csrf,
+        # rkey 是 TTL 受限的媒体访问密钥，同样只报存在性，不回值。
+        "rkey_present": _has_rkey(body),
         # QZone 等接口签名依赖 p_skey/skey，缺它就是"凭证没配好"，这是排障要的事实。
         "has_qzone_signing_key": any(k in {"p_skey", "skey"} for k in cookie_keys),
     }
@@ -1009,7 +1023,7 @@ async def _handle_napcat_credential_probe(
         )
 
     summary = _summarize_credential_payload(raw, domain)
-    if summary["cookies_present"] or summary["csrf_token_present"]:
+    if summary["cookies_present"] or summary["csrf_token_present"] or summary.get("rkey_present"):
         display = "QQ 凭证通道可用（已脱敏，仅返回存在性；凭证值不对外提供）"
     else:
         display = "QQ 凭证未配置或已失效：上游没有返回可用凭证"
@@ -2256,13 +2270,13 @@ def _register_napcat_extended_tools(registry: AgentToolRegistry) -> None:
         ["group_id"], _handle_get_group_at_all_remain),
 
         # ── 请求处理 ──
-        ("set_friend_add_request", "处理好友添加请求(同意/拒绝)。\n使用场景: 用户说'同意好友请求'、'拒绝加好友'时使用。\nflag 从好友请求事件中获取",
+        ("set_friend_add_request", "处理好友添加请求(同意/拒绝)。\n使用场景: 用户说'同意好友请求'、'拒绝加好友'时使用。\nflag 从好友请求事件中获取。\napprove 必须显式填写 true=同意 / false=拒绝，漏填默认拒绝",
         {"flag": ("string", "请求标识(从事件获取)"), "approve": ("boolean", "true=同意, false=拒绝"), "remark": ("string", "好友备注(同意时可选)")},
-        ["flag"], _handle_set_friend_add_request),
+        ["flag", "approve"], _handle_set_friend_add_request),
 
-        ("set_group_add_request", "处理加群请求或邀请(同意/拒绝)。\n使用场景: 用户说'同意入群'、'拒绝加群请求'时使用。\nflag 从加群请求事件中获取",
+        ("set_group_add_request", "处理加群请求或邀请(同意/拒绝)。\n使用场景: 用户说'同意入群'、'拒绝加群请求'时使用。\nflag 从加群请求事件中获取。\napprove 必须显式填写 true=同意 / false=拒绝，漏填默认拒绝",
         {"flag": ("string", "请求标识(从事件获取)"), "sub_type": ("string", "'add'=主动加群, 'invite'=被邀请"), "approve": ("boolean", "true=同意, false=拒绝"), "reason": ("string", "拒绝理由(拒绝时可选)")},
-        ["flag", "sub_type"], _handle_set_group_add_request),
+        ["flag", "sub_type", "approve"], _handle_set_group_add_request),
 
         # ── 好友操作 ──
         ("delete_friend", "删除好友。不可逆操作!\n使用场景: 用户说'删除好友XX'时使用",
@@ -2462,8 +2476,8 @@ def _register_napcat_extended_tools(registry: AgentToolRegistry) -> None:
         {"user_id": ("integer", "目标QQ号"), "group_id": ("integer", "群号(群聊时填，私聊不填)")},
         ["user_id"], _handle_generic_napcat_api),
 
-        ("nc_get_rkey", "获取NapCat rkey(用于媒体资源访问)。\n使用场景: 内部使用，获取媒体访问密钥",
-        {}, [], _handle_generic_napcat_api),
+        ("nc_get_rkey", "检查NapCat rkey媒体访问密钥是否可用，只返回存在性摘要(可用/失效)，不返回密钥值。\n使用场景: 内部使用，排查媒体资源访问是否可用",
+        {}, [], _handle_napcat_credential_probe),
 
         ("get_robot_uin_range", "获取机器人QQ号段范围。\n使用场景: 需要判断某QQ号是否是机器人时使用",
         {}, [], _handle_generic_napcat_api),
@@ -4173,7 +4187,8 @@ async def _handle_set_friend_add_request(args: dict[str, Any], context: dict[str
     flag = str(args.get("flag", ""))
     if not flag:
         return ToolCallResult(ok=False, error="missing flag")
-    approve = args.get("approve", True)
+    # 安全默认：approve 缺失时默认拒绝，避免模型漏传被静默同意放陌生人进群/加好友。
+    approve = args.get("approve", False)
     kwargs: dict[str, Any] = {"flag": flag, "approve": approve}
     if args.get("remark"):
         kwargs["remark"] = str(args["remark"])
@@ -4186,7 +4201,8 @@ async def _handle_set_group_add_request(args: dict[str, Any], context: dict[str,
     sub_type = str(args.get("sub_type", "add"))
     if not flag:
         return ToolCallResult(ok=False, error="missing flag")
-    approve = args.get("approve", True)
+    # 安全默认：approve 缺失时默认拒绝，避免模型漏传被静默同意放陌生人进群。
+    approve = args.get("approve", False)
     kwargs: dict[str, Any] = {"flag": flag, "sub_type": sub_type, "approve": approve}
     if args.get("reason"):
         kwargs["reason"] = str(args["reason"])

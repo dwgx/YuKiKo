@@ -321,7 +321,7 @@ def _make_qzone_handler(mode: str, config: dict[str, Any]) -> ToolHandler:
                     lines.append(f"  {content}")
                     if m.pic_urls:
                         lines.append(f"  [含{len(m.pic_urls)}张图片]")
-                    lines.append(f"  评论:{m.comment_count} 转发:{m.like_count}")
+                    lines.append(f"  评论:{m.comment_count} 转发:{m.forward_count} 点赞:{m.like_count}")
                 display = "\n".join(lines)
                 return ToolCallResult(
                     ok=True,

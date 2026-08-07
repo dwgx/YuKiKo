@@ -232,23 +232,24 @@ class NapcatCredentialRedactionRegressionTests(unittest.TestCase):
 
 
 class NapcatRkeyKnownExposureTests(unittest.TestCase):
-    """`nc_get_rkey` 仍回传 rkey 值 —— 本 wave 只报告，未修改。
+    """`nc_get_rkey` 已脱敏：只返回存在性摘要，不回传 rkey 值。
 
     rkey 是 TTL 受限的媒体访问密钥，会出现在 QQ CDN 直链里
     （`core/tools_vision.py:129-130` 就依赖 URL 中带 rkey），
-    与登录凭证不同级，且不在 C1 范围内。
-    这个用例把现状钉成**已知且有意为之**，而不是被忽略的漏洞：
-    如果以后有人把它也脱敏了，本用例会红，届时请连同本文件的注释一起更新。
+    与登录凭证不同级，但既然走脱敏 probe，值就不该离开 handler。
+    这个用例钉住**脱敏后不回值**的契约；任何人以后把值放回 data 这里必须红。
     """
 
-    def test_rkey_currently_still_returned_documented_exposure(self):
+    def test_rkey_redacted_not_returned(self):
         payload = {"rkeys": [{"type": "private", "rkey": "&rkey=DEADBEEFCAFE", "ttl": "86400"}]}
         result, _ = _call("nc_get_rkey", payload)
         self.assertTrue(result.ok, result.error)
-        self.assertIn("DEADBEEFCAFE", str(result.data))
+        blob = f"{result.data}|{result.display}|{result.error}"
+        self.assertNotIn("DEADBEEFCAFE", blob, "rkey 值泄漏进了 tool_result 载荷")
+        self.assertTrue(result.data.get("rkey_present"), "应报告 rkey 存在性")
 
     def test_mask_helper_would_cover_rkey_if_wired(self):
-        """脱敏工具本身已能覆盖 rkey，接线只是一个决定。"""
+        """脱敏工具本身能覆盖 rkey（已接线）。"""
         self.assertNotIn(
             "DEADBEEFCAFE", _mask_credential_text("rkey=DEADBEEFCAFE&x=1")
         )

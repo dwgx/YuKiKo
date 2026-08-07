@@ -95,6 +95,7 @@ class QZoneMood:
     create_time: str = ""
     comment_count: int = 0
     like_count: int = 0
+    forward_count: int = 0
     pic_urls: list[str] = field(default_factory=list)
     video_url: str = ""
     video_cover_url: str = ""
@@ -275,7 +276,8 @@ class QZoneClient:
                 content=str(item.get("content", "") or ""),
                 create_time=time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "",
                 comment_count=int(item.get("cmtnum", 0) or 0),
-                like_count=int(item.get("fwdnum", 0) or 0),
+                like_count=int(item.get("likenum", 0) or 0),
+                forward_count=int(item.get("fwdnum", 0) or 0),
                 pic_urls=pics,
                 video_url=video_url,
                 video_cover_url=video_cover_url,
