@@ -1578,13 +1578,16 @@ def _resolve_group_ban_target(args: dict[str, Any], context: dict[str, Any]) -> 
                 target_uid = next(iter(explicit_signals))
             else:
                 return None, "target_user_ambiguous_explicit_context"
-    elif target_uid and text_mentions_target:
-        pass
+    elif target_uid:
+        # 模型显式给了 user_id（从原文/@/回复/共享上下文判断）：信任它。
+        # 原来这里因「文本没提该号码」就拒，导致「把 123456 禁言」这类最自然的管理
+        # 动作被 target_user_not_explicit 拒绝。只要不与共享上下文冲突，就放行。
+        if shared_context_uid and shared_context_uid != target_uid:
+            return None, "target_user_mismatch_with_shared_context"
     elif shared_context_uid:
         target_uid = shared_context_uid
-    elif target_uid and actor_uid and target_uid == actor_uid:
-        pass
-    elif target_uid:
+    elif actor_uid:
+        # 文本/共享上下文都没有目标，且非本人场景：明确要求目标。
         return None, "target_user_not_explicit"
     else:
         return None, shared_context_err or "missing_or_invalid_user_id"
@@ -3979,6 +3982,14 @@ async def _handle_smart_download(args: dict[str, Any], context: dict[str, Any]) 
 
     # 4) 可选：直接上传到群文件
     if upload_after:
+        # 上传群文件是高影响操作：普通用户不能绕过 upload_group_file 的门禁。
+        perm_level = normalize_text(str(context.get("permission_level", "user"))).lower()
+        if perm_level not in ("group_admin", "super_admin"):
+            return ToolCallResult(
+                ok=False,
+                error="permission_denied:upload_group_file",
+                display="上传群文件需要群管理员或超级管理员权限",
+            )
         if not group_id:
             return ToolCallResult(ok=False, error="missing group_id_for_upload", display="需要 group_id 才能上传群文件")
         upload_name = file_name or Path(staged_path).name

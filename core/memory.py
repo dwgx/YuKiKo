@@ -2464,11 +2464,16 @@ class MemoryEngine:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO embeddings (conversation_id, user_id, role, content, embedding, created_at)
-                VALUES (?, ?, ?, ?, ?, ?);
+                INSERT OR IGNORE INTO embeddings
+                    (conversation_id, user_id, role, content, embedding, created_at, origin_class)
+                VALUES (?, ?, ?, ?, ?, ?, ?);
                 """,
-                (conv, uid, role_value, text, emb, created_at),
+                # 显式 add 是 user 来源（比群聊未指向 untrusted 更可信，可晋升 Curated）。
+                (conv, uid, role_value, text, emb, created_at, "user"),
             )
+            if cursor.rowcount == 0:
+                # 唯一索引 (conv,uid,role,content,origin_class) 命中：重复内容幂等返回。
+                return True, "memory_exists", {"duplicate": True}
             record_id = int(cursor.lastrowid or 0)
 
         self._append_history_entry(conversation_id=conv, user_id=uid, role=role_value, content=text)
@@ -2526,15 +2531,19 @@ class MemoryEngine:
             return False, "内容未变化", before
 
         emb = json.dumps(self._embed(new_text), ensure_ascii=False)
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE embeddings
-                SET content = ?, embedding = ?
-                WHERE id = ?;
-                """,
-                (new_text, emb, int(record_id)),
-            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE embeddings
+                    SET content = ?, embedding = ?
+                    WHERE id = ?;
+                    """,
+                    (new_text, emb, int(record_id)),
+                )
+        except sqlite3.IntegrityError:
+            # 唯一索引命中：新内容与已有记忆重复（同会话/用户/角色/来源）。
+            return False, "该内容与已有记忆重复，未更新", before
 
         self._update_history_entry(
             conversation_id=str(before.get("conversation_id", "")),
@@ -3236,8 +3245,14 @@ class MemoryEngine:
             return ""
         name = normalize_text(str(profile.get("display_name", ""))) or user_id
         msg_count = int(profile.get("message_count", 0))
-        keywords = profile.get("keywords", [])
-        top_kw = keywords[:5] if isinstance(keywords, list) else []
+        keywords = profile.get("keywords", {})
+        if isinstance(keywords, dict):
+            # _update_user_profile 存的是 {词: 次数}，按次数取 top5。
+            top_kw = [k for k, _ in sorted(keywords.items(), key=lambda x: x[1], reverse=True)[:5]]
+        elif isinstance(keywords, list):
+            top_kw = keywords[:5]
+        else:
+            top_kw = []
         # 原先这里还读 `language_style` 与 `topic_preferences` 两个 key 并据此拼
         # 「风格: X | 兴趣: Y」。全仓历史上从未有任何代码写过这两个 key
         # （`git log --all -S` 零命中），画像里实际落的是 `style_counts`，

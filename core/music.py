@@ -320,10 +320,13 @@ class MusicEngine:
                 return left, right
         parts = [part for part in re.split(r"\s+", kw) if part]
         if len(parts) >= 2:
-            left = parts[0]
-            right = " ".join(parts[1:])
-            if len(left) >= 2 and right:
-                return left, right
+            # 中文点歌惯例「歌名 歌手」：「晴天 周杰伦」→ title=晴天, artist=周杰伦。
+            # 末段当歌手、前面当歌名（原实现首段当歌手，把「晴天 周杰伦」解析成
+            # 查《周杰伦》这首歌，实测点歌必失败）。
+            artist = parts[-1]
+            title = " ".join(parts[:-1])
+            if len(artist) >= 2 and title:
+                return artist, title
         return "", kw
 
     @classmethod

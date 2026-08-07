@@ -310,7 +310,10 @@ def _make_search_media_handler(search_engine: Any) -> ToolHandler:
         payload.setdefault("media_type", media_type)
         payload.setdefault("mode", mode)
         display = normalize_text(str(payload.get("text", "")))
-        if not display:
+        if not result.ok:
+            # 失败时不能还显示"媒体搜索完成"，模型会据此误导回复。
+            display = f"媒体搜索失败: {result.error or '未找到相关媒体'}。可换关键词或 media_type 重试。"
+        elif not display:
             if payload.get("video_url"):
                 display = "找到可发送视频。"
             elif payload.get("image_url") or payload.get("image_urls"):

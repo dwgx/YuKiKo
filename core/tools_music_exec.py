@@ -50,8 +50,14 @@ class ToolMusicExecMixin:
         if not keyword:
             return ToolResult(ok=False, tool_name="music_search", error="empty_keyword")
 
+        # 尊重 tool_args 的 limit（原硬编码 5，handler 传 8 被忽略）。
+        try:
+            search_limit = int(tool_args.get("limit", 5) or 5)
+        except (TypeError, ValueError):
+            search_limit = 5
+        search_limit = max(1, min(20, search_limit))
         results = await self._music_engine.search(
-            keyword, limit=5, title=title, artist=artist
+            keyword, limit=search_limit, title=title, artist=artist
         )
         if not results:
             return ToolResult(

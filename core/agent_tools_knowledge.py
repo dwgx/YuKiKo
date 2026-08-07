@@ -330,7 +330,13 @@ def _register_crawler_tools(registry: AgentToolRegistry) -> None:
         kb = context.get("knowledge_base")
         if kb is not None:
             try:
-                kb_results = kb.search(f"user:{user_id}", category="learned", limit=8)
+                # 用 search_by_tag 精确取 user:<id> 标签，避免 kb.search 的 LIKE 子串
+                # 匹配串号（user:10001 命中 user:1000102 的条目，跨用户泄漏）。
+                search_fn = getattr(kb, "search_by_tag", None)
+                if callable(search_fn):
+                    kb_results = search_fn(f"user:{user_id}", category="learned", limit=8)
+                else:
+                    kb_results = kb.search(f"user:{user_id}", category="learned", limit=8)
                 if kb_results:
                     kb_items = []
                     for entry in kb_results:

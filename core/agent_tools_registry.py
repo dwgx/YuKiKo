@@ -26,7 +26,7 @@ _log = logging.getLogger("yukiko.agent_tools")
 class AgentToolRegistry:
     """工具注册中心，管理所有可用工具的 schema、handler、提示词和上下文提供者。"""
 
-    _QQ_ID_PATTERN = re.compile(r"^[1-9]\d{5,11}$")
+    _QQ_ID_PATTERN = re.compile(r"^[1-9]\d{4,11}$")
     _MESSAGE_ID_PATTERN = re.compile(r"^\d{4,20}$")
     _STRICT_QQ_FIELDS = {"user_id", "group_id", "target_user_id", "qq", "qq_number", "bot_id"}
     _STRICT_MESSAGE_FIELDS = {"message_id"}
