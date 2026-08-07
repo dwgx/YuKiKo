@@ -104,6 +104,27 @@ elif needs_setup():
         run_setup()
         sys.exit(0)
 
+# Phase 2 平台主路径：配置 `platform.onebot11.primary: true` 时用 OneBot11Adapter 替代 NoneBot。
+def _platform_primary_enabled() -> bool:
+    try:
+        import yaml
+
+        cfg_path = Path(__file__).resolve().parent / "config" / "config.yml"
+        if not cfg_path.exists():
+            return False
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        p = (cfg.get("platform", {}) or {}).get("onebot11", {}) or {}
+        return bool(p.get("primary", False))
+    except Exception:
+        return False
+
+
+if _platform_primary_enabled():
+    from core.platform.run_primary import run_primary
+
+    run_primary()
+    raise SystemExit(0)
+
 nonebot.init()
 driver = nonebot.get_driver()
 driver.register_adapter(OneBotV11Adapter)

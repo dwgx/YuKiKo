@@ -46,6 +46,8 @@ class OneBot11Adapter(Platform):
         self._active_ws: Any = None
         self._authenticated = False
         self._pending_api: dict[str, asyncio.Future[Any]] = {}
+        # 发送抽象：websockets 库接口 vs Starlette WebSocket（挂 uvicorn 时用）。
+        self._ws_send_text: Any = None
 
     def meta(self) -> PlatformMetadata:
         return PlatformMetadata(
@@ -137,6 +139,7 @@ class OneBot11Adapter(Platform):
             return
         self._authenticated = True
         self._active_ws = websocket
+        self._ws_send_text = lambda text: websocket.send(text)
         async for raw in websocket:
             try:
                 payload = json.loads(raw)
@@ -154,6 +157,44 @@ class OneBot11Adapter(Platform):
             else:
                 await self._dispatch_event(payload)
 
+    async def handle_starlette_ws(self, websocket: Any) -> None:
+        """Starlette WebSocket 入口（挂 uvicorn 与 WebUI 同端口时用）。"""
+        headers = dict(getattr(websocket, "headers", {}) or {})
+        query = dict(getattr(websocket, "query_params", {}) or {})
+        if not self._check_auth(headers, query):
+            try:
+                await websocket.close(code=4401)
+            except Exception:
+                pass
+            return
+        self._authenticated = True
+        self._active_ws = websocket
+        self._ws_send_text = lambda text: websocket.send_text(text)
+        await websocket.accept()
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                payload = json.loads(raw)
+                echo = payload.get("echo")
+                if echo is not None and echo in self._pending_api:
+                    future = self._pending_api.pop(echo, None)
+                    if future is not None and not future.done():
+                        future.set_result(payload)
+                    continue
+                if "action" in payload:
+                    await self._handle_api(websocket, payload)
+                else:
+                    await self._dispatch_event(payload)
+        except Exception:
+            pass
+
+    async def _send_text(self, text: str) -> None:
+        """统一发送文本：Starlette WebSocket 用 send_text，websockets 库用 send。"""
+        if self._ws_send_text is not None:
+            await self._ws_send_text(text)
+        elif self._active_ws is not None:
+            await self._active_ws.send(text)
+
     async def _handle_api(self, websocket: Any, payload: dict[str, Any]) -> None:
         # 只处理通过鉴权的连接（fail-closed 的补充防线）。
         if not getattr(self, "_authenticated", False):
@@ -163,7 +204,7 @@ class OneBot11Adapter(Platform):
         echo = payload.get("echo")
         data = await self._dispatch_api(action, params)
         response = {"status": "ok", "retcode": 0, "data": data, "echo": echo}
-        await websocket.send(json.dumps(response, ensure_ascii=False))
+        await self._send_text(json.dumps(response, ensure_ascii=False))
 
     async def _dispatch_api(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         """API 分派：支持 OneBot 核心动作（发送/撤回/改群名片/取消息）。
@@ -192,7 +233,7 @@ class OneBot11Adapter(Platform):
         future: asyncio.Future[Any] = loop.create_future()
         self._pending_api[echo] = future
         try:
-            await self._active_ws.send(
+            await self._send_text(
                 json.dumps({"action": action, "params": params, "echo": echo}, ensure_ascii=False)
             )
             response = await asyncio.wait_for(future, timeout=30.0)
