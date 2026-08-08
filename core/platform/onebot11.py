@@ -190,13 +190,15 @@ class OneBot11Adapter(Platform):
             return
         self._authenticated = True
         if self._active_ws is not None and self._active_ws is not websocket:
-            # NapCat 会按 reconnectInterval 重连；旧连接可能还没被 finally 清理。
-            # 这里允许新连接替换旧连接（关闭旧的），保证反连连接总是可恢复的。
-            _log.info("onebot_ws_reconnect | replacing_old_ws")
+            # 只接受一个活跃反连连接（NapCat）。额外连接（调试/劫持）会覆盖
+            # _active_ws，导致 _send_api 把 OneBot 请求发到错误连接（自环）。
+            # NapCat 重连时旧连接会先断开、finally 清理 _active_ws 后再接受新连接。
+            _log.warning("onebot_ws_extra_connection_rejected")
             try:
-                await self._active_ws.close(code=4000)
+                await websocket.close(code=4001)
             except Exception:
                 pass
+            return
         self._active_ws = websocket
         self._ws_send_text = lambda text: websocket.send_text(text)
         await websocket.accept()

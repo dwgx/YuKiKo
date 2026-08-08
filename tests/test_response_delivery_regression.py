@@ -55,6 +55,7 @@ class ResponseDeliveryVoiceTests(unittest.IsolatedAsyncioTestCase):
             response = EngineResponse(action="reply", reason="test", audio_file=str(mp3))
             sender = _MockSender()
             silk = Path(tmp) / "clip.silk"
+            silk.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
             with (
                 patch("app._probe_audio_duration_seconds_sync", return_value=30.0),
                 patch("app._silk_encode_for_record", new=AsyncMock(return_value=silk)),
@@ -70,7 +71,8 @@ class ResponseDeliveryVoiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sender.send_count, 1)
             records = _record_files(sender.sent_chains)
             self.assertEqual(len(records), 1)
-            self.assertIn(".silk", records[0])
+            # NapCat 沙盒读不到 file:// 项目路径，语音直接以 base64 发送。
+            self.assertTrue(records[0].startswith("base64://"))
 
     async def test_long_audio_splits_into_multiple_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -80,6 +82,8 @@ class ResponseDeliveryVoiceTests(unittest.IsolatedAsyncioTestCase):
             sender = _MockSender()
             part1 = Path(tmp) / "song.part1.silk"
             part2 = Path(tmp) / "song.part2.silk"
+            part1.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
+            part2.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
             with (
                 patch("app._probe_audio_duration_seconds_sync", return_value=200.0),
                 patch("app._split_voice_audio_file", new=AsyncMock(return_value=[part1, part2])),
@@ -96,8 +100,8 @@ class ResponseDeliveryVoiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sender.send_count, 2)
             records = _record_files(sender.sent_chains)
             self.assertEqual(len(records), 2)
-            self.assertTrue(all(f.startswith("file://") for f in records))
-            self.assertTrue(all(".silk" in f for f in records))
+            # NapCat 沙盒读不到 file:// 项目路径，语音直接以 base64 发送。
+            self.assertTrue(all(f.startswith("base64://") for f in records))
 
     async def test_voice_with_text_sends_text_then_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -108,6 +112,7 @@ class ResponseDeliveryVoiceTests(unittest.IsolatedAsyncioTestCase):
             )
             sender = _MockSender()
             silk = Path(tmp) / "clip.silk"
+            silk.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
             with (
                 patch("app._probe_audio_duration_seconds_sync", return_value=30.0),
                 patch("app._silk_encode_for_record", new=AsyncMock(return_value=silk)),
@@ -143,6 +148,7 @@ class ResponseDeliveryMusicVoiceTests(unittest.IsolatedAsyncioTestCase):
             response = EngineResponse(action="music_play", reason="test", audio_file=str(mp3))
             sender = _MockSender()
             silk = Path(tmp) / "song.silk"
+            silk.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
             with (
                 patch("app._probe_audio_duration_seconds_sync", return_value=200.0),
                 patch("app._silk_encode_for_record", new=AsyncMock(return_value=silk)),
@@ -166,7 +172,8 @@ class ResponseDeliveryMusicVoiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sender.send_count, 1)
             records = _record_files(sender.sent_chains)
             self.assertEqual(len(records), 1)
-            self.assertIn(".silk", records[0])
+            # NapCat 沙盒读不到 file:// 项目路径，语音直接以 base64 发送。
+            self.assertTrue(records[0].startswith("base64://"))
 
     async def test_music_disable_split_sends_single_trimmed_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -214,6 +221,8 @@ class ResponseDeliveryMusicVoiceTests(unittest.IsolatedAsyncioTestCase):
             sender = _MockSender()
             part1 = Path(tmp) / "song.part1.silk"
             part2 = Path(tmp) / "song.part2.silk"
+            part1.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
+            part2.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
             split_mock = AsyncMock(return_value=[part1, part2])
             encode_calls: list[Path] = []
 
@@ -250,6 +259,8 @@ class ResponseDeliveryMusicVoiceTests(unittest.IsolatedAsyncioTestCase):
             sender = _MockSender()
             part1 = Path(tmp) / "song.part1.silk"
             part2 = Path(tmp) / "song.part2.silk"
+            part1.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
+            part2.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
             split_mock = AsyncMock(return_value=[part1, part2])
             encode_calls: list[Path] = []
 
@@ -350,6 +361,7 @@ class ResponseDeliveryMusicVoiceTests(unittest.IsolatedAsyncioTestCase):
             response = EngineResponse(action="reply", reason="test", audio_file=str(mp3))
             sender = _MockSender()
             part = Path(tmp) / "song.part1.silk"
+            part.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
             encode_calls: list[Path] = []
 
             async def fake_encode(path, seconds):

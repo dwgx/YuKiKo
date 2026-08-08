@@ -88,6 +88,8 @@ class PlatformPrimaryVoiceSplitTests(unittest.IsolatedAsyncioTestCase):
 
             part_silk = Path(tmp) / "song.part1.silk"
             part2_silk = Path(tmp) / "song.part2.silk"
+            part_silk.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
+            part2_silk.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
             with (
                 patch("app._probe_audio_duration_seconds_sync", return_value=200.0),
                 patch(
@@ -106,8 +108,8 @@ class PlatformPrimaryVoiceSplitTests(unittest.IsolatedAsyncioTestCase):
                 for f in _record_files(chain)
             ]
             self.assertEqual(len(voice_files), 2)
-            self.assertTrue(all(f.startswith("file://") for f in voice_files))
-            self.assertTrue(all(".silk" in f for f in voice_files))
+            # NapCat 沙盒读不到 file:// 项目路径，语音直接以 base64 发送。
+            self.assertTrue(all(f.startswith("base64://") for f in voice_files))
 
     async def test_short_audio_sends_single_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

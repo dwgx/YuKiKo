@@ -218,32 +218,25 @@ async def _resolve_record_ref(response: Any, voice_max_seconds: int) -> str:
     return ""
 
 
-async def _send_record_with_b64_fallback(
+async def _send_record_base64(
     audio_path: Path,
     guard_send: SendFn,
     conversation_id: str,
     label: str,
 ) -> bool:
-    """发送 record（file://），失败时对 silk 用 base64 重试。
+    """直接以 base64 发送 record。
 
-    NapCat 对 file:// 的 .silk 可能报「语音转换失败」（QQ 沙盒读不到项目路径），
-    base64 直接传数据绕过路径问题。
+    NapCat 的 ffmpeg 不可用（QQ 沙盒禁止 exec 外部二进制 + native addon 未签名），
+    且 QQ 沙盒读不到 file:// 项目路径——isSilk 读文件失败必然走转换、转换必败。
+    base64 由 NapCat 解码到容器内临时文件，isSilk 识别为 silk 后直接上传（免 ffmpeg）。
     """
-    from core.napcat_compat import build_napcat_file_reference
-
-    file_ref = build_napcat_file_reference(audio_path)
-    ok = await guard_send(MessageChain([Record(file=file_ref)]))
-    if ok:
-        return True
-    if audio_path.suffix.lower() != ".silk":
-        return False
     try:
         raw = audio_path.read_bytes()
         if len(raw) < 256:
             return False
         b64_ref = f"base64://{base64.b64encode(raw).decode('ascii')}"
         _log.info(
-            "deliver_voice_b64_retry | conversation=%s | %s | bytes=%d",
+            "deliver_voice_b64_send | conversation=%s | %s | bytes=%d",
             conversation_id,
             label,
             len(raw),
@@ -352,7 +345,7 @@ async def _send_voice(
                 is_long_audio,
             )
             if isinstance(record_audio_path, Path) and record_audio_path.exists():
-                sent_voice = await _send_record_with_b64_fallback(
+                sent_voice = await _send_record_base64(
                     record_audio_path, guard_send, conversation_id, "full"
                 )
             else:
@@ -390,7 +383,7 @@ async def _send_voice(
                     part_silk if part_silk is not None else part_path
                 )
                 if part_silk is not None:
-                    part_ok = await _send_record_with_b64_fallback(
+                    part_ok = await _send_record_base64(
                         part_silk, guard_send, conversation_id, f"part{part_idx}"
                     )
                 else:
