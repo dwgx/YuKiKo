@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import ipaddress
 import io
+import ipaddress
 import json
 import mimetypes
 import os
@@ -13,29 +13,34 @@ import shutil
 import socket
 import subprocess
 import tempfile
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Awaitable, Callable
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
-from urllib.parse import urlencode
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 
 import httpx
+from utils.intent import (
+    looks_like_github_request as _shared_github_request,
+)
+from utils.intent import (
+    looks_like_repo_readme_request as _shared_repo_readme_request,
+)
+from utils.intent import (
+    looks_like_video_request as _shared_video_request,
+)
+from utils.text import clip_text, normalize_matching_text, normalize_text
 
 from core.image import ImageEngine
 from core.music import MusicEngine, MusicPlayResult
 from core.prompt_policy import PromptPolicy
 from core.search import SearchEngine, SearchResult
 from core.system_prompts import SystemPromptRelay
-from core.video_analyzer import VideoAnalyzer, VideoAnalysisResult
-from utils.intent import (
-    looks_like_github_request as _shared_github_request,
-    looks_like_repo_readme_request as _shared_repo_readme_request,
-    looks_like_video_request as _shared_video_request,
-)
-from utils.text import clip_text, normalize_matching_text, normalize_text
+from core.video_analyzer import VideoAnalysisResult, VideoAnalyzer
 
 try:
     from yt_dlp import YoutubeDL
@@ -74,24 +79,109 @@ class _UnsafeToolUrlError(RuntimeError):
 
 
 # ── Re-imports from tools_types (拆分后兼容) ──
+from core.tools_ai_method import ToolAiMethodMixin  # noqa: F401
+from core.tools_github import ToolGithubMixin  # noqa: F401
+from core.tools_music_exec import ToolMusicExecMixin  # noqa: F401
+from core.tools_search import ToolSearchMixin  # noqa: F401
 from core.tools_types import (  # noqa: F401
-    _unwrap_redirect_url,
-    _normalize_multimodal_query,
-    _is_known_image_signature,
     ToolResult,
     _find_ffmpeg,
+    _is_known_image_signature,
+    _normalize_multimodal_query,
+    _prompt_cues,
     _SilentYTDLPLogger,
     _tool_trace_tag,
-    _prompt_cues,
+    _unwrap_redirect_url,
     _write_netscape_cookie_file,
 )
-
-from core.tools_ai_method import ToolAiMethodMixin  # noqa: F401
-from core.tools_music_exec import ToolMusicExecMixin  # noqa: F401
-from core.tools_github import ToolGithubMixin  # noqa: F401
-from core.tools_search import ToolSearchMixin  # noqa: F401
 from core.tools_video import ToolVideoMixin  # noqa: F401
 from core.tools_vision import ToolVisionMixin  # noqa: F401
+
+# ── 网页正文提取（无第三方依赖，stdlib html.parser）──
+_HTML_NOISE_TAGS = frozenset(
+    {
+        "script", "style", "noscript", "svg", "canvas", "iframe", "template",
+        "nav", "footer", "header", "aside", "form", "button", "select",
+        "textarea", "input", "dialog",
+    }
+)
+_HTML_PARAGRAPH_TAGS = frozenset(
+    {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "pre",
+     "td", "dt", "dd", "figcaption", "caption"}
+)
+_HTML_CONTENT_HINT_RE = re.compile(
+    r"(?:^|[\s\-_/])(?:content|article|post|entry|main|正文|detail)(?:[\s\-_]|$)"
+)
+_WEB_BODY_MAX_CHARS = 2000
+
+
+@dataclass
+class _WebpageExtract:
+    title: str = ""
+    summary: str = ""
+    paragraphs: list[str] = field(default_factory=list)
+    site_name: str = ""
+    links_count: int = 0
+    body: str = ""
+
+
+class _HtmlNode:
+    __slots__ = ("tag", "attrs", "children", "text")
+
+    def __init__(
+        self,
+        tag: str | None,
+        attrs: dict[str, str] | None = None,
+        text: str = "",
+    ) -> None:
+        self.tag = tag  # None 表示纯文本叶子
+        self.attrs = dict(attrs or {})
+        self.children: list[_HtmlNode] = []
+        self.text = text
+
+
+class _WebpageHtmlParser(HTMLParser):
+    """把 HTML 解析成轻量树；噪声标签子树整体跳过，不参与文本统计。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.root = _HtmlNode(None)
+        self._stack: list[_HtmlNode] = [self.root]
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if self._skip_depth:
+            self._skip_depth += 1
+            return
+        if tag in _HTML_NOISE_TAGS:
+            self._skip_depth = 1
+            return
+        node = _HtmlNode(tag, {name: str(value or "") for name, value in attrs})
+        self._stack[-1].children.append(node)
+        self._stack.append(node)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if self._skip_depth or tag in _HTML_NOISE_TAGS:
+            return
+        node = _HtmlNode(tag, {name: str(value or "") for name, value in attrs})
+        self._stack[-1].children.append(node)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if self._skip_depth:
+            self._skip_depth -= 1
+            return
+        for index in range(len(self._stack) - 1, 0, -1):
+            if self._stack[index].tag == tag:
+                del self._stack[index:]
+                break
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        self._stack[-1].children.append(_HtmlNode(None, text=data))
 
 
 class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolSearchMixin, ToolVideoMixin, ToolVisionMixin):
@@ -797,22 +887,34 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
         title = ""
         summary = ""
         paragraphs: list[str] = []
+        site_name = ""
+        links_count = 0
+        body = ""
 
         if "html" in content_type:
             html = resp.text or ""
-            title, summary, paragraphs = self._extract_html_summary(html)
+            extract = self._extract_html_summary(html)
+            title = extract.title
+            summary = extract.summary
+            paragraphs = extract.paragraphs
+            site_name = extract.site_name
+            links_count = extract.links_count
+            body = extract.body
         elif "json" in content_type:
             try:
                 data = resp.json()
             except Exception:
                 data = resp.text
             summary = self._summarize_json_like(data)
+            body = summary
         elif content_type.startswith("text/"):
             summary = clip_text(
                 normalize_text(resp.text or ""), self._web_fetch_max_chars
             )
+            body = summary
         else:
             summary = f"二进制内容，大小约 {len(resp.content)} 字节。"
+            body = summary
 
         summary = normalize_text(summary)
         if not summary and paragraphs:
@@ -837,13 +939,66 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
             "title": title,
             "summary": summary,
             "paragraphs": paragraphs[:4],
+            "site_name": site_name,
+            "links_count": links_count,
+            "body": body,
         }
 
-    def _extract_html_summary(self, html: str) -> tuple[str, str, list[str]]:
+    def _extract_html_summary(self, html: str) -> _WebpageExtract:
         raw = str(html or "")
         if not raw:
-            return "", "", []
+            return _WebpageExtract()
+        try:
+            parser = _WebpageHtmlParser()
+            parser.feed(raw)
+            parser.close()
+        except Exception:
+            return self._extract_html_summary_legacy(raw)
+        tree = parser.root
+        if not tree.children:
+            return self._extract_html_summary_legacy(raw)
 
+        title = ""
+        title_node = self._find_first_element(tree, "title")
+        if title_node:
+            title = self._tree_text(title_node)
+
+        meta_desc = self._find_meta_content(tree, ("description", "og:description"))
+        site_name = self._find_meta_content(tree, ("og:site_name", "twitter:site"))
+
+        best = self._pick_main_block(tree)
+        paragraphs = self._collect_paragraph_lines(best)
+        seen: set[str] = set()
+        unique: list[str] = []
+        for line in paragraphs:
+            key = line.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(clip_text(line, 600))
+            if len(unique) >= 6:
+                break
+        paragraphs = unique
+
+        if len(paragraphs) < 2:
+            whole = self._tree_text(best)
+            split = self._split_text_to_paragraphs(whole, max_paragraphs=4)
+            paragraphs = split or paragraphs
+
+        summary = meta_desc or (paragraphs[0] if paragraphs else "")
+        summary = clip_text(normalize_text(summary), self._web_fetch_max_chars // 2)
+        body = clip_text(normalize_text("\n".join(paragraphs)), _WEB_BODY_MAX_CHARS)
+        return _WebpageExtract(
+            title=title,
+            summary=summary,
+            paragraphs=paragraphs,
+            site_name=site_name,
+            links_count=self._count_links(best),
+            body=body,
+        )
+
+    def _extract_html_summary_legacy(self, raw: str) -> _WebpageExtract:
+        """正则兜底路径：新解析器失败时保持旧行为不退化。"""
         title = ""
         title_match = re.search(r"(?is)<title[^>]*>(.*?)</title>", raw)
         if title_match:
@@ -899,7 +1054,115 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
 
         summary = meta_desc or (paragraphs[0] if paragraphs else "")
         summary = clip_text(normalize_text(summary), self._web_fetch_max_chars // 2)
-        return title, summary, paragraphs
+        return _WebpageExtract(title=title, summary=summary, paragraphs=paragraphs)
+
+    @staticmethod
+    def _tree_text(node: _HtmlNode) -> str:
+        """按文档顺序收集子树文本，压缩空白。"""
+        parts: list[str] = []
+        stack: list[_HtmlNode] = [node]
+        while stack:
+            current = stack.pop()
+            if current.tag is None:
+                parts.append(current.text)
+                continue
+            stack.extend(reversed(current.children))
+        return re.sub(r"\s+", " ", "".join(parts)).strip()
+
+    @classmethod
+    def _find_first_element(cls, node: _HtmlNode, tag: str) -> _HtmlNode | None:
+        stack: list[_HtmlNode] = [node]
+        while stack:
+            current = stack.pop()
+            if current.tag == tag:
+                return current
+            stack.extend(reversed(current.children))
+        return None
+
+    @classmethod
+    def _find_meta_content(cls, node: _HtmlNode, names: tuple[str, ...]) -> str:
+        stack: list[_HtmlNode] = [node]
+        while stack:
+            current = stack.pop()
+            if current.tag == "meta":
+                raw = str(current.attrs.get("name", "") or "").lower()
+                if not raw:
+                    raw = str(current.attrs.get("property", "") or "").lower()
+                if raw in names:
+                    return normalize_text(str(current.attrs.get("content", "")))
+            stack.extend(reversed(current.children))
+        return ""
+
+    @classmethod
+    def _is_content_candidate(cls, node: _HtmlNode) -> bool:
+        if node.tag in ("article", "main"):
+            return True
+        if node.tag not in ("div", "section", "td"):
+            return False
+        combined = " ".join(
+            [
+                str(node.attrs.get("class", "")).lower(),
+                str(node.attrs.get("id", "")).lower(),
+            ]
+        )
+        return bool(_HTML_CONTENT_HINT_RE.search(combined))
+
+    @classmethod
+    def _pick_main_block(cls, tree: _HtmlNode) -> _HtmlNode:
+        """按段落文本密度挑主块；候选不足时退回整棵正文树。"""
+        candidates: list[_HtmlNode] = []
+        stack: list[_HtmlNode] = [tree]
+        while stack:
+            current = stack.pop()
+            if current.tag is not None and cls._is_content_candidate(current):
+                candidates.append(current)
+            stack.extend(reversed(current.children))
+
+        best = tree
+        best_score = 0
+        for candidate in candidates:
+            lines = cls._collect_paragraph_lines(candidate)
+            score = sum(len(line) for line in lines)
+            if not lines:
+                score = len(cls._tree_text(candidate))
+            if score > best_score:
+                best, best_score = candidate, score
+        if best is tree or best_score < 60:
+            body_lines = cls._collect_paragraph_lines(tree)
+            body_score = sum(len(line) for line in body_lines) or len(
+                cls._tree_text(tree)
+            )
+            if body_score >= best_score:
+                best = tree
+        return best
+
+    @classmethod
+    def _collect_paragraph_lines(cls, node: _HtmlNode) -> list[str]:
+        """收集块级元素文本（p/h1-6/li/blockquote/pre 等），嵌套不重复。"""
+        lines: list[str] = []
+        stack: list[_HtmlNode] = [node]
+        while stack:
+            current = stack.pop()
+            if current.tag is None or current.tag in _HTML_NOISE_TAGS:
+                continue
+            if current.tag in _HTML_PARAGRAPH_TAGS:
+                text = cls._tree_text(current)
+                if len(text) >= 14:
+                    lines.append(text)
+                continue
+            stack.extend(reversed(current.children))
+        return lines
+
+    @classmethod
+    def _count_links(cls, node: _HtmlNode) -> int:
+        count = 0
+        stack: list[_HtmlNode] = [node]
+        while stack:
+            current = stack.pop()
+            if current.tag == "a" and str(current.attrs.get("href", "") or "").strip():
+                count += 1
+            stack.extend(reversed(current.children))
+        return count
 
     @staticmethod
     def _extract_primary_html_block(cleaned_html: str) -> str:
@@ -2111,6 +2374,41 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
         return any(fragment in normalized for fragment in blocked_fragments)
 
     @staticmethod
+    def _fold_ipv4_translation(
+        ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    ) -> ipaddress.IPv4Address | None:
+        """把 IPv6 中嵌入 IPv4 的形态折叠回 IPv4，None 表示非可折叠地址。
+
+        覆盖四种形态：
+        - IPv4-mapped（::ffff:x.x.x.x，含 getaddrinfo 会返回的
+          `::ffff:0:x.x.x.x` 非标准形状，见 _is_benchmark_fake_ip 注释）
+        - 6to4（2002::/16，IPv4 在 bits 16-47）
+        - NAT64（64:ff9b::/96 RFC 6052 well-known prefix，IPv4 在低 32 位）
+        - Teredo（2001::/32，客户端 IPv4 为低 32 位取反）
+
+        不折叠就交给 stdlib 的 is_private / is_reserved 判定，会因 Python
+        版本差异而漂移（旧版本对 ::ffff:169.254.169.254 判 is_private=False
+        直接放行），且 64:ff9b::7f00:1 只是恰好被 is_reserved 拦住。
+        """
+
+        if isinstance(ip_obj, ipaddress.IPv4Address):
+            return None
+        mapped = ip_obj.ipv4_mapped
+        if mapped is not None:
+            return mapped
+        packed = int(ip_obj)
+        low32 = packed & 0xFFFFFFFF
+        if packed >> 32 in {0xFFFF_0000, 0xFFFF}:
+            return ipaddress.ip_address(low32)
+        if packed >> 112 == 0x2002:
+            return ipaddress.ip_address((packed >> 80) & 0xFFFFFFFF)
+        if packed >> 96 == 0x0064_FF9B:
+            return ipaddress.ip_address(low32)
+        if packed >> 96 == 0x2001_0000:
+            return ipaddress.ip_address(low32 ^ 0xFFFFFFFF)
+        return None
+
+    @staticmethod
     def _is_public_ip_obj(
         ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address,
     ) -> bool:
@@ -2125,6 +2423,9 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
 
         if _is_dns_interception_range(ip_obj):
             return True
+        folded_v4 = ToolExecutor._fold_ipv4_translation(ip_obj)
+        if folded_v4 is not None:
+            return ToolExecutor._is_public_ip_obj(folded_v4)
         return not (
             ip_obj.is_private
             or ip_obj.is_loopback
@@ -2648,7 +2949,7 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
             self._cleanup_recent_media_cache()
             return
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for key in target_keys:
             state = self._recent_media_by_conversation.get(key, {})
             if not isinstance(state, dict):
@@ -2742,7 +3043,7 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
     def _cleanup_recent_media_cache(self) -> None:
         if not self._recent_media_by_conversation:
             return
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         ttl = timedelta(seconds=self._recent_media_cache_ttl_seconds)
         stale: list[str] = []
         for key, state in self._recent_media_by_conversation.items():

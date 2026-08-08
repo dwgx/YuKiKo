@@ -7,34 +7,40 @@ import asyncio
 import hashlib
 import io
 import json
+import logging as _logging
 import mimetypes
 import os
 import re
 import shutil
 import subprocess
 import sys
-
+from collections.abc import Awaitable, Callable
 from html import unescape
 from pathlib import Path
-from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 import httpx
-
-from utils.text import clip_text, normalize_text
-from core.tools_types import ToolResult
-from core.tools_types import _unwrap_redirect_url, _normalize_multimodal_query, _is_known_image_signature
 from utils.process_compat import macos_subprocess_kwargs, resolve_executable_for_spawn
-import logging as _logging
-from core.tools_types import _SilentYTDLPLogger, _tool_trace_tag, _write_netscape_cookie_file
-from core.video_analyzer import VideoAnalysisResult, VideoAnalyzer
+from utils.text import clip_text, normalize_text
+
 # SearchEngine 是 bilibili_audio_extract 用的（:2372 处 SearchEngine(search_cfg)）。
 # 漏它的后果：该工具一调就 `NameError: name 'SearchEngine' is not defined`，
 # 而 handler 里的 try/except 把它包成 error="extract_error" —— 看起来像"提取失败"，
 # 实际是符号不存在。实测线上 2 次调用全废，而它正是音乐放不出来时模型给的替代方案。
 # ruff 基线上就报了这条 F821，没人看。
 from core.search import SearchEngine, SearchResult
+from core.tools_types import (
+    ToolResult,
+    _is_known_image_signature,
+    _normalize_multimodal_query,
+    _SilentYTDLPLogger,
+    _tool_trace_tag,
+    _unwrap_redirect_url,
+    _write_netscape_cookie_file,
+)
+from core.video_analyzer import VideoAnalysisResult, VideoAnalyzer
+from core.xhs import fetch_xhs_post, is_xhs_detail_url, is_xhs_url
 
 try:
     from yt_dlp import YoutubeDL
@@ -74,6 +80,10 @@ class ToolVideoMixin:
         "AppleWebKit/605.1.15 (KHTML, like Gecko) "
         "Version/16.0 Mobile/15E148 Safari/604.1"
     )
+
+    # 小红书（图文/视频）域名 —— 主域集合在 tools.py 的 _platform_video_domains，
+    # 这里单独声明并在平台判定时并入，避免动 tools.py 的初始化。
+    _XHS_PLATFORM_DOMAINS = ("xiaohongshu.com", "xhslink.com")
 
     # 多 CDN 主机回退列表（aweme.snssdk.com 失败时依次尝试）
     _DOUYIN_CDN_HOSTS = [
@@ -229,7 +239,7 @@ class ToolVideoMixin:
                 payload={
                     "text": (
                         "parse_video 只支持抖音/快手/B站/AcFun/腾讯视频/"
-                        "爱奇艺/YouTube/优酷/直链视频。"
+                        "爱奇艺/YouTube/优酷/小红书/直链视频。"
                     )
                 },
                 error="unsupported_video_platform",
@@ -263,6 +273,17 @@ class ToolVideoMixin:
             )
             if douyin_image_result is not None:
                 return douyin_image_result
+
+        # 小红书（图文/视频）走 HTML 解析特判 —— yt-dlp 没有 xhs 提取器，
+        # 喂给它只会白烧 8~12 秒再失败；解析失败直接返回清晰错误，不造假数据。
+        if is_xhs_url(url):
+            xhs_result = await self._try_resolve_xhs_post(
+                url=url,
+                query=query,
+                method_name=method_name,
+            )
+            if xhs_result is not None:
+                return xhs_result
 
         resolved, resolve_diag = (
             await self._resolve_platform_video_safe_with_diagnostic(url)
@@ -685,6 +706,120 @@ class ToolVideoMixin:
             payload["image_url"] = sendable_image
         if normalize_text(resolve_diag):
             payload["diagnostic"] = normalize_text(resolve_diag)
+        return ToolResult(
+            ok=True,
+            tool_name=method_name,
+            payload=payload,
+            evidence=evidence,
+        )
+
+    def _get_xhs_cookie(self) -> str:
+        """读配置 video_analysis.xiaohongshu.cookie（与 B站/抖音/快手同构）。"""
+        try:
+            raw = self._raw_config or {}
+            va = raw.get("video_analysis", {}) or {}
+            xhs_cfg = va.get("xiaohongshu", {}) or {}
+            return normalize_text(str(xhs_cfg.get("cookie", "")))
+        except Exception:
+            return ""
+
+    async def _try_resolve_xhs_post(
+        self,
+        url: str,
+        query: str,
+        method_name: str,
+    ) -> ToolResult | None:
+        """小红书特判分支：图文返回多图 image_urls，视频返回 video_url。
+
+        不是小红书链接返回 None（让调用方走常规解析链）；
+        是小红书但抓取/解析失败返回明确的错误 ToolResult，不编造数据。
+        """
+        target = _unwrap_redirect_url(url)
+        if not is_xhs_url(target):
+            return None
+
+        result = await fetch_xhs_post(target, cookie=self._get_xhs_cookie())
+        if result.error:
+            error_text = {
+                "invalid_url": "这个不是有效的小红书链接。",
+                "blocked": "小红书反爬拦截（需要登录或验证码），抓不到内容，请人工打开链接查看。",
+                "no_data": "这个小红书页面没有可提取的图文/视频数据。",
+                "timeout": "抓取小红书页面超时，请稍后重试或换一条链接。",
+                "network_error": "抓取小红书页面失败（网络错误），请稍后重试。",
+            }.get(result.error, "小红书链接解析失败。")
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": error_text},
+                error=f"xhs_{result.error}",
+            )
+
+        if result.video_url:
+            evidence = [
+                {
+                    "title": clip_text(result.title or "小红书视频", 64),
+                    "point": "已从小红书分享页提取到视频直链",
+                    "source": result.source_url or target,
+                }
+            ]
+            return ToolResult(
+                ok=True,
+                tool_name=method_name,
+                payload={
+                    "mode": "video",
+                    "text": "已从小红书分享页拿到视频，马上发你",
+                    "video_url": result.video_url,
+                    "evidence": evidence,
+                },
+                evidence=evidence,
+            )
+
+        image_urls = [item for item in (result.image_urls or []) if item]
+        if not image_urls:
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": "这个小红书页面没有可提取的图文或视频内容。"},
+                error="xhs_no_data",
+            )
+
+        sendable_image = ""
+        for item in image_urls[:5]:
+            if await self._is_sendable_image_url(item):
+                sendable_image = item
+                break
+        if not sendable_image:
+            sendable_image = image_urls[0]
+
+        title = result.title or "小红书图文作品"
+        evidence = [
+            {
+                "title": clip_text(title, 64),
+                "point": clip_text(f"图文作品，共 {len(image_urls)} 张图。", 80),
+                "source": result.source_url or target,
+            }
+        ]
+        lines = [f"识别到这是小红书图文作品，共 {len(image_urls)} 张图。"]
+        if result.title:
+            lines.append(f"标题：{result.title}")
+        if result.uploader:
+            lines.append(f"作者：{result.uploader}")
+        lines.append(f"来源：{result.source_url or target}")
+        for idx, item in enumerate(image_urls[:3], 1):
+            lines.append(f"{idx}. {item}")
+        if len(image_urls) > 3:
+            lines.append(f"其余 {len(image_urls) - 3} 张已省略。")
+
+        payload: dict[str, Any] = {
+            "mode": "image",
+            "post_type": "image_text",
+            "query": query,
+            "text": "\n".join(lines),
+            "image_urls": image_urls,
+            "evidence": evidence,
+        }
+        if sendable_image:
+            payload["image_url"] = sendable_image
         return ToolResult(
             ok=True,
             tool_name=method_name,
@@ -1212,7 +1347,7 @@ class ToolVideoMixin:
                 self._inspect_platform_video_metadata(source_url),
                 timeout=float(self._video_metadata_timeout_seconds),
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _ytdlp_log.warning(
                 "video_metadata_timeout | url=%s | timeout=%ss",
                 source_url[:100],
@@ -2928,7 +3063,7 @@ class ToolVideoMixin:
             return False
         return any(
             host == domain or host.endswith(f".{domain}")
-            for domain in self._platform_video_domains
+            for domain in (*self._platform_video_domains, *self._XHS_PLATFORM_DOMAINS)
         )
 
     def _is_platform_video_detail_url(self, url: str) -> bool:
@@ -2969,6 +3104,11 @@ class ToolVideoMixin:
             if short_path and len(short_path) >= 6:
                 return True
             return False
+
+        if "xiaohongshu.com" in host or "xhslink.com" in host:
+            # 小红书详情：xhslink 短链任意非空路径；详情页 /explore/xxx、
+            # /discovery/item/xxx、/user/profile/xxx（其余如 /search、裸 /explore 不是详情）。
+            return is_xhs_detail_url(target)
 
         if "kuaishou.com" in host or "chenzhongtech.com" in host:
             blocked_cues = (
@@ -3182,6 +3322,18 @@ class ToolVideoMixin:
             if parsed_url:
                 return parsed_url
             self._last_video_resolve_diagnostic[url] = "parse_api_failed"
+
+        # 小红书没有 yt-dlp 提取器，走 HTML 解析；图文作品没有视频直链，返回空
+        # （图文由 _method_browser_resolve_video 的 xhs 特判分支处理）。
+        if is_xhs_url(url):
+            xhs_result = await fetch_xhs_post(url, cookie=self._get_xhs_cookie())
+            if not xhs_result.error and xhs_result.video_url:
+                return xhs_result.video_url
+            if xhs_result.error:
+                self._last_video_resolve_diagnostic[url] = f"xhs_{xhs_result.error}"
+            else:
+                self._last_video_resolve_diagnostic[url] = "xhs_image_post_no_video"
+            return ""
 
         # 抖音优先走分享页提取（不需要 cookie / 签名）
         host = normalize_text(urlparse(url).netloc).lower()
@@ -3509,7 +3661,7 @@ class ToolVideoMixin:
             # 抖音/快手：优先 h264 720p，回退到 best mp4
             # 注意：快手目前 yt-dlp 官方不支持，可能需要第三方插件
             format_candidates = [
-                f"best[vcodec^=avc][height<=720][ext=mp4]/best[vcodec^=avc][ext=mp4]",
+                "best[vcodec^=avc][height<=720][ext=mp4]/best[vcodec^=avc][ext=mp4]",
                 f"best[ext=mp4][filesize<{self._video_download_max_mb}M]/best[ext=mp4]",
                 "best[ext=mp4]",
                 "best",
