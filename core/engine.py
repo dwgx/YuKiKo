@@ -1114,28 +1114,17 @@ class YukikoEngine:
         self.admin.increment_message_count()
 
         # ── 消息去重（NapCat 偶尔重复推送同一条消息）──
-        if message.message_id:
-            if message.message_id in self._seen_message_ids:
-                return EngineResponse(action="ignore", reason="duplicate_message")
-
-            self._seen_message_ids[message.message_id] = message.timestamp.timestamp()
-            while len(self._seen_message_ids) > self._seen_message_ids_max:
-                self._seen_message_ids.popitem(last=False)
+        dedup_response = self._deduplicate_message(message)
+        if dedup_response is not None:
+            return dedup_response
         text = normalize_text(message.text)
         if not text:
             return EngineResponse(action="ignore", reason="empty_message")
 
         # ── 白名单检查（非私聊 + 权限系统启用时）──
-        if not message.is_private and self.admin.enabled:
-            if not self.admin.is_group_whitelisted(message.group_id):
-                if self.admin.non_whitelist_mode == "silent":
-                    return EngineResponse(
-                        action="ignore", reason="group_not_whitelisted"
-                    )
-                if not message.mentioned:
-                    return EngineResponse(
-                        action="ignore", reason="group_not_whitelisted_not_mentioned"
-                    )
+        whitelist_ignore_reason = self._whitelist_ignore_reason(message)
+        if whitelist_ignore_reason:
+            return EngineResponse(action="ignore", reason=whitelist_ignore_reason)
         # Keep recent media even when this turn is ignored, so "先发图后问" can still work.
         self.tools.remember_incoming_media(
             message.conversation_id, message.raw_segments
@@ -1272,17 +1261,8 @@ class YukikoEngine:
         # 按空格切必然误伤 —— 实测「表情包 + 用户喊 yuki」会被判成裸媒体而沉默。
         # raw_segments 是精确的结构事实，_extract_multimodal_user_text 是本仓
         # 已有的剥离实现（core/engine.py:4004，另有四处调用点），这里复用它。
-        trigger_media_types = [
-            normalize_text(str(seg.get("type", ""))).lower()
-            for seg in (message.raw_segments or [])
-            if isinstance(seg, dict) and normalize_text(str(seg.get("type", "")))
-        ]
-        # 注意用 message.text（未压平）而不是上面的 text —— 换行是精确边界，
-        # 而 text 已经在 core/engine.py:1022 被 normalize_text 压成一行了。
-        trigger_user_text = (
-            self._user_typed_text_for_trigger(message.text)
-            if trigger_media_types
-            else text
+        trigger_media_types, trigger_user_text = self._trigger_media_context(
+            message, text
         )
         trigger = self.trigger.evaluate(
             TriggerInput(
@@ -2462,6 +2442,58 @@ class YukikoEngine:
                 "target_user_id": getattr(decision, "target_user_id", ""),
             },
         )
+
+    def _deduplicate_message(self, message: EngineMessage) -> EngineResponse | None:
+        """消息去重：已见 message_id 返回 ignore，否则记录并裁剪最近缓存。
+
+        纯读 self._seen_message_ids + 记录新 id；副作用与 handle_message 原内联
+        完全同序（同输入同输出同时序）。
+        """
+
+        if not message.message_id:
+            return None
+        if message.message_id in self._seen_message_ids:
+            return EngineResponse(action="ignore", reason="duplicate_message")
+
+        self._seen_message_ids[message.message_id] = message.timestamp.timestamp()
+        while len(self._seen_message_ids) > self._seen_message_ids_max:
+            self._seen_message_ids.popitem(last=False)
+        return None
+
+    def _whitelist_ignore_reason(self, message: EngineMessage) -> str | None:
+        """白名单/触发忽略判断：非私聊且权限系统启用时，返回忽略 reason，否则 None。
+
+        纯读 self.admin + message 字段，无副作用，与原内联逻辑逐分支等价。
+        """
+
+        if not message.is_private and self.admin.enabled:
+            if not self.admin.is_group_whitelisted(message.group_id):
+                if self.admin.non_whitelist_mode == "silent":
+                    return "group_not_whitelisted"
+                if not message.mentioned:
+                    return "group_not_whitelisted_not_mentioned"
+        return None
+
+    def _trigger_media_context(
+        self, message: EngineMessage, text: str
+    ) -> tuple[list[str], str]:
+        """纯计算：从原始 segments 提取 trigger 媒体类型 + 用户实际键入文本。
+
+        注意 trigger_user_text 用 message.text（未压平）—— 换行是精确边界，
+        而 text 已在 handle_message 开头被 normalize_text 压成一行了。
+        """
+
+        trigger_media_types = [
+            normalize_text(str(seg.get("type", ""))).lower()
+            for seg in (message.raw_segments or [])
+            if isinstance(seg, dict) and normalize_text(str(seg.get("type", "")))
+        ]
+        trigger_user_text = (
+            self._user_typed_text_for_trigger(message.text)
+            if trigger_media_types
+            else text
+        )
+        return trigger_media_types, trigger_user_text
 
     async def _try_agent_path(
         self,

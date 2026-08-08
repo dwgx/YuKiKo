@@ -657,6 +657,16 @@ def _build_file_uri(path_like: Path | str) -> str:
     return build_napcat_file_reference(path_like)
 
 
+def _noop_send_failure_mark(group_id: int, bot_id: str, reason: str) -> None:
+    """发送失败标记的 no-op 注入（架构收敛任务 B3）。
+
+    统一发送核心 `build_send_guard` 在 sender 失败时会调用 mark_failure_fn；
+    NoneBot 路径的熔断/暂停标记已经由 `_safe_send` 内部完成（按错误分类决定
+    是否停群/停 bot），这里显式 no-op，避免对「结果未知/不可重试」这类
+    本就不该停发的情况额外加 180s 群熔断 + 120s bot 暂停（行为等价保留）。
+    """
+
+
 def _silk_duration_seconds_sync(path: Path) -> float:
     """探测 silk 时长（秒）。ffprobe/ffmpeg 读不出 silk 时长（返回 0），
     优先用 pilk.get_duration（毫秒），失败才回退 ffprobe。"""
@@ -2027,31 +2037,27 @@ def register_handlers(engine: YukikoEngine) -> None:
             )
             prefixed_sent = False
 
+            # 统一发送核心：限流/熔断/暂停经 core.response_delivery.build_send_guard
+            # （架构收敛任务 B3）。失败标记保留在 _safe_send 内部（no-op 注入，
+            # 见 _noop_send_failure_mark），不重复熔断。
+            from core.response_delivery import build_send_guard
+
+            async def _raw_platform_send(msg: Message) -> bool:
+                return await _safe_send(bot=bot, event=event, message=msg)
+
+            send_guard = build_send_guard(
+                engine.config,
+                _raw_platform_send,
+                conversation_id=payload.conversation_id,
+                group_id=payload.group_id,
+                bot_id=str(getattr(bot, "self_id", "") or ""),
+                mark_failure_fn=_noop_send_failure_mark,
+            )
+
             async def send_msg(msg: Message) -> bool:
                 nonlocal delivered, send_attempts, send_success, rate_limited
                 send_attempts += 1
-                if send_rate_enable:
-                    bucket = _get_send_bucket(
-                        conversation_id=payload.conversation_id,
-                        group_id=payload.group_id,
-                        max_per_window=send_rate_max_per_window,
-                        refill_seconds=send_rate_window_seconds,
-                        warn_threshold=send_rate_warn_threshold,
-                    )
-                    wait_seconds, rate_flag = bucket.reserve()
-                    if rate_flag:
-                        rate_limited = True
-                    if wait_seconds > 0:
-                        _log.warning(
-                            "send_rate_limit_wait | trace=%s | conversation=%s | wait=%.2fs | used=%d/%d",
-                            payload.trace_id,
-                            payload.conversation_id,
-                            wait_seconds,
-                            bucket.used_in_window(),
-                            bucket.capacity,
-                        )
-                        await asyncio.sleep(wait_seconds)
-                ok = await _safe_send(bot=bot, event=event, message=msg)
+                ok = await send_guard(msg)
                 if ok:
                     send_success += 1
                     delivered = True

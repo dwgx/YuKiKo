@@ -413,6 +413,10 @@ def _type_names(expected: tuple[type, ...]) -> str:
     return "|".join(t.__name__ for t in expected)
 
 
+class ConfigValidationError(RuntimeError):
+    """strict 模式下配置校验失败时抛出，用于阻断启动 / 热重载。"""
+
+
 def _get_dotpath(config: dict[str, Any], dotpath: str) -> tuple[bool, Any]:
     """沿点路径取配置值。返回 (是否存在, 值)。中间节点不是 dict 视为不存在。"""
     node: Any = config

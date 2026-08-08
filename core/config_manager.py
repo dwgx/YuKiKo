@@ -16,12 +16,15 @@ from typing import Any
 
 import yaml
 
-from core.config_schema import validate_config
+from core.config_schema import ConfigValidationError, validate_config
 from core.config_templates import deep_merge_dict, load_config_template
 from core.crypto import DecryptionError, SecretManager
 
 _log = logging.getLogger("yukiko.config")
 _ENV_PATTERN = re.compile(r"^\$\{([A-Z0-9_]+)\}$")
+# 环境变量置 1 时强制 strict 模式：配置校验失败抛异常阻断启动。
+_STRICT_ENV_VAR = "YUKIKO_CONFIG_STRICT"
+_STRICT_CONFIG_KEY = "validation.strict"
 
 
 class ConfigManager:
@@ -90,10 +93,12 @@ class ConfigManager:
 
     # ── private ───────────────────────────────────────────────
     def _validate_runtime_config(self) -> None:
-        """按 schema 校验运行时配置，只记 warning，不阻断启动。
+        """按 schema 校验运行时配置。
 
         漂移（模板与内置默认值、或用户 config.yml 的类型矛盾）静默错下去会
-        拖到消费端才炸，这里在启动/热重载时尽早暴露。
+        拖到消费端才炸，这里在启动/热重载时尽早暴露。默认只记 warning；
+        当 `validation.strict: true` 或环境变量 `YUKIKO_CONFIG_STRICT=1` 时
+        校验失败抛 ConfigValidationError 阻断启动。
         """
         self._last_validation_issues = validate_config(self._data)
         for issue in self._last_validation_issues:
@@ -104,6 +109,18 @@ class ConfigManager:
                 issue["expected"],
                 issue["actual"],
             )
+        if self._last_validation_issues and self._strict_mode_enabled():
+            detail = "; ".join(
+                f"{i['path']}: expected {i['expected']}, got {i['actual']}"
+                for i in self._last_validation_issues
+            )
+            raise ConfigValidationError(f"配置校验失败（strict 模式）: {detail}")
+
+    def _strict_mode_enabled(self) -> bool:
+        """strict 模式开关：环境变量 YUKIKO_CONFIG_STRICT=1 或配置 validation.strict=true。"""
+        env_strict = os.environ.get(_STRICT_ENV_VAR, "") == "1"
+        cfg_strict = bool(self.get(_STRICT_CONFIG_KEY, False))
+        return env_strict or cfg_strict
 
     @staticmethod
     def _load_yaml(path: Path) -> dict[str, Any]:
