@@ -2636,6 +2636,39 @@ async def put_plugin(plugin_name: str, request: Request):
     return {"ok": True, "message": message, "plugin": updated}
 
 
+@router.post("/tools/{tool_name}/unregister", dependencies=[Depends(_check_auth)])
+async def unregister_tool(tool_name: str):
+    """运行时卸载工具：从 registry 移除 schema 与 handler（显式操作）。"""
+    e = _engine
+    if not e:
+        raise HTTPException(503, "引擎未初始化")
+    registry = getattr(e, "agent_tool_registry", None)
+    unregister = getattr(registry, "unregister", None)
+    if not callable(unregister):
+        raise HTTPException(503, "工具注册表未初始化")
+    if not unregister(tool_name):
+        raise HTTPException(404, f"工具不存在: {tool_name}")
+    return {"ok": True, "message": f"工具已卸载: {tool_name}"}
+
+
+@router.post("/mcp/sync", dependencies=[Depends(_check_auth)])
+async def resync_mcp():
+    """重连 MCP 连接器：重新同步 trusted server 的工具注册（热装入口）。"""
+    e = _engine
+    if not e:
+        raise HTTPException(503, "引擎未初始化")
+    resync = getattr(e, "_resync_mcp_connectors", None)
+    if not callable(resync):
+        raise HTTPException(503, "MCP 重连不可用")
+    try:
+        task = resync()
+        if task is not None:
+            await task
+    except Exception as ex:
+        raise HTTPException(500, f"MCP 重连失败: {ex}")
+    return {"ok": True, "message": "MCP 重连完成"}
+
+
 @router.get("/db/overview", dependencies=[Depends(_check_auth)])
 async def db_overview():
     """获取所有数据库概览。"""

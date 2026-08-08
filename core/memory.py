@@ -607,6 +607,71 @@ class MemoryEngine:
             )
         self._migrate_embeddings_dedupe()
         self._migrate_add_origin_class()
+        self._init_fts_mirror()
+
+    def _init_fts_mirror(self) -> None:
+        """建 embeddings 的 FTS5 镜像表 + 同步触发器（H3 会话全文检索）。
+
+        外部内容表（content='embeddings'）只存索引不存正文，命中后 JOIN 回原表
+        取字段；INSERT/UPDATE/DELETE 三个触发器做增量同步，`INSERT OR IGNORE`
+        被唯一索引挡掉的行不会触发任何触发器，镜像天然一致。
+
+        幂等对账：新表或触发器缺失（早期版本崩溃残留）时对 embeddings 执行
+        `rebuild` 全量重建一次索引；正常重启时表与触发器俱在则不动。
+        """
+        try:
+            with self._connect() as conn:
+                existed = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings_fts';"
+                ).fetchone()
+                if not existed:
+                    try:
+                        conn.execute(
+                            "CREATE VIRTUAL TABLE embeddings_fts USING fts5("
+                            "content, content='embeddings', content_rowid='id', "
+                            "tokenize='trigram');"
+                        )
+                    except sqlite3.OperationalError:
+                        # 旧版 SQLite 无 trigram tokenizer：退化为默认 unicode61。
+                        conn.execute(
+                            "CREATE VIRTUAL TABLE embeddings_fts USING fts5("
+                            "content, content='embeddings', content_rowid='id');"
+                        )
+                triggers_ok = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='embeddings_fts_ai';"
+                ).fetchone()
+                if not triggers_ok:
+                    # 存量行回填 + 崩溃残留修复，两条路都靠 rebuild 一次解决。
+                    conn.execute("INSERT INTO embeddings_fts(embeddings_fts) VALUES('rebuild');")
+                conn.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS embeddings_fts_ai AFTER INSERT ON embeddings
+                    BEGIN
+                        INSERT INTO embeddings_fts(rowid, content) VALUES (new.id, new.content);
+                    END;
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS embeddings_fts_ad AFTER DELETE ON embeddings
+                    BEGIN
+                        INSERT INTO embeddings_fts(embeddings_fts, rowid, content)
+                        VALUES ('delete', old.id, old.content);
+                    END;
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS embeddings_fts_au AFTER UPDATE ON embeddings
+                    BEGIN
+                        INSERT INTO embeddings_fts(embeddings_fts, rowid, content)
+                        VALUES ('delete', old.id, old.content);
+                        INSERT INTO embeddings_fts(rowid, content) VALUES (new.id, new.content);
+                    END;
+                    """
+                )
+        except Exception:
+            _log.warning("fts_mirror_init_failed", exc_info=True)
 
     def _migrate_add_origin_class(self) -> None:
         """给已存在的 embeddings 表补 `origin_class` 列（Phase 0 来源分级）。
@@ -2459,28 +2524,27 @@ class MemoryEngine:
                 tuple(params + [limit, offset]),
             ).fetchall()
 
-        out: list[dict[str, Any]] = []
-        for row in rows:
-            row_conv = str(row[1] or "")
-            row_uid = str(row[2] or "")
-            profile = self._user_profiles.get(row_uid, {})
-            display_name = (
-                normalize_text(str(profile.get("display_name", "")))
-                or self._user_display_names.get(row_uid, row_uid)
-            )
-            out.append(
-                {
-                    "id": int(row[0]),
-                    "conversation_id": row_conv,
-                    "conversation_label": self._format_conversation_label(row_conv),
-                    "user_id": row_uid,
-                    "display_name": display_name,
-                    "role": str(row[3] or ""),
-                    "content": str(row[4] or ""),
-                    "created_at": str(row[5] or ""),
-                }
-            )
-        return out, total
+        return [self._embedding_row_to_record(row) for row in rows], total
+
+    def _embedding_row_to_record(self, row: tuple[Any, ...]) -> dict[str, Any]:
+        """embeddings 查询行（id, conversation_id, user_id, role, content, created_at）→ 记录字典。"""
+        row_conv = str(row[1] or "")
+        row_uid = str(row[2] or "")
+        profile = self._user_profiles.get(row_uid, {})
+        display_name = (
+            normalize_text(str(profile.get("display_name", "")))
+            or self._user_display_names.get(row_uid, row_uid)
+        )
+        return {
+            "id": int(row[0]),
+            "conversation_id": row_conv,
+            "conversation_label": self._format_conversation_label(row_conv),
+            "user_id": row_uid,
+            "display_name": display_name,
+            "role": str(row[3] or ""),
+            "content": str(row[4] or ""),
+            "created_at": str(row[5] or ""),
+        }
 
     def add_memory_record(
         self,
@@ -2900,6 +2964,94 @@ class MemoryEngine:
             return ""
         return " ".join(tokens[:3])
 
+    def search_message_fts(
+        self,
+        query: str,
+        limit: int = 10,
+        *,
+        conversation_id: str = "",
+        user_id: str = "",
+        roles: tuple[str, ...] | None = None,
+        trace_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """按关键词全文检索会话消息（FTS5 镜像，H3）。
+
+        向量检索（search_related）是词袋相似度，查「原话怎么说的」会漏；这里走
+        embeddings_fts 镜像表的 trigram 索引做子串级命中。trigram 对不足 3 字符
+        的查询词无法匹配（SQLite 限制），此时退化为 content LIKE。默认限定
+        user/assistant 角色，与 search_related 的语义一致。
+        """
+        if not self.enable_vector_memory:
+            return []
+        # 先刷缓冲区，确保刚写入的消息可查
+        self._flush_vector_buffer()
+
+        q = normalize_text(query)
+        if not q:
+            return []
+        tokens = [token for token in q.split() if token]
+        if not tokens:
+            return []
+        limit = max(1, min(50, int(limit or 10)))
+
+        conv = normalize_text(conversation_id)
+        uid = normalize_text(user_id)
+        allowed_roles = tuple(roles or ("user", "assistant"))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if conv:
+            clauses.append("e.conversation_id = ?")
+            params.append(conv)
+        if uid:
+            clauses.append("e.user_id = ?")
+            params.append(uid)
+        role_placeholders = ",".join("?" for _ in allowed_roles)
+        clauses.append(f"e.role IN ({role_placeholders})")
+        params.extend(allowed_roles)
+        scope_sql = " AND ".join(clauses)
+
+        rows: list[tuple[Any, ...]] = []
+        fts_used = False
+        with self._connect() as conn:
+            if all(len(token) >= 3 for token in tokens):
+                match_expr = " AND ".join(
+                    f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens
+                )
+                try:
+                    rows = conn.execute(
+                        f"""
+                        SELECT e.id, e.conversation_id, e.user_id, e.role, e.content, e.created_at
+                        FROM embeddings_fts JOIN embeddings e ON e.id = embeddings_fts.rowid
+                        WHERE embeddings_fts MATCH ? AND {scope_sql}
+                        ORDER BY rank LIMIT ?;
+                        """,
+                        [match_expr, *params, limit],
+                    ).fetchall()
+                    fts_used = True
+                except sqlite3.OperationalError:
+                    # 镜像表缺失/损坏：落到 LIKE 兜底，不让搜索整条失败。
+                    rows = []
+            if not rows:
+                rows = conn.execute(
+                    f"""
+                    SELECT e.id, e.conversation_id, e.user_id, e.role, e.content, e.created_at
+                    FROM embeddings e
+                    WHERE e.content LIKE ? AND {scope_sql}
+                    ORDER BY e.id DESC LIMIT ?;
+                    """,
+                    [f"%{q}%", *params, limit],
+                ).fetchall()
+
+        hits = [self._embedding_row_to_record(row) for row in rows]
+        _log.info(
+            "memory_fts_hit | trace=%s | query=%s | fts=%s | hits=%d",
+            trace_id or "-",
+            q[:60],
+            fts_used,
+            len(hits),
+        )
+        return hits
+
     def search_related(
         self,
         conversation_id: str,
@@ -2985,6 +3137,33 @@ class MemoryEngine:
             floor,
             dropped,
         )
+        # H3 兜底：向量检索无结果时用 FTS5 关键词检索补位（recall_intent 车道 2 场景）。
+        # 只在调用方未显式抬高 min_score 时生效——显式传了 min_score 意味着要求
+        # 严格语义召回，不应用关键词结果绕过。
+        if not results and min_score is None:
+            fts_hits = self.search_message_fts(
+                query,
+                limit=k,
+                conversation_id=conversation_id,
+                user_id=user_filter,
+                roles=allowed_roles,
+                trace_id=trace_id,
+            )
+            for hit in fts_hits:
+                content = normalize_text(str(hit.get("content", "")))
+                if not content or content in seen:
+                    continue
+                seen.add(content)
+                results.append(content)
+                if len(results) >= k:
+                    break
+            if results:
+                _log.info(
+                    "memory_fts_fallback | trace=%s | query=%s | hits=%d",
+                    trace_id or "-",
+                    query[:60],
+                    len(results),
+                )
         return results
 
     @staticmethod

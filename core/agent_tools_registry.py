@@ -128,6 +128,20 @@ class AgentToolRegistry:
         self._schemas[schema.name] = schema
         self._handlers[schema.name] = handler
 
+    def unregister(self, tool_name: str) -> bool:
+        """运行时移除工具：从 _schemas/_handlers 删除（显式操作）。
+
+        返回是否确实存在并移除；不存在的工具返回 False，便于上层（WebUI 等）
+        区分「卸载成功」与「本来就没有」。权限集合（_SUPER_ADMIN_TOOLS 等）是
+        静态名单不在此删除 —— 同名工具重新注册后仍套用原权限门。
+        """
+        name = str(tool_name or "").strip()
+        if not name or name not in self._schemas or name not in self._handlers:
+            return False
+        del self._schemas[name]
+        del self._handlers[name]
+        return True
+
     def register_prompt_hint(self, hint: PromptHint) -> None:
         """注册静态提示词块，会被注入到 Agent 系统提示的对应 section。"""
         self._prompt_hints.append(hint)

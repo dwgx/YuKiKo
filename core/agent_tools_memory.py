@@ -26,6 +26,9 @@ from utils.text import clip_text, normalize_matching_text, normalize_text, token
 
 _log = logging.getLogger("yukiko.agent_tools")
 
+# 记忆条目数超过该值时，memory_list 在 display 里提示 agent 自主整理（H3）。
+_MEMORY_OVERFLOW_HINT_THRESHOLD = 200
+
 
 def _has_cross_user_memory_access(context: dict[str, Any]) -> bool:
     level = normalize_text(str(context.get("permission_level", ""))).lower()
@@ -116,6 +119,11 @@ def _register_memory_tools(registry: AgentToolRegistry) -> None:
             offset=offset,
         )
         lines = [f"记忆记录: {total} 条（第 {page} 页）"]
+        if total > _MEMORY_OVERFLOW_HINT_THRESHOLD:
+            lines.append(
+                f"提示: 记忆条目过多（{total} 条 > {_MEMORY_OVERFLOW_HINT_THRESHOLD}），"
+                "可用 memory_delete 删除不需要的（需附 note 备注），或用 memory_compact 整理。"
+            )
         for item in items[:10]:
             lines.append(
                 f"#{item.get('id')} [{item.get('role')}] {item.get('user_id')}: "

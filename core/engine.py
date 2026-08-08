@@ -390,6 +390,54 @@ class YukikoEngine:
             self.logger.warning("mcp_connectors_sync_failed", exc_info=True)
             self._mcp_manager = None
 
+    def _resync_mcp_connectors(self) -> asyncio.Task | None:
+        """热重载/WebUI 触发时重跑 MCP sync（重新连接 trusted server 的工具）。
+
+        有运行中的事件循环时挂后台任务（不阻塞 reload，失败只记日志）；
+        无循环的同步上下文（测试）里退化为阻塞执行。配置未启用 MCP 时无操作。
+        """
+        mcp_cfg = self.config.get("mcp", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(mcp_cfg, dict) or not mcp_cfg.get("enabled"):
+            return None
+        servers = mcp_cfg.get("servers")
+        if not isinstance(servers, dict) or not servers:
+            return None
+        trust = MCPTrustStore(self.storage_dir / "agent" / "mcp_trust.json")
+        manager = MCPConnectorManager(
+            {"mcpServers": servers}, trust, self.agent_tool_registry
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            return loop.create_task(self._run_mcp_resync(manager))
+        try:
+            asyncio.run(self._run_mcp_resync(manager))
+        except Exception:
+            self.logger.warning("mcp_connectors_resync_failed", exc_info=True)
+        return None
+
+    async def _run_mcp_resync(self, manager: MCPConnectorManager) -> None:
+        """sync 成功后替换 _mcp_manager 并关闭旧连接；失败保留旧连接不中断 reload。
+
+        旧 server 已下掉的工具不自动卸载（unregister 是显式操作），
+        但旧 handler 闭包绑定的 client 会被 close，调用会得到明确错误。
+        """
+        try:
+            registered = await manager.sync()
+        except Exception:
+            self.logger.warning("mcp_connectors_resync_failed", exc_info=True)
+            return
+        old = getattr(self, "_mcp_manager", None)
+        self._mcp_manager = manager
+        self.logger.info("mcp_connectors_resynced | tools=%s", registered)
+        if old is not None and old is not manager:
+            try:
+                await old.close()
+            except Exception:
+                self.logger.warning("mcp_connectors_old_close_failed", exc_info=True)
+
     async def _run_memory_promotion(self, user_id: str, conversation_id: str = "") -> dict[str, Any]:
         """后台晋升：collect 候选 → rank（untrusted 排除）→ consolidate（模型）→ 写入 explicit_facts。
 
@@ -1132,8 +1180,10 @@ class YukikoEngine:
                         ),
                     )
                 # 不重置 _async_init_done：重置会让下一条消息重跑 plugins.setup_all
-                # （幂等性未验证）和 MCP 连接器初始化。插件已在启动时 setup 过，
-                # reload 只重跑 plugins.load() 读配置。
+                # （幂等性未验证）。插件已在启动时 setup 过，reload 只重跑
+                # plugins.load() 读配置；MCP 工具则在这里显式重连（后台任务，
+                # 失败不阻塞 reload）。
+                self._resync_mcp_connectors()
                 self.logger.info("配置热重载完成")
             return ok, msg
 

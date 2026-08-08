@@ -245,6 +245,52 @@ def evaluate_requires(
     return True
 
 
+def install_skill(skills_dir: Path, name: str, description: str, content: str) -> tuple[bool, str]:
+    """把技能写入 ``skills/<name>/SKILL.md``，返回 (成功, 错误信息)。
+
+    name 用 _NAME_PATTERN 校验（小写字母/数字/连字符），与 load_skill 的
+    准入规则一致：通过校验的 name 不含路径分隔符，可直接拼目录；校验失败
+    则不落任何文件，从源头堵住路径穿越与非法技能名。
+    """
+    name = name.strip()
+    if not name or not _NAME_PATTERN.fullmatch(name):
+        return False, f"技能名非法: {name!r}（只允许小写字母、数字、连字符）"
+    if len(name) > _MAX_NAME_LEN:
+        return False, f"技能名过长（最多 {_MAX_NAME_LEN} 字符）"
+    description = description.strip()
+    if not description:
+        return False, "description 不能为空"
+    if len(description) > _MAX_DESC_LEN:
+        return False, f"描述过长（最多 {_MAX_DESC_LEN} 字符）"
+    content = content.strip()
+    if not content:
+        return False, "content 不能为空"
+
+    skill_md = Path(skills_dir) / name / "SKILL.md"
+    skill_md.parent.mkdir(parents=True, exist_ok=True)
+    text = f"---\nname: {name}\ndescription: {description}\n---\n\n{content}\n"
+    skill_md.write_text(text, encoding="utf-8")
+    return True, ""
+
+
+def remove_skill_dir(skills_dir: Path, name: str) -> tuple[bool, str]:
+    """删除 ``skills/<name>`` 目录，返回 (成功, 错误信息)。
+
+    先 resolve 再校验真实路径仍在 skills_dir 内，防 symlink 逃逸删到越界目录。
+    """
+    name = name.strip()
+    if not name or not _NAME_PATTERN.fullmatch(name):
+        return False, f"技能名非法: {name!r}（只允许小写字母、数字、连字符）"
+    base = Path(skills_dir).resolve()
+    skill_dir = (base / name).resolve()
+    if not str(skill_dir).startswith(str(base)):
+        return False, "路径越界，拒绝删除"
+    if not skill_dir.is_dir():
+        return False, f"技能 '{name}' 不存在"
+    shutil.rmtree(skill_dir)
+    return True, ""
+
+
 def _tokenize(text: str) -> list[str]:
     """把查询文本切成小写词元；纯 CJK 时退化为按空白切分。"""
     tokens = re.findall(r"[a-z0-9]+", text.lower())
@@ -273,6 +319,15 @@ class SkillRegistry:
                         skills.append(skill)
         self._loaded = skills
         return self._loaded
+
+    def reload(self) -> list[SkillMeta]:
+        """丢弃缓存重新扫描 skills_dir，返回当前全部合法技能。
+
+        create_skill / remove_skill 写完磁盘后调用，让同一实例的 read_skill
+        立即看到变化，无需等整机热重载。
+        """
+        self._loaded = None
+        return self.load()
 
     def match(self, text: str, top_k: int = 3) -> list[SkillMeta]:
         """按关键词在 name/description 中的出现次数排序，返回 top_k 个技能。"""
@@ -306,10 +361,14 @@ class SkillRegistry:
 
 
 def register_skill_tools(registry: Any, skill_registry: SkillRegistry) -> None:
-    """把 read_skill 工具注册进 AgentToolRegistry。
+    """把 read_skill 与 Skill Workshop 工具（create_skill / list_skills / remove_skill）注册进 AgentToolRegistry。
 
     渐进式披露：技能目录（name+description）已由 AgentLoop 注入 system prompt，
     模型命中后调 read_skill 读取 SKILL.md 全文再执行。全文不进上下文，避免挤占预算。
+
+    Skill Workshop 对应 OpenClaw 的「技能提案→审批→生效」闭环的保守形态：
+    create_skill / remove_skill 由 super_admin 直接执行（人审即 owner 审批），
+    写盘后调 skill_registry.reload() 让技能立即可用，无需等整机热重载。
     """
     from core.agent_tools_types import ToolCallResult, ToolSchema
 
@@ -329,6 +388,62 @@ def register_skill_tools(registry: Any, skill_registry: SkillRegistry) -> None:
             display=text,
         )
 
+    async def _handle_list_skills(args: dict[str, Any], context: Any) -> ToolCallResult:
+        _ = args
+        _ = context
+        skills = skill_registry.load()
+        return ToolCallResult(
+            ok=True,
+            data={"count": len(skills), "names": [skill.name for skill in skills]},
+            display=render_catalog(skills) or "（暂无技能）",
+        )
+
+    async def _handle_create_skill(args: dict[str, Any], context: Any) -> ToolCallResult:
+        if str(context.get("permission_level", "")).lower() != "super_admin":
+            return ToolCallResult(
+                ok=False,
+                error="need_super_admin",
+                display="权限不足：仅超级管理员可创建技能",
+            )
+        name = str(args.get("name", "")).strip()
+        description = str(args.get("description", "")).strip()
+        content = str(args.get("content", "")).strip()
+        if not name or not description or not content:
+            return ToolCallResult(
+                ok=False,
+                error="missing_required_args",
+                display="name / description / content 均为必填",
+            )
+        ok, err = install_skill(skill_registry.skills_dir, name, description, content)
+        if not ok:
+            return ToolCallResult(ok=False, error="invalid_skill", display=err)
+        loaded = skill_registry.reload()
+        return ToolCallResult(
+            ok=True,
+            data={"name": name, "skill_count": len(loaded)},
+            display=f"技能 '{name}' 已创建并立即生效（当前共 {len(loaded)} 个技能）",
+        )
+
+    async def _handle_remove_skill(args: dict[str, Any], context: Any) -> ToolCallResult:
+        if str(context.get("permission_level", "")).lower() != "super_admin":
+            return ToolCallResult(
+                ok=False,
+                error="need_super_admin",
+                display="权限不足：仅超级管理员可删除技能",
+            )
+        name = str(args.get("name", "")).strip()
+        if not name:
+            return ToolCallResult(ok=False, error="missing_name", display="name 为必填")
+        ok, err = remove_skill_dir(skill_registry.skills_dir, name)
+        if not ok:
+            return ToolCallResult(ok=False, error="remove_skill_failed", display=err)
+        loaded = skill_registry.reload()
+        return ToolCallResult(
+            ok=True,
+            data={"name": name, "skill_count": len(loaded)},
+            display=f"技能 '{name}' 已删除并生效（当前共 {len(loaded)} 个技能）",
+        )
+
     registry.register(
         ToolSchema(
             name="read_skill",
@@ -346,4 +461,60 @@ def register_skill_tools(registry: Any, skill_registry: SkillRegistry) -> None:
             category="general",
         ),
         _handle_read_skill,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="list_skills",
+            description="列出当前已加载的全部技能（名称 + 简介目录），用于确认有哪些技能可用。",
+            parameters={"type": "object", "properties": {}, "required": []},
+            category="general",
+        ),
+        _handle_list_skills,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="create_skill",
+            description=(
+                "仅超级管理员可用：创建一个新技能（skill）。写入 skills/<name>/SKILL.md 后立即生效，"
+                "模型此后可通过 read_skill 读取其指令执行。name 只允许小写字母、数字、连字符。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "技能名（小写字母、数字、连字符）"},
+                    "description": {
+                        "type": "string",
+                        "description": "技能用途简述（模型据此决定何时读取该技能）",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "SKILL.md 正文：执行该技能的详细步骤与指令",
+                    },
+                },
+                "required": ["name", "description", "content"],
+            },
+            category="admin",
+        ),
+        _handle_create_skill,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="remove_skill",
+            description=(
+                "仅超级管理员可用：删除一个已有技能（skill）。删除 skills/<name>/ 目录并立即生效，"
+                "删除后模型将无法再通过 read_skill 读取该技能。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "技能名（小写字母、数字、连字符）"},
+                },
+                "required": ["name"],
+            },
+            category="admin",
+        ),
+        _handle_remove_skill,
     )
