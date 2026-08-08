@@ -125,5 +125,57 @@ class SilkTencentHeaderTests(unittest.TestCase):
             self.assertEqual(head, b"\x02", "silk 应为 tencent 版本头（0x02）")
 
 
+class PlatformMediaSendTests(unittest.TestCase):
+    """run_primary 平台路径的媒体发送（_resolve_record_ref）。"""
+
+    def test_record_b64_becomes_base64_ref(self) -> None:
+        from core.engine_types import EngineResponse
+        from core.platform.run_primary import _resolve_record_ref
+
+        resp = EngineResponse(action="reply", reason="test", record_b64="c2lsaw==")
+        ref = _run(_resolve_record_ref(resp, 60))
+        self.assertEqual(ref, "base64://c2lsaw==")
+
+    def test_audio_file_converted_to_silk_ref(self) -> None:
+        from core.engine_types import EngineResponse
+        from core.platform.run_primary import _resolve_record_ref
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mp3 = Path(tmp) / "sine.mp3"
+            if _FFMPEG:
+                subprocess.run(
+                    [
+                        _FFMPEG, "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                        "-ac", "1", "-ar", "24000", "-b:a", "64k", str(mp3),
+                    ],
+                    capture_output=True,
+                    check=True,
+                )
+            else:
+                mp3.write_bytes(b"\xff" * 2048)  # 无效 mp3：silk 转换失败 → 回退空
+            resp = EngineResponse(action="reply", reason="test", audio_file=str(mp3))
+            ref = _run(_resolve_record_ref(resp, 60))
+            if _FFMPEG:
+                self.assertTrue(ref.startswith("file://"), f"应产出 file:// silk 引用，实际 {ref!r}")
+                self.assertIn(".silk", ref)
+            else:
+                self.assertEqual(ref, "")
+
+    def test_no_audio_returns_empty(self) -> None:
+        from core.engine_types import EngineResponse
+        from core.platform.run_primary import _resolve_record_ref
+
+        resp = EngineResponse(action="reply", reason="test", reply_text="hi")
+        self.assertEqual(_run(_resolve_record_ref(resp, 60)), "")
+
+    def test_voice_max_seconds_reads_config(self) -> None:
+        from core.platform.run_primary import _platform_voice_max_seconds
+
+        class _E:
+            config = {"bot": {"voice_send_max_seconds": 45}}
+
+        self.assertEqual(_platform_voice_max_seconds(_E()), 45)
+
+
 if __name__ == "__main__":
     unittest.main()
