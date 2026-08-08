@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import contextlib
 import io
@@ -66,43 +66,7 @@ def _log_onebot_reverse_ws_hint() -> None:
 
 _load_env_files()
 _disable_uvicorn_access_log()
-_log_onebot_reverse_ws_hint()
 
-# 首次运行向导：
-#   config.yml 不存在 → 启动 WebUI 配置页面
-#   python main.py --setup → 强制 CLI 向导
-#   python main.py setup   → 强制 CLI 向导
-_force_cli_setup = "--setup" in sys.argv or (len(sys.argv) > 1 and sys.argv[1] == "setup")
-if _force_cli_setup:
-    if not _is_interactive_tty():
-        print("[ERROR] --setup 需要交互式终端，请在 SSH 终端手动执行。")
-        sys.exit(2)
-    run_setup()
-    sys.exit(0)
-elif needs_setup():
-    # WebUI 配置向导模式
-    _webui_dist = Path(__file__).resolve().parent / "webui" / "dist"
-    if _webui_dist.is_dir():
-        from core.webui import run_setup_server
-        host = os.environ.get("HOST", "127.0.0.1")
-        port = int(os.environ.get("PORT", "8081"))
-        run_setup_server(host=host, port=port)
-        # setup server 退出后检查是否已生成 config
-        if not needs_setup():
-            print("配置已完成，setup 模式结束。")
-            sys.exit(0)
-        else:
-            print("配置未完成，退出。")
-            sys.exit(0)
-    else:
-        # webui/dist 不存在，回退到 CLI 向导
-        if not _is_interactive_tty():
-            print("WebUI 未构建且当前为非交互环境，无法运行 CLI 向导。")
-            print("请先执行 install.sh 构建 WebUI，或手动创建 config/config.yml 后再启动。")
-            sys.exit(1)
-        print("WebUI 未构建，使用 CLI 向导...")
-        run_setup()
-        sys.exit(0)
 
 # Phase 2 平台主路径：配置 `platform.onebot11.primary: true` 时用 OneBot11Adapter 替代 NoneBot。
 def _platform_primary_enabled() -> bool:
@@ -119,93 +83,157 @@ def _platform_primary_enabled() -> bool:
         return False
 
 
-if _platform_primary_enabled():
-    from core.platform.run_primary import run_primary
-
-    run_primary()
-    raise SystemExit(0)
-
-nonebot.init()
-driver = nonebot.get_driver()
-driver.register_adapter(OneBotV11Adapter)
-
-# FastAPI 0.141 的 add_api_websocket_route（NoneBot fastapi driver 挂 OneBot ws）在真实
-# uvicorn 下会提前 close(403)。把 OneBot 的 APIWebSocketRoute 换成 Starlette WebSocketRoute。
-from core.nonebot_ws_patch import patch_nonebot_ws_routes
-
-patch_nonebot_ws_routes(driver)
-
-engine = create_engine()
-register_handlers(engine)
-
-# WebUI 管理面板 API
-from core.webui import init_webui
-from starlette.responses import FileResponse, RedirectResponse, Response
-from starlette.staticfiles import StaticFiles
-
-app = nonebot.get_asgi()
-app.include_router(init_webui(engine))
-
-# SPA 静态文件 + 路由回退
-_webui_dist = Path(__file__).resolve().parent / "webui" / "dist"
-_webui_index = _webui_dist / "index.html"
-_webui_assets = _webui_dist / "assets"
-if _webui_assets.is_dir():
-    app.mount("/webui/assets", StaticFiles(directory=str(_webui_assets)), name="webui-assets")
+# 双轨入口（重构 B5）：平台主路径 run_primary 是推荐入口；NoneBot 路径是 legacy 回退。
+# 两路径共用 create_engine() 与统一发送核心（core.response_delivery），差异只在入站绑定。
+ENTRY_PRIMARY = "primary"
+LEGACY_NONEBOT_PATH = "nonebot"
 
 
-def _webui_missing_response() -> Response:
-    return Response(
-        "WebUI 静态页面未构建。请先执行：cd webui && npm install && npm run build，然后重启服务再访问 /webui/login",
-        status_code=503,
-        media_type="text/plain; charset=utf-8",
-    )
+def _select_entry_path() -> str:
+    """统一双轨入口选择：返回 ENTRY_PRIMARY（平台主路径）或 LEGACY_NONEBOT_PATH（NoneBot legacy）。
+
+    平台主路径保持**显式开关**：`platform.onebot11.primary: true` 才启用；缺失/False 一律
+    回退 NoneBot legacy 路径。不把「缺失」翻成平台默认的原因（翻默认的前提是模板回填
+    platform 段，属后续工作，见 docs/zh-CN/RECONSTRUCTION-BLUEPRINT.md §4.4）：
+    - 平台 adapter 鉴权 fail-closed（core/platform/onebot11.py `_check_auth`）：未配置
+      access_token 时拒绝一切连接，而 run_primary 只读 config.yml 的 platform.onebot11，
+      不读 .env 的 ONEBOT_ACCESS_TOKEN / HOST / PORT；
+    - config 模板（master.template.yml / config_templates.py）目前不生成 platform 段，
+      新装配置缺失时翻默认会让 bot 静默连不上 NapCat。
+    """
+    if _platform_primary_enabled():
+        return ENTRY_PRIMARY
+    return LEGACY_NONEBOT_PATH
 
 
-def _with_no_cache(resp: Response) -> Response:
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    resp.headers["Pragma"] = "no-cache"
-    resp.headers["Expires"] = "0"
-    return resp
+def main() -> None:
+    """统一入口：setup 向导 → 双轨选择（平台主路径 / NoneBot legacy）。"""
+    _log_onebot_reverse_ws_hint()
 
+    # 首次运行向导：
+    #   config.yml 不存在 → 启动 WebUI 配置页面
+    #   python main.py --setup → 强制 CLI 向导
+    #   python main.py setup   → 强制 CLI 向导
+    _force_cli_setup = "--setup" in sys.argv or (len(sys.argv) > 1 and sys.argv[1] == "setup")
+    if _force_cli_setup:
+        if not _is_interactive_tty():
+            print("[ERROR] --setup 需要交互式终端，请在 SSH 终端手动执行。")
+            sys.exit(2)
+        run_setup()
+        sys.exit(0)
+    elif needs_setup():
+        # WebUI 配置向导模式
+        _webui_dist = Path(__file__).resolve().parent / "webui" / "dist"
+        if _webui_dist.is_dir():
+            from core.webui import run_setup_server
 
-@app.get("/webui/{path:path}")
-async def _webui_spa(path: str):
-    if ".." in path:
-        return Response("Not found", status_code=404)
-    if path.lower().startswith("setup"):
+            host = os.environ.get("HOST", "127.0.0.1")
+            port = int(os.environ.get("PORT", "8081"))
+            run_setup_server(host=host, port=port)
+            # setup server 退出后检查是否已生成 config
+            if not needs_setup():
+                print("配置已完成，setup 模式结束。")
+                sys.exit(0)
+            else:
+                print("配置未完成，退出。")
+                sys.exit(0)
+        else:
+            # webui/dist 不存在，回退到 CLI 向导
+            if not _is_interactive_tty():
+                print("WebUI 未构建且当前为非交互环境，无法运行 CLI 向导。")
+                print("请先执行 install.sh 构建 WebUI，或手动创建 config/config.yml 后再启动。")
+                sys.exit(1)
+            print("WebUI 未构建，使用 CLI 向导...")
+            run_setup()
+            sys.exit(0)
+
+    entry = _select_entry_path()
+    if entry == ENTRY_PRIMARY:
+        from core.platform.run_primary import run_primary
+
+        run_primary()
+        raise SystemExit(0)
+
+    # LEGACY_NONEBOT_PATH：NoneBot 入口（双轨收敛前的旧路径，保留以便回退）。
+    # 与平台主路径共用 create_engine() 与统一发送核心（core.response_delivery）。
+    nonebot.init()
+    driver = nonebot.get_driver()
+    driver.register_adapter(OneBotV11Adapter)
+
+    # FastAPI 0.141 的 add_api_websocket_route（NoneBot fastapi driver 挂 OneBot ws）在真实
+    # uvicorn 下会提前 close(403)。把 OneBot 的 APIWebSocketRoute 换成 Starlette WebSocketRoute。
+    # legacy 路径仍需要此补丁；平台主路径已在 run_primary 内置同款修复（Starlette WebSocketRoute）。
+    from core.nonebot_ws_patch import patch_nonebot_ws_routes
+
+    patch_nonebot_ws_routes(driver)
+
+    engine = create_engine()
+    register_handlers(engine)
+
+    # WebUI 管理面板 API
+    from core.webui import init_webui
+    from starlette.responses import FileResponse, RedirectResponse, Response
+    from starlette.staticfiles import StaticFiles
+
+    app = nonebot.get_asgi()
+    app.include_router(init_webui(engine))
+
+    # SPA 静态文件 + 路由回退
+    _webui_dist = Path(__file__).resolve().parent / "webui" / "dist"
+    _webui_index = _webui_dist / "index.html"
+    _webui_assets = _webui_dist / "assets"
+    if _webui_assets.is_dir():
+        app.mount("/webui/assets", StaticFiles(directory=str(_webui_assets)), name="webui-assets")
+
+    def _webui_missing_response() -> Response:
+        return Response(
+            "WebUI 静态页面未构建。请先执行：cd webui && npm install && npm run build，然后重启服务再访问 /webui/login",
+            status_code=503,
+            media_type="text/plain; charset=utf-8",
+        )
+
+    def _with_no_cache(resp: Response) -> Response:
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
+
+    @app.get("/webui/{path:path}")
+    async def _webui_spa(path: str):
+        if ".." in path:
+            return Response("Not found", status_code=404)
+        if path.lower().startswith("setup"):
+            if _webui_index.exists():
+                return RedirectResponse(url="/webui/", status_code=307)
+            return _webui_missing_response()
+        fp = _webui_dist / path
+        if fp.is_file():
+            resp = FileResponse(fp)
+            if fp.name.lower() == "index.html":
+                return _with_no_cache(resp)
+            return resp
+        if _webui_index.exists():
+            return _with_no_cache(FileResponse(_webui_index))
+        return _webui_missing_response()
+
+    @app.get("/webui")
+    async def _webui_root():
+        if _webui_index.exists():
+            return _with_no_cache(FileResponse(_webui_index))
+        return _webui_missing_response()
+
+    @app.get("/login")
+    async def _login_alias():
+        return RedirectResponse(url="/webui/login", status_code=307)
+
+    @app.get("/")
+    async def _root_redirect():
         if _webui_index.exists():
             return RedirectResponse(url="/webui/", status_code=307)
         return _webui_missing_response()
-    fp = _webui_dist / path
-    if fp.is_file():
-        resp = FileResponse(fp)
-        if fp.name.lower() == "index.html":
-            return _with_no_cache(resp)
-        return resp
-    if _webui_index.exists():
-        return _with_no_cache(FileResponse(_webui_index))
-    return _webui_missing_response()
 
-
-@app.get("/webui")
-async def _webui_root():
-    if _webui_index.exists():
-        return _with_no_cache(FileResponse(_webui_index))
-    return _webui_missing_response()
-
-
-@app.get("/login")
-async def _login_alias():
-    return RedirectResponse(url="/webui/login", status_code=307)
-
-
-@app.get("/")
-async def _root_redirect():
-    if _webui_index.exists():
-        return RedirectResponse(url="/webui/", status_code=307)
-    return _webui_missing_response()
+    nonebot.run()
 
 
 if __name__ == "__main__":
-    nonebot.run()
+    main()

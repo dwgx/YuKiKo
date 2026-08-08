@@ -442,9 +442,12 @@ def make_engine(
     engine._media_artifact_index: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
     engine._media_artifact_index_max = 500
     engine._agent_conversation_locks: dict[str, asyncio.Lock] = {}
+    engine._agent_conversation_locks_max = 500
     engine._last_reply_state: dict[str, Any] = {}
+    engine._last_resume_token: dict[str, str] = {}
     engine._promotion_counters: dict[str, int] = {}
     engine._group_member_name_cache: dict[int, Any] = {}
+    engine._group_member_name_cache_max = 200
     engine._runtime_webui_bridge: dict[str, Any] = {}
     engine.verbosity = "normal"
     engine._verbosity_group_overrides: dict[str, str] = {}
@@ -475,6 +478,18 @@ def make_engine(
     except (TypeError, ValueError):
         profile_chars = 800
     engine._profile_summary_max_chars = max(200, min(3000, profile_chars))
+    try:
+        memory_context_chars = int(memory_cfg.get("memory_context_max_chars", 1600))
+    except (TypeError, ValueError):
+        memory_context_chars = 1600
+    engine._memory_context_max_chars = max(200, min(6000, memory_context_chars))
+    try:
+        related_memories_chars = int(
+            memory_cfg.get("related_memories_max_chars", 1200)
+        )
+    except (TypeError, ValueError):
+        related_memories_chars = 1200
+    engine._related_memories_max_chars = max(200, min(6000, related_memories_chars))
 
     # ── 组件 ──
     engine.admin = StubAdmin(

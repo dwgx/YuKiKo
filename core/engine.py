@@ -42,7 +42,7 @@ from core.knowledge import KnowledgeBase
 from core.knowledge_updater import KnowledgeUpdater
 from core.markdown import MarkdownRenderer
 from core.mcp_client import MCPConnectorManager, MCPTrustStore
-from core.memory import MemoryEngine, budget_text_parts
+from core.memory import MemoryEngine, budget_text_lines, budget_text_parts
 from core.memory_promotion import (
     apply_operations,
     consolidate_memory,
@@ -253,6 +253,9 @@ class YukikoEngine:
                 len(self.sticker.get_unregistered()),
             )
         self._last_reply_state: dict[str, dict[str, Any]] = {}
+        # 会话级恢复凭据：conversation_id -> 最近一次 agent 兜底结果的 checkpoint id
+        # （= 该次尝试的 trace_id）。queue 超时重试机制可据此续跑。
+        self._last_resume_token: dict[str, str] = {}
         self._promotion_counters: dict[str, int] = {}
         self._pending_fragments: dict[str, dict[str, Any]] = {}
         self._recent_directed_hints: dict[str, datetime] = {}
@@ -894,6 +897,29 @@ class YukikoEngine:
                     self.model_client if hasattr(self, "model_client") else None
                 ),
             )
+        # 蓝图 §4.6：记忆注入护栏——最近对话 / 相关记忆两段的字符上限
+        # （画像段用 _profile_summary_max_chars，在 __init__ 里读）。
+        memory_cfg = self.config.get("memory", {})
+        if not isinstance(memory_cfg, dict):
+            memory_cfg = {}
+        try:
+            memory_context_max_chars = int(
+                memory_cfg.get("memory_context_max_chars", 1600)
+            )
+        except (TypeError, ValueError):
+            memory_context_max_chars = 1600
+        self._memory_context_max_chars = max(
+            200, min(6000, memory_context_max_chars)
+        )
+        try:
+            related_memories_max_chars = int(
+                memory_cfg.get("related_memories_max_chars", 1200)
+            )
+        except (TypeError, ValueError):
+            related_memories_max_chars = 1200
+        self._related_memories_max_chars = max(
+            200, min(6000, related_memories_max_chars)
+        )
 
     def get_verbosity(self, group_id: int | str = 0) -> str:
         """获取指定群的输出详细度。"""
@@ -1934,6 +1960,14 @@ class YukikoEngine:
             memory_context=memory_context,
             related_memories=related_memories,
         )
+        # 蓝图 §4.6：记忆 / 相关两段在注入前做字符预算（画像段 L1781 已预算），
+        # 与 prune 的条数上限叠加成双层护栏，防单行超长或总量失控。
+        memory_context = budget_text_lines(
+            memory_context, max_chars=self._memory_context_max_chars
+        )
+        related_memories = budget_text_lines(
+            related_memories, max_chars=self._related_memories_max_chars
+        )
         return TurnContext(
             memory_context=memory_context,
             related_memories=related_memories,
@@ -2862,6 +2896,16 @@ class YukikoEngine:
                 inner_budget = 0.0
             if inner_budget > 0:
                 agent_timeout = max(agent_timeout, min(300.0, inner_budget + 6.0))
+            # queue 超时重试同一消息时，EngineMessage 携带上一回合的 checkpoint id，
+            # 传给 AgentLoop 从快照续跑，跳过已完成步骤。
+            resume_checkpoint_id = str(message.resume_checkpoint_id or "")
+            if resume_checkpoint_id:
+                self.logger.info(
+                    "agent_resume_attached | trace=%s | 会话=%s | resume_id=%s",
+                    message.trace_id,
+                    message.conversation_id,
+                    resume_checkpoint_id,
+                )
             self.logger.info(
                 "agent_timeout_budget | trace=%s | outer=%.1fs | inner=%.1fs | has_media=%s | download_like=%s",
                 message.trace_id,
@@ -2883,12 +2927,12 @@ class YukikoEngine:
                     )
                 async with lock:
                     agent_result = await asyncio.wait_for(
-                        self.agent.run(ctx),
+                        self.agent.run(ctx, resume_checkpoint_id=resume_checkpoint_id),
                         timeout=agent_timeout,
                     )
             else:
                 agent_result = await asyncio.wait_for(
-                    self.agent.run(ctx),
+                    self.agent.run(ctx, resume_checkpoint_id=resume_checkpoint_id),
                     timeout=agent_timeout,
                 )
             self.logger.info(
@@ -2901,6 +2945,12 @@ class YukikoEngine:
                 agent_result.total_time_ms,
                 agent_result.reason,
             )
+            # 兜底结果带恢复凭据（= 本回合 checkpoint 的 trace_id）：存入会话状态，
+            # 供 queue 超时重试机制按 conversation 取回续跑。
+            if agent_result.resume_checkpoint_id:
+                self._last_resume_token[message.conversation_id] = (
+                    agent_result.resume_checkpoint_id
+                )
             # 这里以前是 `_should_block_undirected_agent_plain_reply`：模型已经产出回复后，
             # 代码再按 trigger.reason 把「没调工具的纯文本」整条丢掉。实测它与回复内容无关
             # （同一场景下换任何文本都照丢），属于代码事后否决模型，已删除。
@@ -3090,6 +3140,14 @@ class YukikoEngine:
                 reason=agent_result.reason,
                 text=text,
             )
+            meta: dict[str, Any] = {
+                "trace_id": message.trace_id,
+                "agent_steps": len(agent_result.steps),
+                "agent_tool_calls": agent_result.tool_calls_made,
+                "agent_time_ms": agent_result.total_time_ms,
+            }
+            if agent_result.resume_checkpoint_id:
+                meta["resume_token"] = agent_result.resume_checkpoint_id
             return EngineResponse(
                 action=agent_result.action,
                 reason=agent_result.reason,
@@ -3098,12 +3156,7 @@ class YukikoEngine:
                 image_urls=agent_result.image_urls,
                 video_url=agent_result.video_url,
                 audio_file=agent_result.audio_file,
-                meta={
-                    "trace_id": message.trace_id,
-                    "agent_steps": len(agent_result.steps),
-                    "agent_tool_calls": agent_result.tool_calls_made,
-                    "agent_time_ms": agent_result.total_time_ms,
-                },
+                meta=meta,
             )
         except TimeoutError:
 
@@ -3121,6 +3174,14 @@ class YukikoEngine:
                 exc,
             )
             return None
+
+    def get_last_resume_token(self, conversation_id: str) -> str:
+        """返回会话最近一次 agent 兜底结果的恢复凭据（checkpoint 的 trace_id）。
+
+        queue 超时重试同一消息时取回，作为 EngineMessage.resume_checkpoint_id
+        传回 engine，AgentLoop 从快照续跑而非从头再来。无凭据返回空串。
+        """
+        return self._last_resume_token.get(conversation_id, "")
 
     async def _route_with_failover(
         self, payload: RouterInput

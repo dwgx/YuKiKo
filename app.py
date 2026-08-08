@@ -2682,6 +2682,13 @@ def register_handlers(engine: YukikoEngine) -> None:
                 str(getattr(dispatch, "pending_count", 0)),
             )
             pending_count = int(getattr(dispatch, "pending_count", 0) or 0)
+            # 超时取消时带出恢复凭据：记入会话上下文，重试同一消息时取回作为
+            # EngineMessage.resume_checkpoint_id 从快照续跑。
+            dispatch_resume_token = str(getattr(dispatch, "resume_token", "") or "")
+            if dispatch_resume_token:
+                _latest_queue_task_ctx.setdefault(conversation_id, {})[
+                    "resume_token"
+                ] = dispatch_resume_token
             latest_ctx = _latest_queue_task_ctx.get(conversation_id)
             if isinstance(latest_ctx, dict):
                 latest_seq_for_cleanup = int(latest_ctx.get("seq", -1) or -1)

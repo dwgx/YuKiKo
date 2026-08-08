@@ -91,6 +91,32 @@ def budget_text_parts(parts: list[str], max_chars: int, separator: str = " ") ->
     return separator.join(out)
 
 
+def budget_text_lines(lines: list[str], max_chars: int) -> list[str]:
+    """对记忆行列表做字符预算（budget_text_parts 的列表形态，蓝图 §4.6）。
+
+    逐行累加并保留列表结构（供上层按行渲染）；超预算时截断当前行并停止，
+    单行超长同样只保留预算内的前缀。
+    """
+    if max_chars <= 0:
+        return []
+    out: list[str] = []
+    used = 0
+    for line in lines:
+        text = (line or "").strip()
+        if not text:
+            continue
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        if len(text) <= remaining:
+            out.append(text)
+            used += len(text)
+        else:
+            out.append(text[:remaining].rstrip())
+            break
+    return out
+
+
 @dataclass(slots=True)
 class MemoryMessage:
     role: str

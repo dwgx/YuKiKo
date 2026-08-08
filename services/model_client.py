@@ -9,6 +9,7 @@ from services.anthropic import AnthropicClient
 from services.deepseek import DeepSeekClient
 from services.gemini import GeminiClient
 from services.mistral import MistralClient
+from services.model_quality import ModelQualityTracker
 from services.moonshot import MoonshotClient
 from services.newapi import NewAPIClient
 from services.openai import OpenAIClient
@@ -153,6 +154,9 @@ class ModelClient:
         self._primary_provider = provider  # 永远记住主 provider
         self._failover_at: float = 0.0  # 降级发生的时间戳
         self._recovery_interval: float = float(raw.get("recovery_interval_seconds", 300))  # 5分钟后尝试回切
+        # 质量评测：始终记录每次调用的成败/延迟；仅当 rank_failover 开启时才用它重排 fallback 链
+        self._rank_failover = bool(raw.get("rank_failover", False))
+        self._quality_tracker = ModelQualityTracker()
         self._init_fallbacks(raw)
 
     @property
@@ -245,7 +249,9 @@ class ModelClient:
             primary_client = self.client
             if self._supports_method(primary_client, method_name):
                 try:
-                    result = await getattr(primary_client, method_name)(*args, **kwargs)
+                    result = await self._timed_invoke(
+                        self._primary_provider, primary_client, method_name, *args, **kwargs
+                    )
                     _log.info(
                         "provider_recovery_ok | %s -> %s | method=%s",
                         self._active_provider, self._primary_provider, method_name,
@@ -272,7 +278,7 @@ class ModelClient:
             )
         else:
             try:
-                return await getattr(active_client, method_name)(*args, **kwargs)
+                return await self._timed_invoke(active_provider, active_client, method_name, *args, **kwargs)
             except Exception as exc:
                 if not self._fallback_providers or not self._fallback_supported_error(method_name, exc):
                     raise
@@ -283,14 +289,14 @@ class ModelClient:
                     exc,
                 )
 
-        for prov in self._fallback_providers:
+        for prov in self._ordered_fallback_providers():
             if prov == active_provider:
                 continue
             client = self._fallback_clients.get(prov)
             if not client or not self._supports_method(client, method_name):
                 continue
             try:
-                result = await getattr(client, method_name)(*args, **kwargs)
+                result = await self._timed_invoke(prov, client, method_name, *args, **kwargs)
                 _log.info(
                     "provider_failover_ok | %s -> %s | method=%s",
                     active_provider,
@@ -309,6 +315,68 @@ class ModelClient:
                 )
 
         raise RuntimeError("所有 provider 均不可用")
+
+    async def _timed_invoke(self, provider: str, client: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        """带计时调用一次 client 方法，并把成败/延迟/错误类型记入质量评测。"""
+        model = str(getattr(client, "model", "") or "")
+        start = time.monotonic()
+        try:
+            result = await getattr(client, method_name)(*args, **kwargs)
+            self.record_outcome(provider, model, True, (time.monotonic() - start) * 1000.0, "success")
+            return result
+        except Exception as exc:
+            self.record_outcome(
+                provider,
+                model,
+                False,
+                (time.monotonic() - start) * 1000.0,
+                self._classify_error(exc),
+            )
+            raise
+
+    @classmethod
+    def _classify_error(cls, exc: Exception) -> str:
+        """把异常归类为评测用的错误类型：拒绝（认证/配额/限流）> 超时/网络 > 其它。"""
+        if cls._is_fatal_error(exc):
+            return "reject"
+        if cls._is_transient_error(exc):
+            return "timeout"
+        return "error"
+
+    def _ordered_fallback_providers(self) -> list[str]:
+        """返回本次 failover 尝试的 provider 顺序。
+
+        ``rank_failover`` 开启时按历史质量分降序重排：有足够样本的 provider 高分优先，
+        样本不足的保持配置顺序排在后面（稳定排序，不改变未评分 provider 的相对次序）。
+        默认关闭，此时原样返回配置顺序，线上行为不变。
+        """
+        if not self._rank_failover:
+            return list(self._fallback_providers)
+
+        def rank_key(prov: str) -> tuple[int, float]:
+            client = self._fallback_clients.get(prov)
+            model = str(getattr(client, "model", "") or "")
+            score = self._quality_tracker.score_for(prov, model)
+            if score is None:
+                return (1, 0.0)
+            return (0, -score)
+
+        return sorted(self._fallback_providers, key=rank_key)
+
+    def record_outcome(
+        self,
+        provider: str,
+        model: str,
+        ok: bool,
+        latency_ms: float,
+        error_type: str = "success",
+    ) -> None:
+        """记录一次模型调用结果（成功/失败 + 延迟），供质量评测打分。"""
+        self._quality_tracker.record_outcome(provider, model, ok, latency_ms, error_type)
+
+    def get_model_rankings(self, min_samples: int = 3) -> list[tuple[str, float]]:
+        """按质量分降序返回 [(model, score)]，供外部查看 failover 链候选的评测结果。"""
+        return self._quality_tracker.get_rankings(min_samples)
 
     @staticmethod
     def _prune_tools_schema(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:

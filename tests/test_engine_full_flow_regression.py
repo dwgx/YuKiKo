@@ -24,8 +24,8 @@ def _wrap_run_to_capture(engine, results: list[AgentResult]) -> None:
     """用真实 run() 包一层，捕获 AgentResult 供 steps 断言。"""
     real_run = engine.agent.run
 
-    async def wrapped(ctx):
-        result = await real_run(ctx)
+    async def wrapped(ctx, **kwargs):
+        result = await real_run(ctx, **kwargs)
         results.append(result)
         return result
 

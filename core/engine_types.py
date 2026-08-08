@@ -66,6 +66,10 @@ class EngineMessage:
     # 原始 OneBot/NapCat 事件快照（用于 Agent 上下文和工具侧高级判断）
     event_payload: dict[str, Any] = field(default_factory=dict)
 
+    # queue 超时重试上一回合时携带的恢复凭据（= 上一回合 checkpoint 的 trace_id）。
+    # engine 会把它传给 AgentLoop.run(resume_checkpoint_id=...) 从快照续跑。
+    resume_checkpoint_id: str = ""
+
 
 @dataclass(slots=True)
 class EngineResponse:
