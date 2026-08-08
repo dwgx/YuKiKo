@@ -117,6 +117,11 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "vector_dim": 64,
             "retrieve_top_k": 5,
             "privacy_filter": False,
+            "reflection_enable": True,
+            "reflection_interval_messages": 15,
+            "reflection_interval_minutes": 10,
+            "reflection_model": "",
+            "reflection_max_tokens": 200,
         },
         "knowledge_update": {
             "llm_extractor_enable": True,

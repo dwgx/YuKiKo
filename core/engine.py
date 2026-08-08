@@ -260,6 +260,9 @@ class YukikoEngine:
         self._last_resume_token: dict[str, tuple[str, float]] = {}
         self._resume_token_ttl_seconds = 1800
         self._promotion_counters: dict[str, int] = {}
+        # 回合级反思节流：conversation_id -> 距上次反思的消息计数 / monotonic 时间戳
+        self._reflection_counters: dict[str, int] = {}
+        self._reflection_last_ts: dict[str, float] = {}
         self._pending_fragments: dict[str, dict[str, Any]] = {}
         self._recent_directed_hints: dict[str, datetime] = {}
         self._recent_search_cache: dict[str, dict[str, Any]] = {}
@@ -424,6 +427,106 @@ class YukikoEngine:
         if promoted:
             self.logger.info("memory_promotion_applied | user=%s | promoted=%d", user_id, promoted)
         return {"ok": True, "promoted": promoted}
+
+    async def _run_memory_reflection(
+        self, user_id: str, conversation_id: str, trace_id: str = ""
+    ) -> None:
+        """回合级记忆反思（Hermes 风格）：后台静默提炼最近对话的长期事实。
+
+        失败安全：模型失败/超时/解析失败一律静默跳过，绝不抛到 _after_reply。
+        写入走既有 add_memory_record（actor=agent.reflection 记入审计流），
+        靠 embeddings 唯一索引防重复；不触发任何晋升（晋升仍走 _run_memory_promotion 自己的门）。
+        """
+        try:
+            if getattr(self, "model_client", None) is None:
+                return
+            recent_texts = self.memory.get_recent_texts(conversation_id, limit=30)
+            if not recent_texts:
+                return
+            excerpt = "\n".join(recent_texts[-30:])[:2000]
+            cfg = self.config.get("memory", {})
+            model = normalize_text(str(cfg.get("reflection_model", ""))) or None
+            max_tokens = max(64, int(cfg.get("reflection_max_tokens", 200)))
+            result = await asyncio.wait_for(
+                self.model_client.chat_text(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "你是记忆提炼器。从对话中提炼值得长期记住的事实"
+                                "（用户偏好/身份/重要事件），忽略一次性闲聊。"
+                                '只输出 JSON: {"facts":["事实1","事实2"]}'
+                            ),
+                        },
+                        {"role": "user", "content": excerpt},
+                    ],
+                    max_tokens=max_tokens,
+                    model=model,
+                ),
+                timeout=20.0,
+            )
+            facts = self._parse_reflection_facts(result)
+            if not facts:
+                return
+            written = 0
+            for fact in facts:
+                ok, _, _ = self.memory.add_memory_record(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    role="user",
+                    content=fact,
+                    actor="agent.reflection",
+                    note="回合反思提炼",
+                    reason="memory_reflection",
+                )
+                if ok:
+                    written += 1
+            self.logger.info(
+                "memory_reflection_applied | trace=%s | conversation=%s | user=%s | provenance=agent.reflection | extracted=%d | written=%d",
+                trace_id,
+                conversation_id,
+                user_id,
+                len(facts),
+                written,
+            )
+        except Exception:
+            self.logger.debug(
+                "memory_reflection_skip | trace=%s | conversation=%s | user=%s",
+                trace_id,
+                conversation_id,
+                user_id,
+            )
+
+    @staticmethod
+    def _parse_reflection_facts(raw: str) -> list[str]:
+        """从模型输出宽松提取 facts 列表；解析失败返回空列表（静默跳过）。"""
+        text = normalize_text(str(raw or ""))
+        if not text:
+            return []
+        data: Any = None
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        if not isinstance(data, dict):
+            first = text.find("{")
+            last = text.rfind("}")
+            if first >= 0 and last > first:
+                try:
+                    data = json.loads(text[first : last + 1])
+                except (json.JSONDecodeError, ValueError):
+                    data = None
+        if not isinstance(data, dict):
+            return []
+        facts = data.get("facts")
+        if not isinstance(facts, list):
+            return []
+        out: list[str] = []
+        for item in facts:
+            fact = normalize_text(str(item))
+            if len(fact) >= 2 and fact not in out:
+                out.append(fact[:200])
+        return out
 
     async def _auto_register_stickers(self) -> None:
         """后台自动注册未识别的表情包 (不阻塞主流程)。"""
@@ -5681,6 +5784,42 @@ class YukikoEngine:
                     asyncio.create_task(
                         self._run_memory_promotion(uid, message.conversation_id)
                     )
+            # 回合级反思（Hermes 风格）：每 N 条消息或每 T 分钟后台提炼一次，不阻塞回复。
+            reflection_cfg = self.config.get("memory", {})
+            if (
+                bool(reflection_cfg.get("reflection_enable", True))
+                and message.conversation_id
+            ):
+                # 测试用 __new__ 裸构造引擎不带这两个属性，这里惰性补齐。
+                if not hasattr(self, "_reflection_counters"):
+                    self._reflection_counters = {}
+                if not hasattr(self, "_reflection_last_ts"):
+                    self._reflection_last_ts = {}
+                conv_key = str(message.conversation_id)
+                interval_messages = max(
+                    1, int(reflection_cfg.get("reflection_interval_messages", 15))
+                )
+                interval_minutes = max(
+                    1, int(reflection_cfg.get("reflection_interval_minutes", 10))
+                )
+                counter = self._reflection_counters.get(conv_key, 0) + 1
+                now_mono = time.monotonic()
+                last_ts = self._reflection_last_ts.get(conv_key, 0.0)
+                # last_ts=0 表示从未反思过：首次触发只认消息数，避免进程刚启动就因
+                # monotonic 累计值误触发时间兜底。
+                time_due = last_ts > 0 and (
+                    now_mono - last_ts >= interval_minutes * 60
+                )
+                if counter >= interval_messages or time_due:
+                    self._reflection_counters[conv_key] = 0
+                    self._reflection_last_ts[conv_key] = now_mono
+                    asyncio.create_task(
+                        self._run_memory_reflection(
+                            str(message.user_id), conv_key, message.trace_id
+                        )
+                    )
+                else:
+                    self._reflection_counters[conv_key] = counter
 
         # ── 对话摘要归档 (MemGPT archival): 每 N 条消息生成摘要 ──
         if bool(self.config.get("bot", {}).get("allow_memory", True)):

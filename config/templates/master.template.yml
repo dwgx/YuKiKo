@@ -36,6 +36,13 @@ config:
     vector_dim: 64
     retrieve_top_k: 5
     privacy_filter: false
+    # 回合级反思（Hermes 风格后台反思）：每 N 条消息或每 T 分钟对最近对话提炼一次长期事实
+    reflection_enable: true
+    reflection_interval_messages: 15
+    reflection_interval_minutes: 10
+    # 可选便宜模型名（如 gpt-4o-mini）；留空用主模型但 max_tokens 收窄
+    reflection_model: ''
+    reflection_max_tokens: 200
   knowledge_update:
     llm_extractor_enable: true
     llm_timeout_seconds: 18

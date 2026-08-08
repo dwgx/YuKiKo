@@ -29,6 +29,11 @@ from utils.text import clip_text, normalize_text
 # 而 handler 里的 try/except 把它包成 error="extract_error" —— 看起来像"提取失败"，
 # 实际是符号不存在。实测线上 2 次调用全废，而它正是音乐放不出来时模型给的替代方案。
 # ruff 基线上就报了这条 F821，没人看。
+from core.candidate_scoring import (
+    kind_for_url,
+    parse_height_from_quality,
+    pick_best_candidate,
+)
 from core.search import SearchEngine, SearchResult
 from core.tools_types import (
     ToolResult,
@@ -3403,6 +3408,14 @@ class ToolVideoMixin:
         parsed_url = await self._resolve_platform_video_via_parse_api(url)
         if parsed_url:
             return parsed_url
+
+        # 多解析器聚合兜底（保守）：仅当 yt-dlp 与 parse-api 都失败后才触发。
+        # you-get / streamlink 只有探测到二进制存在才会跑，候选按 URL 去重，
+        # 多来源命中同一 URL 加 evidence 分，最后经 pick_best_candidate 选优并本地下载。
+        aggregated_url = await self._resolve_video_candidates_aggregated(url)
+        if aggregated_url:
+            return aggregated_url
+
         if self._last_video_resolve_diagnostic.get(url, "").startswith("ytdlp:"):
             return ""
         self._last_video_resolve_diagnostic[url] = (
@@ -3420,9 +3433,8 @@ class ToolVideoMixin:
         _ = url
         return False
 
-    def _extract_platform_video_direct_url_sync(self, source_url: str) -> str:
-        if YoutubeDL is None:
-            return ""
+    def _build_ytdlp_probe_options(self) -> dict[str, Any]:
+        """yt-dlp 只探格式不下载时共用的 options（cookie 注入由调用方负责）。"""
         options = {
             "quiet": True,
             "no_warnings": True,
@@ -3437,6 +3449,40 @@ class ToolVideoMixin:
             options["cookiefile"] = self._video_cookies_file
         if self._video_cookies_from_browser:
             options["cookiesfrombrowser"] = (self._video_cookies_from_browser,)
+        return options
+
+    def _collect_platform_direct_candidate_urls(self, info: Any) -> list[str]:
+        """从 yt-dlp info dict 收集候选直链（跳过 m3u8 / 被拦截 URL）。"""
+        candidates: list[str] = []
+
+        def add(value: Any) -> None:
+            if not isinstance(value, str):
+                return
+            url = _unwrap_redirect_url(normalize_text(value))
+            if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+                return
+            if self._is_blocked_video_url(url):
+                return
+            if ".m3u8" in url.lower():
+                return
+            candidates.append(url)
+
+        if isinstance(info, dict):
+            add(info.get("url"))
+            for key in ("requested_formats", "formats"):
+                rows = info.get(key)
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    add(row.get("url"))
+        return candidates
+
+    def _extract_platform_video_direct_url_sync(self, source_url: str) -> str:
+        if YoutubeDL is None:
+            return ""
+        options = self._build_ytdlp_probe_options()
         _tmp_cookie_file = self._inject_platform_cookiefile(options, source_url)
         try:
             with YoutubeDL(options) as ydl:
@@ -3452,35 +3498,227 @@ class ToolVideoMixin:
                     pass
         if not isinstance(info, dict):
             return ""
-
-        candidates: list[str] = []
-
-        def add(value: Any) -> None:
-            if not isinstance(value, str):
-                return
-            url = _unwrap_redirect_url(normalize_text(value))
-            if not re.match(r"^https?://", url, flags=re.IGNORECASE):
-                return
-            if self._is_blocked_video_url(url):
-                return
-            if ".m3u8" in url.lower():
-                return
-            candidates.append(url)
-
-        add(info.get("url"))
-        for key in ("requested_formats", "formats"):
-            rows = info.get(key)
-            if not isinstance(rows, list):
-                continue
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                add(row.get("url"))
-
+        candidates = self._collect_platform_direct_candidate_urls(info)
         for item in candidates:
             if self._is_direct_video_url(item):
                 return item
         return candidates[0] if candidates else ""
+
+    def _probe_resolver_json(
+        self, executable: str, extra_args: list[str], source_url: str
+    ) -> dict[str, Any] | None:
+        """探测第三方解析器（you-get/streamlink）的 --json 输出，失败返回 None。"""
+        timeout = max(15, min(90, int(self._video_download_timeout_seconds)))
+        cmd = [executable, *extra_args, source_url]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                **macos_subprocess_kwargs(),
+            )
+        except Exception as exc:
+            _ytdlp_log.info(
+                "alt_resolver_probe_error | exe=%s | err=%s",
+                executable,
+                str(exc)[:150],
+            )
+            return None
+        if proc.returncode != 0:
+            return None
+        try:
+            return json.loads(proc.stdout or "{}")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_youget_json_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """you-get --json 输出 → 候选列表（每个 stream 可能含多个 URL）。"""
+        candidates: list[dict[str, Any]] = []
+        streams = payload.get("streams")
+        if not isinstance(streams, dict):
+            return candidates
+        for stream in streams.values():
+            if not isinstance(stream, dict):
+                continue
+            height = parse_height_from_quality(
+                normalize_text(str(stream.get("quality", "")))
+            )
+            urls = stream.get("url")
+            if isinstance(urls, str):
+                urls = [urls]
+            if not isinstance(urls, list):
+                continue
+            for item in urls:
+                if not isinstance(item, str) or not item:
+                    continue
+                candidates.append(
+                    {
+                        "url": item,
+                        "kind": kind_for_url(item),
+                        "height": height,
+                        "source": "you-get",
+                    }
+                )
+        return candidates
+
+    @staticmethod
+    def _parse_streamlink_json_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """streamlink --json 输出 → 候选列表（stream 名如 "720p"/"best"）。"""
+        candidates: list[dict[str, Any]] = []
+        streams = payload.get("streams")
+        if not isinstance(streams, dict):
+            return candidates
+        for key, stream in streams.items():
+            if not isinstance(stream, dict):
+                continue
+            url = stream.get("url")
+            if not isinstance(url, str) or not url:
+                continue
+            quality = normalize_text(str(stream.get("quality") or key))
+            candidates.append(
+                {
+                    "url": url,
+                    "kind": kind_for_url(url),
+                    "height": parse_height_from_quality(quality),
+                    "source": "streamlink",
+                }
+            )
+        return candidates
+
+    def _collect_aggregated_video_candidates(
+        self, source_url: str
+    ) -> list[dict[str, Any]]:
+        """聚合 yt-dlp / you-get / streamlink 候选，按 URL 去重并累计证据数。
+
+        只做候选收集，不做选择；同 URL 多来源时 evidence_count+1。
+        """
+        candidates: list[dict[str, Any]] = []
+        by_url: dict[str, int] = {}
+
+        def add(cand: dict[str, Any], source: str) -> None:
+            url = _unwrap_redirect_url(normalize_text(str(cand.get("url", ""))))
+            if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+                return
+            if self._is_blocked_video_url(url):
+                return
+            index = by_url.get(url)
+            if index is None:
+                cand = dict(cand)
+                cand["url"] = url
+                cand["evidence_count"] = 1
+                cand["sources"] = [source]
+                by_url[url] = len(candidates)
+                candidates.append(cand)
+                return
+            existing = candidates[index]
+            existing["evidence_count"] = int(existing.get("evidence_count", 1)) + 1
+            if source not in existing.setdefault("sources", []):
+                existing["sources"].append(source)
+
+        # 1) yt-dlp 格式候选：即使下载失败，format 列表可能仍可用。
+        if YoutubeDL is not None:
+            options = self._build_ytdlp_probe_options()
+            _tmp_cookie_file = self._inject_platform_cookiefile(options, source_url)
+            try:
+                with YoutubeDL(options) as ydl:
+                    info = ydl.extract_info(source_url, download=False)
+                if isinstance(info, dict):
+                    self._add_ytdlp_info_candidates(add, info)
+            except Exception as exc:
+                self._disable_cookie_browser_on_error(str(exc))
+            finally:
+                if _tmp_cookie_file:
+                    try:
+                        os.unlink(_tmp_cookie_file)
+                    except OSError:
+                        pass
+
+        # 2) you-get / streamlink：仅当二进制探测到才跑。
+        you_get = shutil.which("you-get")
+        if you_get:
+            payload = self._probe_resolver_json(you_get, ["--json"], source_url)
+            if isinstance(payload, dict):
+                for cand in self._parse_youget_json_payload(payload):
+                    add(cand, "you-get")
+        streamlink = shutil.which("streamlink")
+        if streamlink:
+            payload = self._probe_resolver_json(streamlink, ["--json"], source_url)
+            if isinstance(payload, dict):
+                for cand in self._parse_streamlink_json_payload(payload):
+                    add(cand, "streamlink")
+
+        return candidates
+
+    @staticmethod
+    def _add_ytdlp_info_candidates(
+        add: Callable[[dict[str, Any], str], None], info: dict[str, Any]
+    ) -> None:
+        """把 yt-dlp info dict 的顶层 url 与 formats 逐行加入聚合候选。"""
+        if info.get("url"):
+            add(
+                {
+                    "url": info["url"],
+                    "kind": kind_for_url(str(info["url"])),
+                    "height": info.get("height"),
+                    "width": info.get("width"),
+                    "bitrate": info.get("tbr"),
+                },
+                "yt-dlp",
+            )
+        rows = info.get("formats")
+        if not isinstance(rows, list):
+            rows = info.get("requested_formats")
+        if not isinstance(rows, list):
+            return
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            url = row.get("url")
+            if not isinstance(url, str) or not url:
+                continue
+            add(
+                {
+                    "url": url,
+                    "kind": kind_for_url(url),
+                    "height": row.get("height"),
+                    "width": row.get("width"),
+                    "bitrate": row.get("tbr"),
+                },
+                "yt-dlp",
+            )
+
+    async def _resolve_video_candidates_aggregated(self, source_url: str) -> str:
+        """多解析器聚合兜底：候选经 pick_best_candidate 选优后再本地下载。
+
+        保守策略：仅由 _resolve_platform_video 在 yt-dlp / parse-api 都失败后调用。
+        """
+        return await asyncio.to_thread(
+            self._resolve_video_candidates_aggregated_sync, source_url
+        )
+
+    def _resolve_video_candidates_aggregated_sync(self, source_url: str) -> str:
+        candidates = self._collect_aggregated_video_candidates(source_url)
+        if not candidates:
+            return ""
+        best = pick_best_candidate(candidates)
+        best_url = normalize_text(str(best.get("url", "")))
+        if not best_url:
+            return ""
+        _ytdlp_log.info(
+            "video_aggregated_pick%s | url=%s | score=%s | evidence=%s | sources=%s",
+            _tool_trace_tag(),
+            best_url[:80],
+            best.get("score"),
+            best.get("evidence_count"),
+            best.get("sources"),
+        )
+        downloaded = self._download_platform_video_sync(best_url)
+        if downloaded:
+            return str(downloaded.resolve())
+        return ""
 
     async def _resolve_platform_video_via_parse_api(self, source_url: str) -> str:
         if not self._video_parse_enable or not self._video_parse_api_base:

@@ -26,6 +26,7 @@ from utils.text import normalize_text, tokenize
 # 必须分组且 utils 在前，否则本文件的 I001 会从 1 条涨到 2 条。
 # 同 core/admin.py:14-16 的处置。
 from core.audit import STREAM_MEMORY_WRITES, AuditTrail
+from core.memory_guard import clean_memory_content
 
 SYSTEM_NOISE_KEYWORDS = frozenset(
     {
@@ -1001,14 +1002,18 @@ class MemoryEngine:
         timestamp: datetime | None = None,
         user_name: str = "",
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
+        """写入一条对话消息；被记忆守卫拒绝（疑似敏感信息）时返回 False。"""
         text = normalize_text(content)
         if not text:
-            return
+            return False
         if self.privacy_filter:
             text = self._redact_sensitive_content(text)
             if not text:
-                return
+                return False
+        text = self._apply_memory_guard(text)
+        if not text:
+            return False
 
         ts = timestamp or datetime.now(timezone.utc)
         clean_user_name = normalize_text(user_name)
@@ -1044,6 +1049,7 @@ class MemoryEngine:
         self._message_counter += 1
         if self.enable_daily_log and self._message_counter % self.summary_every_n_messages == 0:
             self.write_daily_snapshot(day_key)
+        return True
 
     def add_media_artifacts(
         self,
@@ -1194,6 +1200,21 @@ class MemoryEngine:
         redacted = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[已隐藏手机号]", redacted)
         redacted = re.sub(r"\b(sk-[A-Za-z0-9_-]{12,})\b", "[已隐藏密钥]", redacted)
         return normalize_text(redacted)
+
+    def _apply_memory_guard(self, text: str) -> str:
+        """写入前扫描：critical 泄露拒绝（返回空串），warning 记录后剥离隐形字符。
+
+        返回空串时调用方必须放弃写入；返回非空串即清洗后可入库的文本。
+        """
+        cleaned, issues = clean_memory_content(text)
+        for issue in issues:
+            _log.warning(
+                "memory_guard_issue | severity=%s kind=%s detail=%s",
+                issue.severity,
+                issue.kind,
+                issue.detail,
+            )
+        return cleaned
 
     @staticmethod
     def _normalize_profile_text(text: str) -> str:
@@ -2003,6 +2024,9 @@ class MemoryEngine:
         fact_text = normalize_text(str(fact))
         if not uid or not fact_text or len(fact_text) < 2:
             return False
+        fact_text = self._apply_memory_guard(fact_text)
+        if not fact_text or len(fact_text) < 2:
+            return False
         if len(fact_text) > 200:
             fact_text = fact_text[:200]
         profile = self._user_profiles.get(uid, {})
@@ -2484,6 +2508,9 @@ class MemoryEngine:
             return False, "role 必须是 user/assistant/system", {}
         if not text:
             return False, "content 不能为空", {}
+        text = self._apply_memory_guard(text)
+        if not text:
+            return False, "memory_rejected_sensitive", {"reason": "内容疑似敏感信息，已拒绝写入"}
 
         created_at = datetime.now(timezone.utc).isoformat()
         emb = json.dumps(self._embed(text), ensure_ascii=False)
