@@ -68,6 +68,7 @@ CONFIG_SCHEMA: dict[str, tuple[tuple[type, ...], bool]] = {
     'api.max_tokens': ((int,), False),
     'api.model': ((str,), False),
     'api.provider': ((str,), False),
+    'api.rank_failover': ((bool,), False),
     'api.temperature': ((int, float), False),
     'api.timeout_seconds': ((int,), False),
     # audit 段（必填）

@@ -125,6 +125,7 @@ config:
     temperature: 0.7
     max_tokens: 1200
     timeout_seconds: 120
+    rank_failover: false
   agent:
     enable: true
     prefer_router_for_directed_plain_text: false

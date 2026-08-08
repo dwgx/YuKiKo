@@ -210,6 +210,7 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "temperature": 0.7,
             "max_tokens": 1200,
             "timeout_seconds": 120,
+            "rank_failover": False,
         },
         "agent": {
             "enable": True,

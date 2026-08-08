@@ -444,7 +444,8 @@ def make_engine(
     engine._agent_conversation_locks: dict[str, asyncio.Lock] = {}
     engine._agent_conversation_locks_max = 500
     engine._last_reply_state: dict[str, Any] = {}
-    engine._last_resume_token: dict[str, str] = {}
+    engine._last_resume_token: dict[str, tuple[str, float]] = {}
+    engine._resume_token_ttl_seconds = 1800
     engine._promotion_counters: dict[str, int] = {}
     engine._group_member_name_cache: dict[int, Any] = {}
     engine._group_member_name_cache_max = 200
@@ -478,18 +479,8 @@ def make_engine(
     except (TypeError, ValueError):
         profile_chars = 800
     engine._profile_summary_max_chars = max(200, min(3000, profile_chars))
-    try:
-        memory_context_chars = int(memory_cfg.get("memory_context_max_chars", 1600))
-    except (TypeError, ValueError):
-        memory_context_chars = 1600
-    engine._memory_context_max_chars = max(200, min(6000, memory_context_chars))
-    try:
-        related_memories_chars = int(
-            memory_cfg.get("related_memories_max_chars", 1200)
-        )
-    except (TypeError, ValueError):
-        related_memories_chars = 1200
-    engine._related_memories_max_chars = max(200, min(6000, related_memories_chars))
+    # _memory_context_max_chars / _related_memories_max_chars 已由 _init_from_config
+    # 从 memory 配置派生（engine.py），这里不重复实现，避免与 engine 默认值漂移。
 
     # ── 组件 ──
     engine.admin = StubAdmin(

@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import re
+import time
 import sys
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
@@ -255,7 +256,9 @@ class YukikoEngine:
         self._last_reply_state: dict[str, dict[str, Any]] = {}
         # 会话级恢复凭据：conversation_id -> 最近一次 agent 兜底结果的 checkpoint id
         # （= 该次尝试的 trace_id）。queue 超时重试机制可据此续跑。
-        self._last_resume_token: dict[str, str] = {}
+        # conversation -> (resume_checkpoint_id, ts)。TTL 过期惰性清理，防无界增长。
+        self._last_resume_token: dict[str, tuple[str, float]] = {}
+        self._resume_token_ttl_seconds = 1800
         self._promotion_counters: dict[str, int] = {}
         self._pending_fragments: dict[str, dict[str, Any]] = {}
         self._recent_directed_hints: dict[str, datetime] = {}
@@ -2946,10 +2949,11 @@ class YukikoEngine:
                 agent_result.reason,
             )
             # 兜底结果带恢复凭据（= 本回合 checkpoint 的 trace_id）：存入会话状态，
-            # 供 queue 超时重试机制按 conversation 取回续跑。
+            # 供 queue 超时重试机制按 conversation 取回续跑。带时间戳供 TTL 清理。
             if agent_result.resume_checkpoint_id:
                 self._last_resume_token[message.conversation_id] = (
-                    agent_result.resume_checkpoint_id
+                    agent_result.resume_checkpoint_id,
+                    time.time(),
                 )
             # 这里以前是 `_should_block_undirected_agent_plain_reply`：模型已经产出回复后，
             # 代码再按 trigger.reason 把「没调工具的纯文本」整条丢掉。实测它与回复内容无关
@@ -3179,9 +3183,16 @@ class YukikoEngine:
         """返回会话最近一次 agent 兜底结果的恢复凭据（checkpoint 的 trace_id）。
 
         queue 超时重试同一消息时取回，作为 EngineMessage.resume_checkpoint_id
-        传回 engine，AgentLoop 从快照续跑而非从头再来。无凭据返回空串。
+        传回 engine，AgentLoop 从快照续跑而非从头再来。无凭据或过期返回空串。
         """
-        return self._last_resume_token.get(conversation_id, "")
+        record = self._last_resume_token.get(conversation_id)
+        if not record:
+            return ""
+        token, ts = record
+        if time.time() - ts > self._resume_token_ttl_seconds:
+            self._last_resume_token.pop(conversation_id, None)
+            return ""
+        return token
 
     async def _route_with_failover(
         self, payload: RouterInput

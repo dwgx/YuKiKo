@@ -2006,6 +2006,12 @@ def register_handlers(engine: YukikoEngine) -> None:
             api_call=api_call,
             trace_id=trace_id,
             sender_role=_extract_sender_role(event),
+            # 超时重试续跑：优先用 queue 超时带出的 resume_token，其次 engine 侧
+            # 兜底结果存的凭据（get_last_resume_token），喂给本轮 AgentLoop 续跑。
+            resume_checkpoint_id=str(
+                _latest_queue_task_ctx.get(conversation_id, {}).get("resume_token", "")
+                or engine.get_last_resume_token(conversation_id)
+            ),
             event_payload=event_payload,
         )
         video_pre_ack_sent = False
