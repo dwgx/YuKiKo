@@ -2207,32 +2207,13 @@ class AgentLoop:
                                         "error": "final_answer 里出现了占位媒体链接（如 example.com）。请先调用工具获取真实 URL 再 final_answer。",
                                     })
                     continue
-                media_candidates = [
-                    normalize_text(url)
-                    for url in [image_url, *image_urls, video_url, audio_file]
-                    if normalize_text(url)
-                ]
+                media_candidates = self._collect_media_candidates(
+                    image_url, image_urls, video_url, audio_file
+                )
                 if media_candidates:
-                    known_media_urls = self._collect_known_media_urls(
-                        steps=steps, ctx=ctx
+                    out_of_chain_urls = self._collect_out_of_chain_media(
+                        media_candidates, steps, ctx
                     )
-                    known_local_media_paths = self._collect_known_local_media_paths(
-                        steps=steps, ctx=ctx
-                    )
-                    out_of_chain_urls: list[str] = []
-                    for candidate in media_candidates:
-                        if self._is_local_media_path(candidate):
-                            local_norm = self._normalize_local_media_path(candidate)
-                            if (
-                                not local_norm
-                                or local_norm not in known_local_media_paths
-                            ):
-                                out_of_chain_urls.append(candidate)
-                            continue
-                        if not self._url_matches_known_media(
-                            candidate, known_media_urls
-                        ):
-                            out_of_chain_urls.append(candidate)
                     if out_of_chain_urls:
                         dropped = {
                             normalize_text(item)
@@ -2503,20 +2484,18 @@ class AgentLoop:
                                     "error": "权限不足，该操作仅超级管理员可执行",
                                 })
                 continue
-            if tool_name in self._group_admin_tools and perm_level not in (
-                "super_admin",
-                "group_admin",
+            if self._should_block_group_admin_tool(
+                ctx, tool_name, tool_args, perm_level
             ):
-                if not self._is_regular_user_self_ban_attempt(ctx, tool_name, tool_args):
-                    steps.append(
-                        {"step": step_idx, "tool": tool_name, "blocked": "need_group_admin"}
-                    )
-                    self._append_tool_result(messages, parsed, assistant_msg, response_text, {
-                                        "tool": tool_name,
-                                        "ok": False,
-                                        "error": "权限不足，该操作需要群管理员或超级管理员权限",
-                                    })
-                    continue
+                steps.append(
+                    {"step": step_idx, "tool": tool_name, "blocked": "need_group_admin"}
+                )
+                self._append_tool_result(messages, parsed, assistant_msg, response_text, {
+                                    "tool": tool_name,
+                                    "ok": False,
+                                    "error": "权限不足，该操作需要群管理员或超级管理员权限",
+                                })
+                continue
             if (
                 tool_name in self._group_admin_tools
                 and tool_name != "delete_message"
@@ -2615,7 +2594,7 @@ class AgentLoop:
             loop_level, loop_streak = loop_guard.veto_if_looping(
                 tool_name, hash_call(tool_name, tool_args)
             )
-            if loop_level in ("critical", "circuit"):
+            if self._is_loop_guard_blocking_level(loop_level):
                 steps.append(
                     {
                         "step": step_idx,
@@ -2641,7 +2620,7 @@ class AgentLoop:
                     messages, parsed, assistant_msg, response_text, guard_payload
                 )
                 continue
-            if loop_level == "warn":
+            if self._is_loop_guard_warn_level(loop_level):
                 _log.warning(
                     "agent_loop_guard_warn | trace=%s | step=%d | tool=%s | streak=%d",
                     ctx.trace_id, step_idx, tool_name, loop_streak,
@@ -2942,6 +2921,63 @@ class AgentLoop:
         return await self._build_fallback_result(
             ctx, steps, tool_calls_made, t0, "max_steps_reached"
         )
+
+    def _should_block_group_admin_tool(
+        self,
+        ctx: AgentContext,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        perm_level: str,
+    ) -> bool:
+        """普通用户调群管理工具是否要拦：非 super_admin/group_admin 且非自助撤回例外。"""
+        if tool_name not in self._group_admin_tools:
+            return False
+        if perm_level in ("super_admin", "group_admin"):
+            return False
+        return not self._is_regular_user_self_ban_attempt(ctx, tool_name, tool_args)
+
+    def _collect_media_candidates(
+        self, image_url: str, image_urls: list[str], video_url: str, audio_file: str
+    ) -> list[str]:
+        """final_answer 携带的全部媒体候选：去空 + 归一化，image_url 保持在最前。"""
+        return [
+            normalize_text(url)
+            for url in [image_url, *image_urls, video_url, audio_file]
+            if normalize_text(url)
+        ]
+
+    def _collect_out_of_chain_media(
+        self,
+        media_candidates: list[str],
+        steps: list[dict[str, Any]],
+        ctx: AgentContext,
+    ) -> list[str]:
+        """不在本回合工具链 / 用户原始消息里的媒体候选。
+
+        与原内联逻辑完全一致：保留顺序与重复项（下游日志长度依赖它们），
+        只做收集，不改动任何状态。
+        """
+        known_media_urls = self._collect_known_media_urls(steps=steps, ctx=ctx)
+        known_local_media_paths = self._collect_known_local_media_paths(
+            steps=steps, ctx=ctx
+        )
+        out_of_chain_urls: list[str] = []
+        for candidate in media_candidates:
+            if self._is_local_media_path(candidate):
+                local_norm = self._normalize_local_media_path(candidate)
+                if not local_norm or local_norm not in known_local_media_paths:
+                    out_of_chain_urls.append(candidate)
+                continue
+            if not self._url_matches_known_media(candidate, known_media_urls):
+                out_of_chain_urls.append(candidate)
+        return out_of_chain_urls
+
+    def _is_loop_guard_blocking_level(self, level: str) -> bool:
+        """veto_if_looping 返回 critical/circuit 时阻断该步工具调用。"""
+        return level in ("critical", "circuit")
+
+    def _is_loop_guard_warn_level(self, level: str) -> bool:
+        return level == "warn"
 
     # ── 系统提示词构建 ──
 

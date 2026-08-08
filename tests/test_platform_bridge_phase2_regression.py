@@ -4,6 +4,7 @@
 1. `_event_to_engine_message` 把 OneBot 事件 dict 转成 EngineMessage（走 dispatcher 串行化）。
 2. `register_onebot11_platform` 配置 gate 关闭时不启动（避免无真机时改变生产路径）。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -26,11 +27,13 @@ class PlatformBridgeTests(unittest.TestCase):
             "is_private": False,
             "group_id": 42,
         }
-        msg = _event_to_engine_message(
-            event,
-            dispatcher=dispatcher,
-            bot_id="bot",
-            trace_builder=lambda conversation_id, seq: "t1",
+        msg = asyncio.run(
+            _event_to_engine_message(
+                event,
+                dispatcher=dispatcher,
+                bot_id="bot",
+                trace_builder=lambda conversation_id, seq: "t1",
+            )
         )
         self.assertEqual(msg.conversation_id, "group:42")
         self.assertEqual(msg.text, "hi")
@@ -42,9 +45,7 @@ class PlatformBridgeTests(unittest.TestCase):
     def test_register_disabled_gate_returns_none(self) -> None:
         engine = MagicMock()
         dispatcher = MagicMock()
-        result = asyncio.run(
-            register_onebot11_platform(engine, dispatcher, config={"enabled": False})
-        )
+        result = asyncio.run(register_onebot11_platform(engine, dispatcher, config={"enabled": False}))
         self.assertIsNone(result)
 
 

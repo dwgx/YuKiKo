@@ -224,7 +224,7 @@ def _wire_bridge(engine: Any, adapter: Any, cfg: dict[str, object]) -> None:
         try:
             from core.response_delivery import deliver_response
 
-            payload = _event_to_engine_message(
+            payload = await _event_to_engine_message(
                 event,
                 dispatcher=dispatcher,
                 bot_id=bot_id,

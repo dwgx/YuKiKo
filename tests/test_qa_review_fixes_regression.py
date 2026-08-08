@@ -193,9 +193,11 @@ class PlatformInboundParseTests(unittest.TestCase):
             "conversation_id": "group:1", "user_id": "999", "text": "hi",
             "message_id": "m1", "is_private": False, "group_id": 1, "chain": chain,
         }
-        msg = _event_to_engine_message(
-            event, dispatcher=_D(), bot_id="2488687937",
-            trace_builder=lambda conversation_id, seq: "t",
+        msg = asyncio.run(
+            _event_to_engine_message(
+                event, dispatcher=_D(), bot_id="2488687937",
+                trace_builder=lambda conversation_id, seq: "t",
+            )
         )
         self.assertTrue(msg.mentioned)
         self.assertEqual(msg.at_other_user_ids, ["12345"])
@@ -213,9 +215,11 @@ class PlatformInboundParseTests(unittest.TestCase):
             "conversation_id": "group:1", "user_id": "999", "text": "hi",
             "message_id": "m1", "is_private": False, "group_id": 1, "chain": chain,
         }
-        msg = _event_to_engine_message(
-            event, dispatcher=_D(), bot_id="2488687937",
-            trace_builder=lambda conversation_id, seq: "t",
+        msg = asyncio.run(
+            _event_to_engine_message(
+                event, dispatcher=_D(), bot_id="2488687937",
+                trace_builder=lambda conversation_id, seq: "t",
+            )
         )
         self.assertTrue(any(s.get("type") == "at" for s in msg.raw_segments))
 
@@ -237,10 +241,12 @@ class PlatformInboundParseTests(unittest.TestCase):
             "conversation_id": "group:1", "user_id": "999", "text": "点歌 晴天",
             "message_id": "m1", "is_private": False, "group_id": 1, "chain": chain,
         }
-        msg = _event_to_engine_message(
-            event, dispatcher=_D(), bot_id="2488687937",
-            trace_builder=lambda conversation_id, seq: "t",
-            api_call=fake_api,
+        msg = asyncio.run(
+            _event_to_engine_message(
+                event, dispatcher=_D(), bot_id="2488687937",
+                trace_builder=lambda conversation_id, seq: "t",
+                api_call=fake_api,
+            )
         )
         self.assertIsNotNone(msg.api_call)
         self.assertEqual(msg.api_call, fake_api)

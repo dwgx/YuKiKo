@@ -924,6 +924,179 @@ def create_engine() -> YukikoEngine:
     return YukikoEngine.from_default_paths(project_root=root)
 
 
+def _normalize_send_media_fields(
+    result: Any,
+) -> tuple[str, bool, str, str, list[str], str, str, str, str]:
+    """把发送结果里媒体相关字段统一成字符串/list 形式，并做 image_urls 去重对齐。"""
+    action = str(getattr(result, "action", "") or "")
+    is_music_voice_action = action in {"music_play", "music_play_by_id", "bilibili_audio_extract"}
+    reply_text = _normalize_reply_text(str(getattr(result, "reply_text", "") or ""))
+    image_url = str(getattr(result, "image_url", "") or "")
+    raw_image_urls = getattr(result, "image_urls", []) or []
+    image_urls: list[str] = []
+    if isinstance(raw_image_urls, list):
+        image_urls = [
+            normalize_text(str(item))
+            for item in raw_image_urls
+            if normalize_text(str(item))
+        ]
+    if image_url and image_url not in image_urls:
+        image_urls.insert(0, image_url)
+    if image_urls and not image_url:
+        image_url = image_urls[0]
+    video_url = str(getattr(result, "video_url", "") or "")
+    cover_url = str(getattr(result, "cover_url", "") or "")
+    record_b64 = str(getattr(result, "record_b64", "") or "")
+    audio_file = str(getattr(result, "audio_file", "") or "")
+    return action, is_music_voice_action, reply_text, image_url, image_urls, video_url, cover_url, record_b64, audio_file
+
+
+def _classify_stale_send(
+    latest_ctx: dict | None,
+    latest_trace: str,
+    payload: Any,
+    action: str,
+    reply_text: str,
+    image_urls: list[str],
+    video_url: str,
+    cover_url: str,
+    record_b64: str,
+    audio_file: str,
+) -> tuple[int, bool, bool, bool, bool]:
+    """判断本次发送是否是被更新的回合打断（纯计算，无副作用）。"""
+    latest_seq = 0
+    if isinstance(latest_ctx, dict):
+        try:
+            latest_seq = int(latest_ctx.get("seq", 0) or 0)
+        except (TypeError, ValueError):
+            latest_seq = 0
+    payload_seq = int(payload.seq or 0)
+    latest_user_id = (
+        normalize_text(str(latest_ctx.get("user_id", "")))
+        if isinstance(latest_ctx, dict)
+        else ""
+    )
+    latest_text = (
+        normalize_text(str(latest_ctx.get("text", "")))
+        if isinstance(latest_ctx, dict)
+        else ""
+    )
+    stale_trace = bool(
+        latest_trace
+        and latest_trace != payload.trace_id
+        and (not latest_seq or not payload_seq or latest_seq > payload_seq)
+    )
+    same_user_newer_turn = bool(
+        stale_trace
+        and latest_user_id
+        and latest_user_id == normalize_text(str(payload.user_id))
+    )
+    cancel_newer_turn = bool(stale_trace and _looks_like_cancel_previous_request(latest_text))
+    stale_plain_reply = (
+        stale_trace
+        and action == "reply"
+        and not payload.is_private
+        and reply_text
+        and not image_urls
+        and not video_url
+        and not cover_url
+        and not record_b64
+        and not audio_file
+    )
+    return latest_seq, stale_trace, same_user_newer_turn, cancel_newer_turn, stale_plain_reply
+
+
+def _plan_reply_text_chunks(
+    reply_text: str,
+    video_url: str,
+    action: str,
+    multi_reply_enable: bool,
+    multi_reply_max_lines: int,
+    multi_reply_max_chars: int,
+    multi_reply_max_chunks: int,
+    multi_reply_chat_max_lines: int,
+    multi_reply_chat_max_chars: int,
+    multi_reply_chat_max_chunks: int,
+    video_analysis_requested: bool,
+    chat_split_mode: str,
+    send_rate_enable: bool,
+    send_rate_max_per_window: int,
+    send_rate_window_seconds: int,
+    send_rate_warn_threshold: int,
+    conversation_id: str,
+    group_id: int,
+) -> tuple[list[str], bool, int]:
+    """把 reply_text 切成发送用 chunk：拆分 → 限流合并 → 超长重平衡。"""
+    text_chunks: list[str] = []
+    if reply_text:
+        # 视频场景默认单条文本，避免“昵称 + 逗号开头下一条”的断裂体验
+        if video_url:
+            text_chunks = [reply_text]
+        elif multi_reply_enable:
+            chunk_max_lines = multi_reply_max_lines
+            chunk_max_chars = multi_reply_max_chars
+            chunk_max_count = multi_reply_max_chunks
+            if action == "reply":
+                chunk_max_lines = multi_reply_chat_max_lines
+                chunk_max_chars = multi_reply_chat_max_chars
+                chunk_max_count = multi_reply_chat_max_chunks
+            if action == "search":
+                chunk_max_lines = max(chunk_max_lines, 4)
+                chunk_max_chars = max(chunk_max_chars, 260)
+                chunk_max_count = max(chunk_max_count, 6)
+            if video_analysis_requested:
+                chunk_max_lines = max(chunk_max_lines, 6)
+                chunk_max_chars = max(chunk_max_chars, 360)
+                chunk_max_count = max(chunk_max_count, 8)
+            if chat_split_mode == "semantic":
+                text_chunks = split_semantic_text(
+                    reply_text,
+                    max_lines=chunk_max_lines,
+                    max_chars=chunk_max_chars,
+                    max_chunks=chunk_max_count,
+                )
+            else:
+                text_chunks = _split_reply_chunks(
+                    reply_text,
+                    max_lines=chunk_max_lines,
+                    max_chars=chunk_max_chars,
+                    max_chunks=chunk_max_count,
+                )
+        if not text_chunks:
+            text_chunks = [reply_text]
+
+    rate_limited = False
+    if text_chunks and send_rate_enable:
+        bucket = _get_send_bucket(
+            conversation_id=conversation_id,
+            group_id=group_id,
+            max_per_window=send_rate_max_per_window,
+            refill_seconds=send_rate_window_seconds,
+            warn_threshold=send_rate_warn_threshold,
+        )
+        if bucket.near_warn():
+            text_chunks = coalesce_for_rate_limit(
+                text_chunks,
+                max_chars=max(220, multi_reply_max_chars + 80),
+                short_chunk_chars=90,
+            )
+            rate_limited = True
+    if text_chunks:
+        base_chunk_chars = (
+            multi_reply_chat_max_chars if action == "reply" else multi_reply_max_chars
+        )
+        safe_chunk_chars = max(240, min(920, base_chunk_chars + 140))
+        text_chunks = _rebalance_text_chunks_for_send(
+            text_chunks,
+            max_chars=safe_chunk_chars,
+        )
+        if not text_chunks and reply_text:
+            text_chunks = [reply_text]
+
+    chunk_count = len(text_chunks)
+    return text_chunks, rate_limited, chunk_count
+
+
 def register_handlers(engine: YukikoEngine) -> None:
     dispatcher = GroupQueueDispatcher(engine.config.get("queue", {}))
     _latest_queue_task_ctx: dict[str, dict[str, Any]] = {}
@@ -1908,69 +2081,39 @@ def register_handlers(engine: YukikoEngine) -> None:
                 )
                 return
 
-            action = str(getattr(result, "action", "") or "")
-            is_music_voice_action = action in {"music_play", "music_play_by_id", "bilibili_audio_extract"}
-            reply_text = _normalize_reply_text(str(getattr(result, "reply_text", "") or ""))
-            image_url = str(getattr(result, "image_url", "") or "")
-            raw_image_urls = getattr(result, "image_urls", []) or []
-            image_urls: list[str] = []
-            if isinstance(raw_image_urls, list):
-                image_urls = [
-                    normalize_text(str(item))
-                    for item in raw_image_urls
-                    if normalize_text(str(item))
-                ]
-            if image_url and image_url not in image_urls:
-                image_urls.insert(0, image_url)
-            if image_urls and not image_url:
-                image_url = image_urls[0]
-            video_url = str(getattr(result, "video_url", "") or "")
-            cover_url = str(getattr(result, "cover_url", "") or "")
-            record_b64 = str(getattr(result, "record_b64", "") or "")
-            audio_file = str(getattr(result, "audio_file", "") or "")
+            (
+                action,
+                is_music_voice_action,
+                reply_text,
+                image_url,
+                image_urls,
+                video_url,
+                cover_url,
+                record_b64,
+                audio_file,
+            ) = _normalize_send_media_fields(result)
             reply_to_bot = bool(
                 normalize_text(str(payload.reply_to_user_id or ""))
                 and normalize_text(str(payload.reply_to_user_id or ""))
                 == normalize_text(str(payload.bot_id or ""))
             )
-            latest_seq = 0
-            if isinstance(latest_ctx, dict):
-                try:
-                    latest_seq = int(latest_ctx.get("seq", 0) or 0)
-                except (TypeError, ValueError):
-                    latest_seq = 0
-            payload_seq = int(payload.seq or 0)
-            latest_user_id = (
-                normalize_text(str(latest_ctx.get("user_id", "")))
-                if isinstance(latest_ctx, dict)
-                else ""
-            )
-            latest_text = (
-                normalize_text(str(latest_ctx.get("text", "")))
-                if isinstance(latest_ctx, dict)
-                else ""
-            )
-            stale_trace = bool(
-                latest_trace
-                and latest_trace != payload.trace_id
-                and (not latest_seq or not payload_seq or latest_seq > payload_seq)
-            )
-            same_user_newer_turn = bool(
-                stale_trace
-                and latest_user_id
-                and latest_user_id == normalize_text(str(payload.user_id))
-            )
-            cancel_newer_turn = bool(stale_trace and _looks_like_cancel_previous_request(latest_text))
-            stale_plain_reply = (
-                stale_trace
-                and action == "reply"
-                and not payload.is_private
-                and reply_text
-                and not image_urls
-                and not video_url
-                and not cover_url
-                and not record_b64
-                and not audio_file
+            (
+                latest_seq,
+                stale_trace,
+                same_user_newer_turn,
+                cancel_newer_turn,
+                stale_plain_reply,
+            ) = _classify_stale_send(
+                latest_ctx,
+                latest_trace,
+                payload,
+                action,
+                reply_text,
+                image_urls,
+                video_url,
+                cover_url,
+                record_b64,
+                audio_file,
             )
             # 只在**真被打断**时丢（新消息带明确的取消/更正意图）。
             #
@@ -2311,72 +2454,26 @@ def register_handlers(engine: YukikoEngine) -> None:
                     await send_msg(warn)
                     delivered = True
 
-            text_chunks: list[str] = []
-            if reply_text:
-                # 视频场景默认单条文本，避免“昵称 + 逗号开头下一条”的断裂体验
-                if video_url:
-                    text_chunks = [reply_text]
-                elif multi_reply_enable:
-                    chunk_max_lines = multi_reply_max_lines
-                    chunk_max_chars = multi_reply_max_chars
-                    chunk_max_count = multi_reply_max_chunks
-                    if action == "reply":
-                        chunk_max_lines = multi_reply_chat_max_lines
-                        chunk_max_chars = multi_reply_chat_max_chars
-                        chunk_max_count = multi_reply_chat_max_chunks
-                    if action == "search":
-                        chunk_max_lines = max(chunk_max_lines, 4)
-                        chunk_max_chars = max(chunk_max_chars, 260)
-                        chunk_max_count = max(chunk_max_count, 6)
-                    if video_analysis_requested:
-                        chunk_max_lines = max(chunk_max_lines, 6)
-                        chunk_max_chars = max(chunk_max_chars, 360)
-                        chunk_max_count = max(chunk_max_count, 8)
-                    if chat_split_mode == "semantic":
-                        text_chunks = split_semantic_text(
-                            reply_text,
-                            max_lines=chunk_max_lines,
-                            max_chars=chunk_max_chars,
-                            max_chunks=chunk_max_count,
-                        )
-                    else:
-                        text_chunks = _split_reply_chunks(
-                            reply_text,
-                            max_lines=chunk_max_lines,
-                            max_chars=chunk_max_chars,
-                            max_chunks=chunk_max_count,
-                        )
-                if not text_chunks:
-                    text_chunks = [reply_text]
-
-            if text_chunks and send_rate_enable:
-                bucket = _get_send_bucket(
-                    conversation_id=payload.conversation_id,
-                    group_id=payload.group_id,
-                    max_per_window=send_rate_max_per_window,
-                    refill_seconds=send_rate_window_seconds,
-                    warn_threshold=send_rate_warn_threshold,
-                )
-                if bucket.near_warn():
-                    text_chunks = coalesce_for_rate_limit(
-                        text_chunks,
-                        max_chars=max(220, multi_reply_max_chars + 80),
-                        short_chunk_chars=90,
-                    )
-                    rate_limited = True
-            if text_chunks:
-                base_chunk_chars = (
-                    multi_reply_chat_max_chars if action == "reply" else multi_reply_max_chars
-                )
-                safe_chunk_chars = max(240, min(920, base_chunk_chars + 140))
-                text_chunks = _rebalance_text_chunks_for_send(
-                    text_chunks,
-                    max_chars=safe_chunk_chars,
-                )
-                if not text_chunks and reply_text:
-                    text_chunks = [reply_text]
-
-            chunk_count = len(text_chunks)
+            text_chunks, rate_limited, chunk_count = _plan_reply_text_chunks(
+                reply_text,
+                video_url,
+                action,
+                multi_reply_enable,
+                multi_reply_max_lines,
+                multi_reply_max_chars,
+                multi_reply_max_chunks,
+                multi_reply_chat_max_lines,
+                multi_reply_chat_max_chars,
+                multi_reply_chat_max_chunks,
+                video_analysis_requested,
+                chat_split_mode,
+                send_rate_enable,
+                send_rate_max_per_window,
+                send_rate_window_seconds,
+                send_rate_warn_threshold,
+                payload.conversation_id,
+                payload.group_id,
+            )
 
             async def _retry_send_remaining_text(remaining_text: str) -> bool:
                 nonlocal prefixed_sent, delivered
