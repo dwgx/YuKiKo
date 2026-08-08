@@ -15,6 +15,7 @@ music_disable_split / 裁剪兜底+整段去重）也已从 app.py 迁入 `_send
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -217,6 +218,42 @@ async def _resolve_record_ref(response: Any, voice_max_seconds: int) -> str:
     return ""
 
 
+async def _send_record_with_b64_fallback(
+    audio_path: Path,
+    guard_send: SendFn,
+    conversation_id: str,
+    label: str,
+) -> bool:
+    """发送 record（file://），失败时对 silk 用 base64 重试。
+
+    NapCat 对 file:// 的 .silk 可能报「语音转换失败」（QQ 沙盒读不到项目路径），
+    base64 直接传数据绕过路径问题。
+    """
+    from core.napcat_compat import build_napcat_file_reference
+
+    file_ref = build_napcat_file_reference(audio_path)
+    ok = await guard_send(MessageChain([Record(file=file_ref)]))
+    if ok:
+        return True
+    if audio_path.suffix.lower() != ".silk":
+        return False
+    try:
+        raw = audio_path.read_bytes()
+        if len(raw) < 256:
+            return False
+        b64_ref = f"base64://{base64.b64encode(raw).decode('ascii')}"
+        _log.info(
+            "deliver_voice_b64_retry | conversation=%s | %s | bytes=%d",
+            conversation_id,
+            label,
+            len(raw),
+        )
+        return await guard_send(MessageChain([Record(file=b64_ref)]))
+    except Exception as exc:
+        _log.warning("deliver_voice_b64_fail | conversation=%s | %s", conversation_id, exc)
+        return False
+
+
 async def _send_voice(
     response: Any,
     guard_send: SendFn,
@@ -314,7 +351,12 @@ async def _send_voice(
                 max_seconds,
                 is_long_audio,
             )
-            sent_voice = await guard_send(MessageChain([Record(file=full_audio_uri)]))
+            if isinstance(record_audio_path, Path) and record_audio_path.exists():
+                sent_voice = await _send_record_with_b64_fallback(
+                    record_audio_path, guard_send, conversation_id, "full"
+                )
+            else:
+                sent_voice = await guard_send(MessageChain([Record(file=full_audio_uri)]))
             if sent_voice:
                 _log.info("deliver_voice_try_full_ok | conversation=%s", conversation_id)
             else:
@@ -347,7 +389,12 @@ async def _send_voice(
                 part_uri = build_napcat_file_reference(
                     part_silk if part_silk is not None else part_path
                 )
-                part_ok = await guard_send(MessageChain([Record(file=part_uri)]))
+                if part_silk is not None:
+                    part_ok = await _send_record_with_b64_fallback(
+                        part_silk, guard_send, conversation_id, f"part{part_idx}"
+                    )
+                else:
+                    part_ok = await guard_send(MessageChain([Record(file=part_uri)]))
                 if not part_ok:
                     _log.warning(
                         "deliver_voice_split_part_fail | conversation=%s | part=%d/%d | file=%s",

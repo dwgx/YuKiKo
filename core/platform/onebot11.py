@@ -294,7 +294,10 @@ class OneBot11Adapter(Platform):
         else:
             return False
         response = await self._send_api(action, params)
-        ok = int(response.get("retcode", -1)) == 0
+        retcode = int(response.get("retcode", -1))
+        # 暴露最近一次发送的 retcode，供熔断分类用（-1=无连接不应熔断）。
+        self.last_send_retcode = retcode
+        ok = retcode == 0
         if not ok:
             # 记录 NapCat 返回的原始响应，定位 send_group_msg 被拒的具体 retcode/错误。
             _log.warning(

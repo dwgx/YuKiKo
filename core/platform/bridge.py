@@ -183,6 +183,11 @@ async def _reply_to_session(
         )
 
         if reason == "send_rejected":
+            last_retcode = int(getattr(adapter, "last_send_retcode", -1) or -1)
+            if last_retcode == -1:
+                # 无连接（NapCat 未连/重连中）：临时状态，不熔断，重试即可。
+                _log.info("deliver_send_no_connection | session=%s", session_id)
+                return
             _mark_platform_send_failure(gid, bid, "platform_send_rejected")
         else:
             _maybe_mark_platform_send_block(gid, bid, reason)
