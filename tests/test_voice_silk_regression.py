@@ -119,35 +119,18 @@ class VoiceSilkRegressionTests(unittest.TestCase):
 
 
 class VoiceSendSilkTimingRegressionTests(unittest.TestCase):
-    """锁 app.py 语音发送的两处优化（review Medium）：
+    """锁语音发送优化（review Medium）：
 
-    a. 完整文件转 silk 只在"将直发"分支内执行——长音频若不直发（等切片）不白编。
     b. silk/pcm 用临时文件 + os.replace 原子落盘，避免同音频并发互相覆盖。
 
-    handle_message 是 ~1400 行的大 handler，无法黑盒驱动，按仓库惯例用 AST/source 判据锁结构。
+    （优化 a —— 完整文件转 silk 只在"将直发"分支内执行——随点歌语音编排迁入
+    core.response_delivery._send_voice（E4），行为判据见
+    tests/test_response_delivery_regression.py::test_long_audio_without_full_first_does_not_pre_encode_source。）
     """
 
     @staticmethod
     def _app_source() -> str:
         return _APP_PY.read_text(encoding="utf-8")
-
-    def test_full_file_silk_encode_is_inside_direct_send_branch(self) -> None:
-        src = self._app_source()
-        match = re.search(
-            r"await\s+_silk_encode_for_record\(\s*effective_audio_path,\s*voice_send_max_seconds\s*\)",
-            src,
-        )
-        self.assertIsNotNone(match, "完整文件 silk 编码调用应存在")
-        branch_idx = src.find("if try_full_for_current or not is_long_audio:")
-        self.assertGreater(branch_idx, -1, "直发分支条件应存在")
-        # 调用必须位于直发分支条件之后（长音频不走直发时不会被预编码）。
-        self.assertGreater(match.start(), branch_idx, "完整文件 silk 编码应位于直发分支内")
-        # 分支之前不应再有同参数的无条件调用（旧代码在 tried_full_direct 前先编）。
-        pre = src[:branch_idx]
-        self.assertNotIn(
-            "await _silk_encode_for_record(", pre,
-            "直发分支前不应有完整文件转 silk 的无条件调用",
-        )
 
     def test_silk_encode_uses_unique_temp_names(self) -> None:
         src = self._app_source()

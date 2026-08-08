@@ -208,7 +208,7 @@ async def _resolve_record_ref(response: Any, voice_max_seconds: int) -> str:
 
 def _wire_bridge(engine: Any, adapter: Any, cfg: dict[str, object]) -> None:
     """把 adapter 事件接进 engine 消息管线（与 NoneBot 主路径的 process/send 对齐）。"""
-    from core.platform.bridge import _event_to_engine_message
+    from core.platform.bridge import build_message_handler
     from core.queue import GroupQueueDispatcher
 
     dispatcher = GroupQueueDispatcher(
@@ -220,48 +220,17 @@ def _wire_bridge(engine: Any, adapter: Any, cfg: dict[str, object]) -> None:
         # 供工具层经 NapCat 调用 OneBot API（如 get_msg / set_group_card 等）。
         return await adapter._send_api(api, kwargs)
 
-    async def message_handler(event: dict[str, object]) -> None:
-        try:
-            from core.response_delivery import deliver_response
-
-            payload = await _event_to_engine_message(
-                event,
-                dispatcher=dispatcher,
-                bot_id=bot_id,
-                trace_builder=lambda conversation_id, seq: f"platform-{conversation_id}-{seq}",
-                api_call=_platform_api_call,
-            )
-            response = await engine.handle_message(payload)
-            conversation_id = str(event.get("conversation_id", ""))
-            group_id = int(event.get("group_id", 0) or 0)
-            config = engine.config if isinstance(engine.config, dict) else {}
-
-            async def sender(chain: Any) -> bool:
-                return await adapter.send_by_session(conversation_id, chain)
-
-            def mark_failure_fn(gid: int, bid: str, reason: str) -> None:
-                # send_rejected（NapCat 返回 retcode!=0）保持 platform_send_rejected 标签；
-                # 异常按 299 限频 / 120 禁言分类标记，其他错误不标记（避免瞬断整 bot 停发）。
-                if reason == "send_rejected":
-                    _mark_platform_send_failure(gid, bid, "platform_send_rejected")
-                else:
-                    _maybe_mark_platform_send_block(gid, bid, reason)
-
-            # 统一发送核心：语义拆分文本 + 限流/熔断/暂停 + 图片/视频 + 语音 silk 分段。
-            await deliver_response(
-                config,
-                response,
-                sender,
-                conversation_id=conversation_id,
-                group_id=group_id,
-                bot_id=bot_id,
-                sleep_fn=_platform_sleep,
-                mark_failure_fn=mark_failure_fn,
-            )
-        except Exception:
-            _log.warning("platform_msg_error", exc_info=True)
-
-    adapter.message_handler = message_handler
+    # 事件 → engine 消息管线 → 统一发送核心：语义拆分文本 + 限流/熔断/暂停 +
+    # 图片/视频 + 语音 silk 分段（与 bridge.register_onebot11_platform 共用构造）。
+    adapter.message_handler = build_message_handler(
+        engine,
+        adapter,
+        dispatcher,
+        bot_id=bot_id,
+        config=engine.config if isinstance(engine.config, dict) else {},
+        api_call=_platform_api_call,
+        sleep_fn=_platform_sleep,
+    )
 
 
 def run_primary() -> None:

@@ -107,6 +107,13 @@ _MISSING_ARG_HINTS: dict[str, str] = {
     ),
 }
 
+# 权限门拦截原因 → 回喂给模型的错误文案。原因字符串同时是 steps 里 blocked 的值。
+_PERMISSION_GATE_BLOCK_MESSAGES: dict[str, str] = {
+    "need_super_admin": "权限不足，该操作仅超级管理员可执行",
+    "need_group_admin": "权限不足，该操作需要群管理员或超级管理员权限",
+    "explicit_bot_address_required": "执行群管理操作前，需要明确点名机器人（@我或直接叫YUKI）",
+}
+
 
 @dataclass(slots=True)
 class AgentContext:
@@ -923,6 +930,32 @@ class AgentLoop:
             # 并说清产物是「更早那次」的，避免模型把它当成本次结果去交付。
             payload["earlier_partial_result"] = obtained
         return payload
+
+    def _record_guard_block(
+        self,
+        *,
+        ctx: AgentContext,
+        steps: list[dict[str, Any]],
+        step_idx: int,
+        tool_name: str,
+        error_tag: str,
+        reason_key: str,
+        reason_text: str,
+    ) -> dict[str, Any]:
+        """守卫拦截的统一落账：失败步 + 回馈 payload。
+
+        日志、熔断与回喂由调用方在返回后自行完成（repeated_tool_call 需要在
+        回喂前先判断是否熔断直接走兜底返回，不能先污染 messages）。
+        """
+        steps.append(
+            {"step": step_idx, "tool": tool_name, "ok": False, "error": error_tag}
+        )
+        return self._build_guard_feedback_payload(
+            tool_name=tool_name,
+            steps=steps,
+            reason_key=reason_key,
+            reason_text=reason_text,
+        )
 
     @staticmethod
     def _rewrite_tool_call_arguments(
@@ -2063,43 +2096,13 @@ class AgentLoop:
 
             # final_answer 特殊处理 — 直接返回
             if tool_name == "final_answer":
-                text = str(tool_args.get("text", "")).strip()
-                image_url = str(tool_args.get("image_url", "")).strip()
-                raw_image_urls = tool_args.get("image_urls", [])
-                image_urls: list[str] = []
-                if isinstance(raw_image_urls, list):
-                    image_urls = [
-                        str(u).strip() for u in raw_image_urls if str(u).strip()
-                    ]
-                if image_url and image_url not in image_urls:
-                    image_urls.insert(0, image_url)
-                if image_urls and not image_url:
-                    image_url = image_urls[0]
-                if not image_url and not image_urls:
-                    image_urls = self._last_success_image_urls(steps)
-                    image_url = image_urls[0] if image_urls else ""
-                video_url = str(tool_args.get("video_url", "")).strip()
-                audio_file = str(tool_args.get("audio_file", "")).strip()
-                cover_url = str(tool_args.get("cover_url", "")).strip()
-                if audio_file.lower().endswith(".silk"):
-                    preferred_audio = self._last_success_audio_file(
-                        steps, prefer_non_silk=True
-                    )
-                    if preferred_audio:
-                        _log.info(
-                            "agent_audio_file_override | trace=%s | step=%d | from=%s | to=%s",
-                            ctx.trace_id,
-                            step_idx,
-                            clip_text(audio_file, 120),
-                            clip_text(preferred_audio, 120),
-                        )
-                        audio_file = preferred_audio
-                if not audio_file:
-                    audio_file = self._last_success_audio_file(steps)
-                if not video_url:
-                    video_url = self._last_success_video_url(steps)
-                if video_url:
-                    text = self._sanitize_final_text_for_local_media(text, video_url)
+                media = self._resolve_final_answer_media(tool_args, steps, ctx, step_idx)
+                text = media["text"]
+                image_url = media["image_url"]
+                image_urls = media["image_urls"]
+                video_url = media["video_url"]
+                audio_file = media["audio_file"]
+                cover_url = media["cover_url"]
                 # 模型显式声明这是拒绝时，不要逼它先调工具。
                 #
                 # 实测（2026-08-06，trace 118886-5-f46539ff）：用户带链接要盗版软件，
@@ -2448,44 +2451,17 @@ class AgentLoop:
 
             # 安全检查: 三级权限
             perm_level = self._resolve_permission_level(ctx)
-            if tool_name in self._super_admin_tools and perm_level != "super_admin":
-                steps.append(
-                    {"step": step_idx, "tool": tool_name, "blocked": "need_super_admin"}
-                )
-                self._append_tool_result(messages, parsed, assistant_msg, response_text, {
-                                    "tool": tool_name,
-                                    "ok": False,
-                                    "error": "权限不足，该操作仅超级管理员可执行",
-                                })
-                continue
-            if self._should_block_group_admin_tool(
+            blocked_reason = self._check_permission_gate(
                 ctx, tool_name, tool_args, perm_level
-            ):
+            )
+            if blocked_reason:
                 steps.append(
-                    {"step": step_idx, "tool": tool_name, "blocked": "need_group_admin"}
+                    {"step": step_idx, "tool": tool_name, "blocked": blocked_reason}
                 )
                 self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                     "tool": tool_name,
                                     "ok": False,
-                                    "error": "权限不足，该操作需要群管理员或超级管理员权限",
-                                })
-                continue
-            if (
-                tool_name in self._group_admin_tools
-                and tool_name != "delete_message"
-                and not self._is_explicit_bot_addressed(ctx)
-            ):
-                steps.append(
-                    {
-                        "step": step_idx,
-                        "tool": tool_name,
-                        "blocked": "explicit_bot_address_required",
-                    }
-                )
-                self._append_tool_result(messages, parsed, assistant_msg, response_text, {
-                                    "tool": tool_name,
-                                    "ok": False,
-                                    "error": "执行群管理操作前，需要明确点名机器人（@我或直接叫YUKI）",
+                                    "error": _PERMISSION_GATE_BLOCK_MESSAGES[blocked_reason],
                                 })
                 continue
 
@@ -2541,17 +2517,12 @@ class AgentLoop:
             # PreToolUse 审批钩子：任一钩子返回非空说明即阻止该工具。
             pre_tool_block = self._run_pre_tool_hooks(ctx, tool_name, tool_args)
             if pre_tool_block:
-                steps.append(
-                    {
-                        "step": step_idx,
-                        "tool": tool_name,
-                        "ok": False,
-                        "error": "pre_tool_hook_block",
-                    }
-                )
-                guard_payload = self._build_guard_feedback_payload(
-                    tool_name=tool_name,
+                guard_payload = self._record_guard_block(
+                    ctx=ctx,
                     steps=steps,
+                    step_idx=step_idx,
+                    tool_name=tool_name,
+                    error_tag="pre_tool_hook_block",
                     reason_key="pre_tool_hook_block",
                     reason_text=clip_text(pre_tool_block, 500),
                 )
@@ -2569,17 +2540,12 @@ class AgentLoop:
                 tool_name, hash_call(tool_name, tool_args)
             )
             if self._is_loop_guard_blocking_level(loop_level):
-                steps.append(
-                    {
-                        "step": step_idx,
-                        "tool": tool_name,
-                        "ok": False,
-                        "error": f"loop_guard:{loop_level}:{loop_streak}",
-                    }
-                )
-                guard_payload = self._build_guard_feedback_payload(
-                    tool_name=tool_name,
+                guard_payload = self._record_guard_block(
+                    ctx=ctx,
                     steps=steps,
+                    step_idx=step_idx,
+                    tool_name=tool_name,
+                    error_tag=f"loop_guard:{loop_level}:{loop_streak}",
                     reason_key="loop_guard_loop",
                     reason_text=(
                         "检测到同一工具和参数连续空转多次，结果没有进展。"
@@ -2615,17 +2581,12 @@ class AgentLoop:
                     else self.max_same_tool_call
                 )
                 if repeat_count > repeat_limit:
-                    steps.append(
-                        {
-                            "step": step_idx,
-                            "tool": tool_name,
-                            "ok": False,
-                            "error": f"repeated_tool_call:{repeat_count}",
-                        }
-                    )
-                    guard_payload = self._build_guard_feedback_payload(
-                        tool_name=tool_name,
+                    guard_payload = self._record_guard_block(
+                        ctx=ctx,
                         steps=steps,
+                        step_idx=step_idx,
+                        tool_name=tool_name,
+                        error_tag=f"repeated_tool_call:{repeat_count}",
                         reason_key="repeated_tool_call",
                         reason_text="同一工具和参数重复过多，请换工具策略或直接 final_answer。",
                     )
@@ -2653,17 +2614,12 @@ class AgentLoop:
             if tool_name in self._EXTERNAL_FACT_TOOLS:
                 ext_sig = self._build_external_fact_signature(tool_name, tool_args)
                 if ext_sig and ext_sig in seen_external_fact_signatures:
-                    steps.append(
-                        {
-                            "step": step_idx,
-                            "tool": tool_name,
-                            "ok": False,
-                            "error": "duplicate_external_fact_query",
-                        }
-                    )
-                    guard_payload = self._build_guard_feedback_payload(
-                        tool_name=tool_name,
+                    guard_payload = self._record_guard_block(
+                        ctx=ctx,
                         steps=steps,
+                        step_idx=step_idx,
+                        tool_name=tool_name,
+                        error_tag="duplicate_external_fact_query",
                         reason_key="duplicate_external_fact_query",
                         reason_text="这个外部查询之前已经成功执行过，请基于已有结果继续。",
                     )
@@ -2683,17 +2639,12 @@ class AgentLoop:
 
             # 致命级循环拦截：如果某个工具连续抛错超过 2 次，强行熔断
             if consecutive_tool_errors.get(tool_name, 0) >= 2:
-                steps.append(
-                    {
-                        "step": step_idx,
-                        "tool": tool_name,
-                        "ok": False,
-                        "error": "consecutive_crashes_guard",
-                    }
-                )
-                guard_payload = self._build_guard_feedback_payload(
-                    tool_name=tool_name,
+                guard_payload = self._record_guard_block(
+                    ctx=ctx,
                     steps=steps,
+                    step_idx=step_idx,
+                    tool_name=tool_name,
+                    error_tag="consecutive_crashes_guard",
                     reason_key="consecutive_crashes_guard",
                     reason_text="该工具已连续崩溃或报错，底层拒绝执行，不要再调用它。",
                 )
@@ -2896,6 +2847,31 @@ class AgentLoop:
             ctx, steps, tool_calls_made, t0, "max_steps_reached"
         )
 
+    def _check_permission_gate(
+        self,
+        ctx: AgentContext,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        perm_level: str,
+    ) -> str | None:
+        """三级权限门：super_admin / group_admin / 点名要求。
+
+        返回 None 表示放行，否则返回拦截原因（即 steps 的 blocked 值，
+        文案见 _PERMISSION_GATE_BLOCK_MESSAGES）。high_risk 确认门不走这里：
+        它需要带回完整回复文本，且拦截形态是整回合返回而非 continue。
+        """
+        if tool_name in self._super_admin_tools and perm_level != "super_admin":
+            return "need_super_admin"
+        if self._should_block_group_admin_tool(ctx, tool_name, tool_args, perm_level):
+            return "need_group_admin"
+        if (
+            tool_name in self._group_admin_tools
+            and tool_name != "delete_message"
+            and not self._is_explicit_bot_addressed(ctx)
+        ):
+            return "explicit_bot_address_required"
+        return None
+
     def _should_block_group_admin_tool(
         self,
         ctx: AgentContext,
@@ -2909,6 +2885,64 @@ class AgentLoop:
         if perm_level in ("super_admin", "group_admin"):
             return False
         return not self._is_regular_user_self_ban_attempt(ctx, tool_name, tool_args)
+
+    def _resolve_final_answer_media(
+        self,
+        tool_args: dict[str, Any],
+        steps: list[dict[str, Any]],
+        ctx: AgentContext,
+        step_idx: int,
+    ) -> dict[str, Any]:
+        """final_answer 媒体规范化：合并 image_url/image_urls、last_success 兜底、
+        silk 覆盖、本地路径清理。
+
+        与原 run 内联逻辑逐行等价（含 agent_audio_file_override 日志的时机），
+        返回规范化后的 text / image_url / image_urls / video_url / audio_file /
+        cover_url。下游对媒体字段的后续清理（out-of-chain、已发送去重）仍在 run。
+        """
+        text = str(tool_args.get("text", "")).strip()
+        image_url = str(tool_args.get("image_url", "")).strip()
+        raw_image_urls = tool_args.get("image_urls", [])
+        image_urls: list[str] = []
+        if isinstance(raw_image_urls, list):
+            image_urls = [str(u).strip() for u in raw_image_urls if str(u).strip()]
+        if image_url and image_url not in image_urls:
+            image_urls.insert(0, image_url)
+        if image_urls and not image_url:
+            image_url = image_urls[0]
+        if not image_url and not image_urls:
+            image_urls = self._last_success_image_urls(steps)
+            image_url = image_urls[0] if image_urls else ""
+        video_url = str(tool_args.get("video_url", "")).strip()
+        audio_file = str(tool_args.get("audio_file", "")).strip()
+        cover_url = str(tool_args.get("cover_url", "")).strip()
+        if audio_file.lower().endswith(".silk"):
+            preferred_audio = self._last_success_audio_file(
+                steps, prefer_non_silk=True
+            )
+            if preferred_audio:
+                _log.info(
+                    "agent_audio_file_override | trace=%s | step=%d | from=%s | to=%s",
+                    ctx.trace_id,
+                    step_idx,
+                    clip_text(audio_file, 120),
+                    clip_text(preferred_audio, 120),
+                )
+                audio_file = preferred_audio
+        if not audio_file:
+            audio_file = self._last_success_audio_file(steps)
+        if not video_url:
+            video_url = self._last_success_video_url(steps)
+        if video_url:
+            text = self._sanitize_final_text_for_local_media(text, video_url)
+        return {
+            "text": text,
+            "image_url": image_url,
+            "image_urls": image_urls,
+            "video_url": video_url,
+            "audio_file": audio_file,
+            "cover_url": cover_url,
+        }
 
     def _collect_media_candidates(
         self, image_url: str, image_urls: list[str], video_url: str, audio_file: str

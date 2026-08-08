@@ -126,6 +126,253 @@ class ResponseDeliveryVoiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(records), 1)
 
 
+class ResponseDeliveryMusicVoiceTests(unittest.IsolatedAsyncioTestCase):
+    """点歌语音 4 特性（E4 从 app.py 迁入 _send_voice）：
+
+    - music_force_full：长音频也整段直发，不再分段。
+    - music_disable_split：禁分段，兜底裁一条单发。
+    - silk 源互换：.silk 输入用 sibling mp3 当切分源；且长音频下覆盖 force_full 只走分段。
+    - 音乐缓存路径推断：audio 落在 music_* 命名时按点歌策略发送。
+    - 完整文件转 silk 只在"将直发"分支内执行（长音频等切片时不预编整段）。
+    """
+
+    async def test_music_force_full_sends_full_record_without_split(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mp3 = Path(tmp) / "song.mp3"
+            mp3.write_bytes(b"\xff" * 2048)
+            response = EngineResponse(action="music_play", reason="test", audio_file=str(mp3))
+            sender = _MockSender()
+            silk = Path(tmp) / "song.silk"
+            with (
+                patch("app._probe_audio_duration_seconds_sync", return_value=200.0),
+                patch("app._silk_encode_for_record", new=AsyncMock(return_value=silk)),
+            ):
+                await deliver_response(
+                    {
+                        "bot": {
+                            "voice_send_max_seconds": 60,
+                            "voice_send_music_force_full": True,
+                        },
+                        "send_rate": {"enable": False},
+                    },
+                    response,
+                    sender.send,
+                    conversation_id="group:401",
+                    group_id=401,
+                    bot_id="bot4",
+                    is_music_voice_action=True,
+                )
+            # force_full：200s 长音频也整段直发单条，不分段。
+            self.assertEqual(sender.send_count, 1)
+            records = _record_files(sender.sent_chains)
+            self.assertEqual(len(records), 1)
+            self.assertIn(".silk", records[0])
+
+    async def test_music_disable_split_sends_single_trimmed_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mp3 = Path(tmp) / "song.mp3"
+            mp3.write_bytes(b"\xff" * 2048)
+            response = EngineResponse(action="music_play", reason="test", audio_file=str(mp3))
+            sender = _MockSender()
+            trimmed = Path(tmp) / "song.voice60s.mp3"
+            with (
+                patch("app._probe_audio_duration_seconds_sync", return_value=200.0),
+                patch(
+                    "app._prepare_voice_audio_file",
+                    new=AsyncMock(return_value=(trimmed, 200.0, True)),
+                ),
+                patch("app._silk_encode_for_record", new=AsyncMock(side_effect=lambda p, s: p)),
+            ):
+                await deliver_response(
+                    {
+                        "bot": {
+                            "voice_send_max_seconds": 60,
+                            "voice_send_music_disable_split": True,
+                        },
+                        "send_rate": {"enable": False},
+                    },
+                    response,
+                    sender.send,
+                    conversation_id="group:402",
+                    group_id=402,
+                    bot_id="bot4",
+                    is_music_voice_action=True,
+                )
+            # disable_split：不整段直发也不分段，兜底裁到 max_seconds 单发一条。
+            self.assertEqual(sender.send_count, 1)
+            records = _record_files(sender.sent_chains)
+            self.assertEqual(len(records), 1)
+            self.assertTrue(records[0].endswith("song.voice60s.mp3"))
+
+    async def test_silk_source_swap_splits_sibling_mp3(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            silk = Path(tmp) / "song.silk"
+            mp3 = Path(tmp) / "song.mp3"
+            silk.write_bytes(b"\x02" * 2048)
+            mp3.write_bytes(b"\xff" * 2048)
+            response = EngineResponse(action="reply", reason="test", audio_file=str(silk))
+            sender = _MockSender()
+            part1 = Path(tmp) / "song.part1.silk"
+            part2 = Path(tmp) / "song.part2.silk"
+            split_mock = AsyncMock(return_value=[part1, part2])
+            encode_calls: list[Path] = []
+
+            async def fake_encode(path, seconds):
+                encode_calls.append(Path(path))
+                return path
+
+            with (
+                patch("app._probe_audio_duration_seconds_sync", return_value=200.0),
+                patch("app._split_voice_audio_file", new=split_mock),
+                patch("app._silk_encode_for_record", new=fake_encode),
+            ):
+                await deliver_response(
+                    {"bot": {"voice_send_max_seconds": 60}, "send_rate": {"enable": False}},
+                    response,
+                    sender.send,
+                    conversation_id="group:403",
+                    group_id=403,
+                    bot_id="bot4",
+                )
+            # silk 源互换：切分源是 sibling mp3 而非 silk 本体（resolve 后比较，兼容 /tmp 符号链接）。
+            split_mock.assert_awaited_once_with(mp3.resolve(), segment_seconds=60, max_segments=8)
+            self.assertEqual(sender.send_count, 2)
+            # 直发分支不应编码整段（silk 源互换后长音频只走分段）。
+            self.assertEqual(encode_calls, [part1, part2])
+
+    async def test_silk_swap_overrides_music_force_full_for_long_split(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            silk = Path(tmp) / "song.silk"
+            mp3 = Path(tmp) / "song.mp3"
+            silk.write_bytes(b"\x02" * 2048)
+            mp3.write_bytes(b"\xff" * 2048)
+            response = EngineResponse(action="music_play", reason="test", audio_file=str(silk))
+            sender = _MockSender()
+            part1 = Path(tmp) / "song.part1.silk"
+            part2 = Path(tmp) / "song.part2.silk"
+            split_mock = AsyncMock(return_value=[part1, part2])
+            encode_calls: list[Path] = []
+
+            async def fake_encode(path, seconds):
+                encode_calls.append(Path(path))
+                return path
+
+            with (
+                patch("app._probe_audio_duration_seconds_sync", return_value=200.0),
+                patch("app._split_voice_audio_file", new=split_mock),
+                patch("app._silk_encode_for_record", new=fake_encode),
+            ):
+                await deliver_response(
+                    {
+                        "bot": {
+                            "voice_send_max_seconds": 60,
+                            "voice_send_try_full_first": True,
+                            "voice_send_music_force_full": True,
+                        },
+                        "send_rate": {"enable": False},
+                    },
+                    response,
+                    sender.send,
+                    conversation_id="group:404",
+                    group_id=404,
+                    bot_id="bot4",
+                    is_music_voice_action=True,
+                )
+            # 即使 force_full + try_full_first，silk 源互换后长音频仍只走分段。
+            split_mock.assert_awaited_once_with(mp3.resolve(), segment_seconds=60, max_segments=8)
+            self.assertEqual(sender.send_count, 2)
+            self.assertEqual(encode_calls, [part1, part2])
+
+    async def test_music_cache_path_inference_applies_force_full(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mp3 = Path(tmp) / "music_demo.mp3"
+            mp3.write_bytes(b"\xff" * 2048)
+            response = EngineResponse(action="reply", reason="test", audio_file=str(mp3))
+            sender = _MockSender()
+            silk = Path(tmp) / "music_demo.silk"
+            with (
+                patch("app._probe_audio_duration_seconds_sync", return_value=200.0),
+                patch("app._silk_encode_for_record", new=AsyncMock(return_value=silk)),
+            ):
+                await deliver_response(
+                    {
+                        "bot": {
+                            "voice_send_max_seconds": 60,
+                            "voice_send_music_force_full": True,
+                        },
+                        "send_rate": {"enable": False},
+                    },
+                    response,
+                    sender.send,
+                    conversation_id="group:405",
+                    group_id=405,
+                    bot_id="bot4",
+                )
+            # 未显式标记点歌，但 music_* 命名推断为点歌 → force_full 生效：整段直发单条。
+            self.assertEqual(sender.send_count, 1)
+            records = _record_files(sender.sent_chains)
+            self.assertEqual(len(records), 1)
+
+    async def test_non_music_path_without_flag_still_splits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mp3 = Path(tmp) / "song.mp3"
+            mp3.write_bytes(b"\xff" * 2048)
+            response = EngineResponse(action="reply", reason="test", audio_file=str(mp3))
+            sender = _MockSender()
+            part1 = Path(tmp) / "song.part1.silk"
+            with (
+                patch("app._probe_audio_duration_seconds_sync", return_value=200.0),
+                patch("app._split_voice_audio_file", new=AsyncMock(return_value=[part1])),
+                patch("app._silk_encode_for_record", new=AsyncMock(side_effect=lambda p, s: p)),
+            ):
+                await deliver_response(
+                    {
+                        "bot": {
+                            "voice_send_max_seconds": 60,
+                            "voice_send_music_force_full": True,
+                        },
+                        "send_rate": {"enable": False},
+                    },
+                    response,
+                    sender.send,
+                    conversation_id="group:406",
+                    group_id=406,
+                    bot_id="bot4",
+                )
+            # 同名但非 music_* 命名：不推断为点歌，force_full 不生效，长音频仍分段。
+            self.assertEqual(sender.send_count, 1)
+
+    async def test_long_audio_without_full_first_does_not_pre_encode_source(self) -> None:
+        """完整文件转 silk 只在"将直发"分支内执行：长音频等切片时不预编整段。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            mp3 = Path(tmp) / "song.mp3"
+            mp3.write_bytes(b"\xff" * 2048)
+            response = EngineResponse(action="reply", reason="test", audio_file=str(mp3))
+            sender = _MockSender()
+            part = Path(tmp) / "song.part1.silk"
+            encode_calls: list[Path] = []
+
+            async def fake_encode(path, seconds):
+                encode_calls.append(Path(path))
+                return Path(path)
+
+            with (
+                patch("app._probe_audio_duration_seconds_sync", return_value=200.0),
+                patch("app._split_voice_audio_file", new=AsyncMock(return_value=[part])),
+                patch("app._silk_encode_for_record", new=fake_encode),
+            ):
+                await deliver_response(
+                    {"bot": {"voice_send_max_seconds": 60}, "send_rate": {"enable": False}},
+                    response,
+                    sender.send,
+                    conversation_id="group:104",
+                    group_id=104,
+                    bot_id="bot1",
+                )
+            # 默认不 try_full_first：只编码切片，不预编整段源文件。
+            self.assertEqual(encode_calls, [part])
+
+
 class ResponseDeliveryGuardTests(unittest.IsolatedAsyncioTestCase):
     """发送保护：限流等待 + 熔断/暂停跳过 + 失败标记。"""
 

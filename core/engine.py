@@ -10,7 +10,6 @@ import re
 import sys
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +18,7 @@ from urllib.parse import urlparse
 from core import prompt_loader as _pl
 from core.admin import AdminEngine
 from core.agent import AgentContext, AgentLoop, AgentResult
-from core import media_utils, text_utils
+from core import intent_predicates, media_utils, text_utils
 from core.agent_tools import (
     AgentToolRegistry,
     register_builtin_tools,
@@ -59,6 +58,7 @@ from core.skill_loader import SkillRegistry, register_skill_tools
 from core.sticker import StickerManager
 from core.thinking import ThinkingEngine
 from core.tools import ToolExecutor
+from core.tools_types import ToolResult
 from core.trigger import TriggerEngine, TriggerInput
 from services.logger import get_logger
 from services.model_client import ModelClient
@@ -67,7 +67,6 @@ from utils.text import (
     normalize_text,
     remove_markdown,
     strip_invisible_format_chars,
-    tokenize,
 )
 
 # ── 公共类型 (拆分至 engine_types.py，此处 re-export) ──
@@ -79,6 +78,27 @@ from core.engine_types import (  # noqa: F401, E402
 
 
 from core.plugin_registry import PluginRegistry  # noqa: E402
+
+
+@dataclass
+class TurnContext:
+    """handle_message 上下文构建阶段（_build_turn_context）的输出聚合（E1 提取）。"""
+
+    memory_context: list[str]
+    related_memories: list[Any]
+    current_user_recent: list[str]
+    user_profile_summary: str
+    preferred_name: str
+    recent_speakers: list[Any]
+    affinity_hint: str
+    mood_hint: str
+    user_policies: dict[str, Any]
+    user_directives: list[Any]
+    runtime_admin_policy: dict[str, Any]
+    thread_state: dict[str, Any]
+    at_other_user_names: dict[str, str]
+    compat_context: str
+    runtime_group_context_for_turn: list[str]
 
 class YukikoEngine:
 
@@ -1442,6 +1462,104 @@ class YukikoEngine:
                 reason="recent_bot_reply_echo_guard",
                 reply_text=rendered,
             )
+        turn_ctx = await self._build_turn_context(
+            message=message,
+            text=text,
+            trigger=trigger,
+            allow_memory=allow_memory,
+            recent_messages=recent_messages,
+            alias_call_hint=alias_call_hint,
+        )
+
+        # 显式记忆优先命中：对“你让我记住的事实”走确定性回复，降低 LLM 跑偏概率。
+        explicit_fact_match = None
+        if (
+            allow_memory
+            and "记住" not in text
+            and hasattr(self.memory, "match_explicit_fact_query")
+            and callable(getattr(self.memory, "match_explicit_fact_query"))
+        ):
+            try:
+                explicit_fact_match = self.memory.match_explicit_fact_query(
+                    message.user_id, text
+                )
+            except Exception:
+
+                explicit_fact_match = None
+        if isinstance(explicit_fact_match, dict) and explicit_fact_match:
+            lhs = normalize_text(str(explicit_fact_match.get("lhs", "")))
+            rhs = normalize_text(str(explicit_fact_match.get("rhs", "")))
+            if lhs and rhs:
+                template = normalize_text(
+                    _pl.get_message(
+                        "explicit_fact_recall_reply",
+                        "你之前让我记住的是：{lhs}={rhs}。",
+                    )
+                )
+                reply_text = template or "你之前让我记住的是：{lhs}={rhs}。"
+                if "{lhs}" in reply_text or "{rhs}" in reply_text:
+                    reply_text = reply_text.replace("{lhs}", lhs).replace("{rhs}", rhs)
+                else:
+                    reply_text = f"{reply_text} {lhs}={rhs}"
+                rendered = self.markdown.render(
+                    self._limit_reply_text(
+                        self._apply_tone_guard(reply_text), "short", proactive=False
+                    ),
+                )
+                await self._after_reply(
+                    message=message,
+                    reply_text=rendered,
+                    proactive=False,
+                    action="reply",
+                    open_followup=True,
+                    user_text=text,
+                )
+                self._record_intent(
+                    message, action="reply", reason="explicit_fact_recall", text=text
+                )
+                return EngineResponse(
+                    action="reply", reason="explicit_fact_recall", reply_text=rendered
+                )
+        # 最近结果追问：命中后优先走本地缓存选择，不必重新让 Agent 理解“第2个/再发一次”。
+        # 本地关键词音乐快速通道已停用：点歌/搜歌交给 Router + Prompt 自行判断。
+
+        dispatch_response, decision, tool_result = await self._dispatch_turn(
+            message=message,
+            text=text,
+            trigger=trigger,
+            safety=safety,
+            explicit_bot_addressed=explicit_bot_addressed,
+            turn_ctx=turn_ctx,
+            recent_user_lines=recent_user_lines,
+            recent_bot_replies=recent_bot_replies,
+        )
+        if dispatch_response is not None:
+            return dispatch_response
+
+        return await self._render_turn_result(
+            message=message,
+            text=text,
+            decision=decision,
+            tool_result=tool_result,
+            trigger=trigger,
+            turn_ctx=turn_ctx,
+            recent_messages=recent_messages,
+        )
+
+    async def _build_turn_context(
+        self,
+        message: EngineMessage,
+        text: str,
+        trigger: Any,
+        allow_memory: bool,
+        recent_messages: list[Any],
+        alias_call_hint: str,
+    ) -> TurnContext:
+        """构建本轮上下文：群聊定向记忆 / 画像 / 知识库 / 摘要注入。
+
+        与 handle_message 原内联块同输入同输出同副作用时序（E1 纯提取）。
+        """
+
         # 群聊里优先使用“当前用户上下文”，避免把其他人的历史误注入当前会话。
         if allow_memory and not message.is_private:
             memory_context = self._build_recent_user_lines_by_user_id(
@@ -1737,57 +1855,39 @@ class YukikoEngine:
             memory_context=memory_context,
             related_memories=related_memories,
         )
-        # 显式记忆优先命中：对“你让我记住的事实”走确定性回复，降低 LLM 跑偏概率。
-        explicit_fact_match = None
-        if (
-            allow_memory
-            and "记住" not in text
-            and hasattr(self.memory, "match_explicit_fact_query")
-            and callable(getattr(self.memory, "match_explicit_fact_query"))
-        ):
-            try:
-                explicit_fact_match = self.memory.match_explicit_fact_query(
-                    message.user_id, text
-                )
-            except Exception:
+        return TurnContext(
+            memory_context=memory_context,
+            related_memories=related_memories,
+            current_user_recent=current_user_recent,
+            user_profile_summary=user_profile_summary,
+            preferred_name=preferred_name,
+            recent_speakers=recent_speakers,
+            affinity_hint=affinity_hint,
+            mood_hint=mood_hint,
+            user_policies=user_policies,
+            user_directives=user_directives,
+            runtime_admin_policy=runtime_admin_policy,
+            thread_state=thread_state,
+            at_other_user_names=at_other_user_names,
+            compat_context=compat_context,
+            runtime_group_context_for_turn=runtime_group_context_for_turn,
+        )
 
-                explicit_fact_match = None
-        if isinstance(explicit_fact_match, dict) and explicit_fact_match:
-            lhs = normalize_text(str(explicit_fact_match.get("lhs", "")))
-            rhs = normalize_text(str(explicit_fact_match.get("rhs", "")))
-            if lhs and rhs:
-                template = normalize_text(
-                    _pl.get_message(
-                        "explicit_fact_recall_reply",
-                        "你之前让我记住的是：{lhs}={rhs}。",
-                    )
-                )
-                reply_text = template or "你之前让我记住的是：{lhs}={rhs}。"
-                if "{lhs}" in reply_text or "{rhs}" in reply_text:
-                    reply_text = reply_text.replace("{lhs}", lhs).replace("{rhs}", rhs)
-                else:
-                    reply_text = f"{reply_text} {lhs}={rhs}"
-                rendered = self.markdown.render(
-                    self._limit_reply_text(
-                        self._apply_tone_guard(reply_text), "short", proactive=False
-                    ),
-                )
-                await self._after_reply(
-                    message=message,
-                    reply_text=rendered,
-                    proactive=False,
-                    action="reply",
-                    open_followup=True,
-                    user_text=text,
-                )
-                self._record_intent(
-                    message, action="reply", reason="explicit_fact_recall", text=text
-                )
-                return EngineResponse(
-                    action="reply", reason="explicit_fact_recall", reply_text=rendered
-                )
-        # 最近结果追问：命中后优先走本地缓存选择，不必重新让 Agent 理解“第2个/再发一次”。
-        # 本地关键词音乐快速通道已停用：点歌/搜歌交给 Router + Prompt 自行判断。
+    async def _dispatch_turn(
+        self,
+        message: EngineMessage,
+        text: str,
+        trigger: Any,
+        safety: Any,
+        explicit_bot_addressed: bool,
+        turn_ctx: TurnContext,
+        recent_user_lines: list[str],
+        recent_bot_replies: list[str],
+    ) -> tuple[EngineResponse | None, RouterDecision | None, ToolResult | None]:
+        """Agent / Router 分派 + 阈值闸 + 工具执行（E1 纯提取）。
+
+        提前返回时 (response, None, None)；落到回复组装阶段时 (None, decision, tool_result)。
+        """
 
         # ── Agent 模式：优先走 Agent 循环 ──
         if self.agent.enable and self.model_client.enabled:
@@ -1802,23 +1902,23 @@ class YukikoEngine:
                 text=text,
                 trigger=trigger,
                 explicit_bot_addressed=explicit_bot_addressed,
-                thread_state=thread_state,
-                runtime_group_context=runtime_group_context_for_turn,
-                memory_context=memory_context,
-                related_memories=related_memories,
-                user_profile_summary=user_profile_summary,
-                preferred_name=preferred_name,
-                recent_speakers=recent_speakers,
-                compat_context=compat_context,
-                user_policies=user_policies,
-                user_directives=user_directives,
-                runtime_admin_policy=runtime_admin_policy,
-                at_other_user_names=at_other_user_names,
-                affinity_hint=affinity_hint,
-                mood_hint=mood_hint,
+                thread_state=turn_ctx.thread_state,
+                runtime_group_context=turn_ctx.runtime_group_context_for_turn,
+                memory_context=turn_ctx.memory_context,
+                related_memories=turn_ctx.related_memories,
+                user_profile_summary=turn_ctx.user_profile_summary,
+                preferred_name=turn_ctx.preferred_name,
+                recent_speakers=turn_ctx.recent_speakers,
+                compat_context=turn_ctx.compat_context,
+                user_policies=turn_ctx.user_policies,
+                user_directives=turn_ctx.user_directives,
+                runtime_admin_policy=turn_ctx.runtime_admin_policy,
+                at_other_user_names=turn_ctx.at_other_user_names,
+                affinity_hint=turn_ctx.affinity_hint,
+                mood_hint=turn_ctx.mood_hint,
             )
             if agent_result is not None:
-                return agent_result
+                return agent_result, None, None
 
         router_media_summary = self._build_media_summary(message.raw_segments)
         if (
@@ -1845,8 +1945,8 @@ class YukikoEngine:
             media_summary=router_media_summary,
             recent_messages=recent_user_lines,
             recent_bot_replies=recent_bot_replies,
-            user_profile_summary=user_profile_summary,
-            thread_state=thread_state,
+            user_profile_summary=turn_ctx.user_profile_summary,
+            thread_state=turn_ctx.thread_state,
             queue_depth=max(0, int(message.queue_depth)),
             busy_messages=int(getattr(trigger, "busy_messages", 0) or 0),
             busy_users=int(getattr(trigger, "busy_users", 0) or 0),
@@ -1855,7 +1955,7 @@ class YukikoEngine:
             followup_candidate=trigger.followup_candidate,
             listen_probe=trigger.listen_probe,
             risk_level=safety.risk_level,
-            runtime_group_context=runtime_group_context_for_turn,
+            runtime_group_context=turn_ctx.runtime_group_context_for_turn,
         )
         decision, route_fail_reason = await self._route_with_failover(router_input)
         if decision is None:
@@ -1866,7 +1966,7 @@ class YukikoEngine:
                 route_fail_reason,
                 clip_text(text, 80),
             )
-            return EngineResponse(action="ignore", reason=route_fail_reason)
+            return EngineResponse(action="ignore", reason=route_fail_reason), None, None
 
         # 这里以前是 `_normalize_decision_with_tool_policy` + `_self_check_decision`：
         # 前者替模型补 query / 改写工具，后者用 13 条本地规则一票否决模型的判定。
@@ -1938,7 +2038,7 @@ class YukikoEngine:
             )
             return EngineResponse(
                 action="ignore", reason="non_directed_threshold_disabled"
-            )
+            ), None, None
         if (
             decision.confidence < effective_min_confidence
             and not directed_like_call
@@ -1955,7 +2055,7 @@ class YukikoEngine:
                 "router_low_confidence",
                 clip_text(text, 80),
             )
-            return EngineResponse(action="ignore", reason="router_low_confidence")
+            return EngineResponse(action="ignore", reason="router_low_confidence"), None, None
 
         if not decision.should_handle or decision.action == "ignore":
             short_reason = f"router:{clip_text(normalize_text(decision.reason), 96)}"
@@ -1966,7 +2066,7 @@ class YukikoEngine:
                 short_reason,
                 clip_text(text, 80),
             )
-            return EngineResponse(action="ignore", reason=short_reason)
+            return EngineResponse(action="ignore", reason=short_reason), None, None
 
         # 路由确认 should_handle 后才消耗 followup turn，避免被过滤时白白浪费回合
         if getattr(trigger, "followup_candidate", False):
@@ -1991,7 +2091,7 @@ class YukikoEngine:
             )
             return EngineResponse(
                 action="moderate", reason=short_reason, reply_text=rendered
-            )
+            ), None, None
         emotion_response = await self._maybe_emotion_gate(
             message=message,
             trigger=trigger,
@@ -1999,7 +2099,7 @@ class YukikoEngine:
             text=text,
         )
         if emotion_response is not None:
-            return emotion_response
+            return emotion_response, None, None
 
         tool_result = None
         if decision.action in {
@@ -2063,7 +2163,7 @@ class YukikoEngine:
                         reason,
                         clip_text(text, 80),
                     )
-                    return EngineResponse(action="ignore", reason=reason)
+                    return EngineResponse(action="ignore", reason=reason), None, None
 
                 self.logger.warning(
                     "tool_exec_error | trace=%s | 会话=%s | 用户=%s | 工具=%s | 错误=%s",
@@ -2073,6 +2173,20 @@ class YukikoEngine:
                     tool_result.tool_name,
                     tool_result.error,
                 )
+        return None, decision, tool_result
+
+    async def _render_turn_result(
+        self,
+        message: EngineMessage,
+        text: str,
+        decision: RouterDecision,
+        tool_result: ToolResult | None,
+        trigger: Any,
+        turn_ctx: TurnContext,
+        recent_messages: list[Any],
+    ) -> EngineResponse:
+        """回复组装：按 action 生成 reply_text，后处理守卫 + 渲染 + 发送（E1 纯提取）。"""
+
         action = decision.action
         reason = f"router:{clip_text(normalize_text(decision.reason), 96)}"
         verbosity = self.get_verbosity(message.group_id)
@@ -2099,29 +2213,29 @@ class YukikoEngine:
                     reply_text = await self._ai_error_reply(
                         user_text=text,
                         error_context="用户想让你总结之前的内容，但没有找到可总结的上下文。请简短自然地问用户想总结什么。",
-                        memory_context=memory_context,
+                        memory_context=turn_ctx.memory_context,
                         scene_hint="summary_miss",
                     )
                     force_structured_reply = True
             else:
                 reply_text = await self.thinking.generate_reply(
                     user_text=text,
-                    memory_context=memory_context,
-                    related_memories=related_memories,
+                    memory_context=turn_ctx.memory_context,
+                    related_memories=turn_ctx.related_memories,
                     reply_style=decision.reply_style,
                     search_summary="",
                     sensitive_context="",
-                    user_profile_summary=user_profile_summary,
+                    user_profile_summary=turn_ctx.user_profile_summary,
                     trigger_reason=trigger.reason,
                     scene_hint=trigger.scene_hint,
                     verbosity=verbosity,
                     output_style_instruction=output_style_instruction,
                     current_user_id=message.user_id,
-                    current_user_name=preferred_name or message.user_name,
-                    recent_speakers=recent_speakers,
-                    compat_context=compat_context,
-                    affinity_hint=affinity_hint,
-                    mood_hint=mood_hint,
+                    current_user_name=turn_ctx.preferred_name or message.user_name,
+                    recent_speakers=turn_ctx.recent_speakers,
+                    compat_context=turn_ctx.compat_context,
+                    affinity_hint=turn_ctx.affinity_hint,
+                    mood_hint=turn_ctx.mood_hint,
                 )
         elif action == "search":
             search_text = ""
@@ -2186,22 +2300,22 @@ class YukikoEngine:
                 elif is_video_analysis and search_text:
                     reply_text = await self.thinking.generate_reply(
                         user_text=text,
-                        memory_context=memory_context,
-                        related_memories=related_memories,
+                        memory_context=turn_ctx.memory_context,
+                        related_memories=turn_ctx.related_memories,
                         reply_style="long",
                         search_summary=search_text,
                         sensitive_context="",
-                        user_profile_summary=user_profile_summary,
+                        user_profile_summary=turn_ctx.user_profile_summary,
                         trigger_reason=trigger.reason,
                         scene_hint="video_analysis",
                         verbosity=verbosity,
                         output_style_instruction=output_style_instruction,
                         current_user_id=message.user_id,
-                        current_user_name=preferred_name or message.user_name,
-                        recent_speakers=recent_speakers,
-                        compat_context=compat_context,
-                        affinity_hint=affinity_hint,
-                        mood_hint=mood_hint,
+                        current_user_name=turn_ctx.preferred_name or message.user_name,
+                        recent_speakers=turn_ctx.recent_speakers,
+                        compat_context=turn_ctx.compat_context,
+                        affinity_hint=turn_ctx.affinity_hint,
+                        mood_hint=turn_ctx.mood_hint,
                     )
                     if not normalize_text(reply_text):
                         reply_text = search_text
@@ -2214,51 +2328,51 @@ class YukikoEngine:
                         reply_text = await self._ai_error_reply(
                             user_text=text,
                             error_context="媒体已经解析完成，但没有生成可展示的说明文本。请简短自然地告诉用户已处理好并继续发送媒体。",
-                            memory_context=memory_context,
+                            memory_context=turn_ctx.memory_context,
                             scene_hint="media_ack",
                         )
             elif search_text:
                 # 搜索有文本结果：交给 AI 综合分析并生成高质量回复
                 reply_text = await self.thinking.generate_reply(
                     user_text=text,
-                    memory_context=memory_context,
-                    related_memories=related_memories,
+                    memory_context=turn_ctx.memory_context,
+                    related_memories=turn_ctx.related_memories,
                     reply_style=decision.reply_style or "casual",
                     search_summary=search_text,
                     sensitive_context="",
-                    user_profile_summary=user_profile_summary,
+                    user_profile_summary=turn_ctx.user_profile_summary,
                     trigger_reason=trigger.reason,
                     scene_hint="search_synthesis",
                     verbosity=verbosity,
                     output_style_instruction=output_style_instruction,
                     current_user_id=message.user_id,
-                    current_user_name=preferred_name or message.user_name,
-                    recent_speakers=recent_speakers,
-                    compat_context=compat_context,
-                    affinity_hint=affinity_hint,
-                    mood_hint=mood_hint,
+                    current_user_name=turn_ctx.preferred_name or message.user_name,
+                    recent_speakers=turn_ctx.recent_speakers,
+                    compat_context=turn_ctx.compat_context,
+                    affinity_hint=turn_ctx.affinity_hint,
+                    mood_hint=turn_ctx.mood_hint,
                 )
                 if not normalize_text(reply_text):
                     reply_text = search_text
             else:
                 reply_text = await self.thinking.generate_reply(
                     user_text=text,
-                    memory_context=memory_context,
-                    related_memories=related_memories,
+                    memory_context=turn_ctx.memory_context,
+                    related_memories=turn_ctx.related_memories,
                     reply_style="serious",
                     search_summary=search_text,
                     sensitive_context="",
-                    user_profile_summary=user_profile_summary,
+                    user_profile_summary=turn_ctx.user_profile_summary,
                     trigger_reason=trigger.reason,
                     scene_hint="tech_support",
                     verbosity=verbosity,
                     output_style_instruction=output_style_instruction,
                     current_user_id=message.user_id,
-                    current_user_name=preferred_name or message.user_name,
-                    recent_speakers=recent_speakers,
-                    compat_context=compat_context,
-                    affinity_hint=affinity_hint,
-                    mood_hint=mood_hint,
+                    current_user_name=turn_ctx.preferred_name or message.user_name,
+                    recent_speakers=turn_ctx.recent_speakers,
+                    compat_context=turn_ctx.compat_context,
+                    affinity_hint=turn_ctx.affinity_hint,
+                    mood_hint=turn_ctx.mood_hint,
                 )
                 if not normalize_text(reply_text):
                     reply_text = search_text
@@ -2280,7 +2394,7 @@ class YukikoEngine:
                 reply_text = await self._ai_error_reply(
                     user_text=text,
                     error_context=f"{_music_hint}。用户原文：{text}。请简短自然地告诉用户，可以换个关键词再试。",
-                    memory_context=memory_context,
+                    memory_context=turn_ctx.memory_context,
                     scene_hint="music_error",
                 )
         elif action == "generate_image":
@@ -2295,7 +2409,7 @@ class YukikoEngine:
                 reply_text = await self._ai_error_reply(
                     user_text=text,
                     error_context=f"用户要求生成图片但失败了。用户原文：{text}。请简短自然地告诉用户生成失败，可以再试一次或换个描述。",
-                    memory_context=memory_context,
+                    memory_context=turn_ctx.memory_context,
                     scene_hint="image_gen_error",
                 )
         elif action in {
@@ -2309,7 +2423,7 @@ class YukikoEngine:
                 reply_text = await self._ai_error_reply(
                     user_text=text,
                     error_context=f"用户的请求执行失败了。用户原文：{text}。请简短自然地告诉用户执行失败，可以再试。",
-                    memory_context=memory_context,
+                    memory_context=turn_ctx.memory_context,
                     scene_hint="tool_error",
                 )
         elif action == "send_segment":
@@ -2326,7 +2440,7 @@ class YukikoEngine:
                 reply_text = await self._ai_error_reply(
                     user_text=text,
                     error_context="消息片段发送失败，没有拿到明确错误信息。请简短自然地让用户稍后重试。",
-                    memory_context=memory_context,
+                    memory_context=turn_ctx.memory_context,
                     scene_hint="segment_send_error",
                 )
         else:
@@ -2336,8 +2450,8 @@ class YukikoEngine:
             reply_text = self._guard_unverified_memory_claims(
                 reply_text=reply_text,
                 user_text=text,
-                current_user_recent=current_user_recent,
-                related_memories=related_memories,
+                current_user_recent=turn_ctx.current_user_recent,
+                related_memories=turn_ctx.related_memories,
             )
         reply_text = self._sanitize_reply_output(reply_text, action=action)
         reply_text = self._enforce_identity_claim(reply_text)
@@ -3808,9 +3922,7 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_video_text_only_intent(text: str) -> bool:
-        return YukikoEngine._has_control_token(
-            text, "output=text", "mode=text", "text-only", "/text"
-        )
+        return intent_predicates.looks_like_video_text_only_intent(text)
 
     @staticmethod
     def _looks_like_download_task_intent(text: str) -> bool:
@@ -3859,30 +3971,9 @@ class YukikoEngine:
     def _looks_like_recent_bot_reply_echo(
         cls, text: str, recent_bot_replies: list[str]
     ) -> bool:
-        incoming = cls._normalize_reply_echo_text(text)
-        if len(incoming) < 80:
-            return False
-
-        for reply in recent_bot_replies[-3:]:
-            candidate = cls._normalize_reply_echo_text(reply)
-            if len(candidate) < 60:
-                continue
-
-            shorter = min(len(incoming), len(candidate))
-            longer = max(len(incoming), len(candidate))
-            if shorter < 60 or shorter / max(longer, 1) < 0.72:
-                continue
-
-            if candidate in incoming and len(incoming) - len(candidate) <= 48:
-                return True
-
-            if incoming in candidate and len(candidate) - len(incoming) <= 24:
-                return True
-
-            if SequenceMatcher(None, incoming[:2000], candidate[:2000]).ratio() >= 0.92:
-                return True
-
-        return False
+        return intent_predicates.looks_like_recent_bot_reply_echo(
+            text, recent_bot_replies
+        )
 
     @staticmethod
     def _extract_candidate_qq_target(message: EngineMessage, text: str) -> str:
@@ -5758,13 +5849,11 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_summary_followup(text: str) -> bool:
-        return YukikoEngine._has_control_token(
-            text, "/summary", "/summarize", "mode=summary", "output=summary"
-        )
+        return intent_predicates.looks_like_summary_followup(text)
 
     @staticmethod
     def _looks_like_resend_followup(text: str) -> bool:
-        return YukikoEngine._has_control_token(text, "/resend", "/retry", "mode=resend")
+        return intent_predicates.looks_like_resend_followup(text)
 
     def _compose_cached_full_reply(self, message: EngineMessage) -> str:
         if not bool(getattr(self, "search_followup_cache_enable", True)):
@@ -5897,11 +5986,11 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_choice_next(text: str) -> bool:
-        return YukikoEngine._has_control_token(text, "/next", "page=next")
+        return intent_predicates.looks_like_choice_next(text)
 
     @staticmethod
     def _looks_like_choice_prev(text: str) -> bool:
-        return YukikoEngine._has_control_token(text, "/prev", "page=prev")
+        return intent_predicates.looks_like_choice_prev(text)
 
     def _looks_like_resend_media_followup(self, text: str) -> bool:
         return self._looks_like_resend_followup(
@@ -5910,9 +5999,7 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_source_trace_followup(text: str) -> bool:
-        return YukikoEngine._has_control_token(
-            text, "/source", "/sources", "mode=sources"
-        )
+        return intent_predicates.looks_like_source_trace_followup(text)
 
     def _build_cached_source_trace_result(
         self, cached: dict[str, Any], text: str
@@ -5977,13 +6064,11 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_sticker_request(text: str) -> bool:
-        return YukikoEngine._has_control_token(text, "/sticker", "/emoji", "/meme")
+        return intent_predicates.looks_like_sticker_request(text)
 
     @staticmethod
     def _looks_like_choice_prompt_text(text: str) -> bool:
-        _ = text
-        # “回复数字/选第几个”链路已下线。
-        return False
+        return intent_predicates.looks_like_choice_prompt_text(text)
 
     @staticmethod
     def _contains_choice_numbered_list(text: str) -> bool:
@@ -6019,45 +6104,11 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_image_url(url: str) -> bool:
-        value = normalize_text(url).lower()
-        if not value:
-            return False
-
-        if "multimedia.nt.qq.com.cn" in value:
-            return True
-
-        return bool(re.search(r"\.(?:jpg|jpeg|png|gif|webp|bmp)(?=$|[?#&!@_/])", value))
+        return intent_predicates.looks_like_image_url(url)
 
     @staticmethod
     def _looks_like_video_url(url: str) -> bool:
-        value = normalize_text(url).lower()
-        if not value:
-            return False
-
-        return bool(
-            re.search(r"\.(?:mp4|mov|webm|m4v)(?:\?|$)", value)
-            or any(
-                host in value
-                for host in (
-                    "bilibili.com/video/",
-                    "b23.tv/",
-                    "douyin.com/",
-                    "kuaishou.com/",
-                    "acfun.cn/v/ac",
-                    "acfun.com/v/ac",
-                    "m.acfun.cn/v/",
-                    "v.qq.com/",
-                    "m.v.qq.com/",
-                    "iqiyi.com/",
-                    "iq.com/",
-                    "qiyi.com/",
-                    "youtube.com/",
-                    "youtu.be/",
-                    "tiktok.com/",
-                    "ixigua.com/",
-                )
-            )
-        )
+        return intent_predicates.looks_like_video_url(url)
 
     def _rotate_cached_choice(
         self,
@@ -6570,56 +6621,7 @@ class YukikoEngine:
 
     @staticmethod
     def _extract_topic_terms_for_memory(text: str, max_terms: int = 6) -> list[str]:
-        content = normalize_text(text)
-        if not content or max_terms <= 0:
-            return []
-
-        out: list[str] = []
-        seen: set[str] = set()
-        strip_chars = "`\"'[](){}<>.,;:!?\uFF0C\u3002\uFF1F\uFF01\uFF1A"
-
-        def add_candidate(raw: str) -> None:
-            item = normalize_text(str(raw)).strip(strip_chars)
-            if not item:
-                return
-            lower = item.lower()
-            if lower in seen:
-                return
-            if lower.startswith("/") or "=" in lower:
-                return
-            if re.search(r"https?://", lower, flags=re.IGNORECASE):
-                return
-            if re.fullmatch(r"[1-9]\d*", item):
-                return
-            if re.search(r"[a-z0-9]", lower):
-                compact = re.sub(r"[^a-z0-9_.-]+", "", lower)
-                if len(compact) < 3:
-                    return
-            elif re.fullmatch(r"[\u4e00-\u9fff]+", item):
-                if len(item) < 3:
-                    return
-            elif len(item) < 3:
-                return
-            seen.add(lower)
-            out.append(item)
-        explicit_patterns = (
-            r"`([^`]{2,80})`",
-            r"\*\*([^*]{2,80})\*\*",
-            r"[\u201c\"]([^\u201d\"]{2,80})[\u201d\"]",
-            r"\u300a([^\u300b]{2,80})\u300b",
-        )
-        for pattern in explicit_patterns:
-            for raw in re.findall(pattern, content):
-                add_candidate(raw)
-                if len(out) >= max_terms:
-                    return out[:max_terms]
-
-        for token in tokenize(content):
-            add_candidate(token)
-            if len(out) >= max_terms:
-                break
-
-        return out[:max_terms]
+        return intent_predicates.extract_topic_terms_for_memory(text, max_terms)
 
     @staticmethod
     def _extract_structured_reference_spans(text: str, max_terms: int = 4) -> list[str]:
@@ -6704,47 +6706,11 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_ambiguous_link_memory_query(text: str) -> bool:
-        content = normalize_text(text)
-        if not content:
-            return False
-
-        if re.search(r"https?://", content, flags=re.IGNORECASE):
-            return False
-
-        if not YukikoEngine._has_control_token(
-            text, "/link", "/url", "type=link", "type=url", "mode=url"
-        ):
-            return False
-
-        cleaned = re.sub(r"(?i)(?<!\S)/(?:link|url)\b", " ", content)
-        cleaned = re.sub(r"(?i)\b(?:type|mode)\s*=\s*(?:link|url)\b", " ", cleaned)
-        return not YukikoEngine._extract_topic_terms_for_memory(cleaned, max_terms=3)
+        return intent_predicates.looks_like_ambiguous_link_memory_query(text)
 
     @staticmethod
     def _looks_like_short_context_sensitive_query(text: str) -> bool:
-        content = normalize_text(text)
-        if not content:
-            return False
-
-        if re.search(r"https?://", content, flags=re.IGNORECASE):
-            return False
-
-        if re.fullmatch(r"[?!.,\uFF1F\uFF01\uFF0C\u3002]+", content):
-            return True
-
-        if len(content) > 24:
-            return False
-
-        if YukikoEngine._extract_topic_terms_for_memory(content, max_terms=2):
-            return False
-
-        compact = re.sub(r"\s+", "", content)
-        if len(compact) <= 8:
-            return True
-
-        tokens = [normalize_text(str(token)) for token in tokenize(content)]
-        tokens = [token for token in tokens if token]
-        return len(tokens) <= 2
+        return intent_predicates.looks_like_short_context_sensitive_query(text)
 
     def _remember_agent_followup_cache(
         self, message: EngineMessage, agent_result: AgentResult

@@ -24,7 +24,7 @@ from nonebot.adapters.onebot.v11 import Bot, Event, Message, MessageEvent, Messa
 from core.chat_splitter import coalesce_for_rate_limit, split_semantic_text
 from core.napcat_compat import build_napcat_file_reference, call_napcat_bot_api
 from core import prompt_loader as _pl
-from core.engine import EngineMessage, YukikoEngine
+from core.engine import EngineMessage, EngineResponse, YukikoEngine
 from core.queue import GroupQueueDispatcher
 from utils.text import clip_text, normalize_text
 
@@ -2061,12 +2061,6 @@ def register_handlers(engine: YukikoEngine) -> None:
             send_rate_window_seconds = int(send_opts["send_rate_window_seconds"])
             send_rate_warn_threshold = int(send_opts["send_rate_warn_threshold"])
             send_rate_enable = bool(send_opts["send_rate_enable"])
-            voice_send_max_seconds = int(send_opts["voice_send_max_seconds"])
-            voice_send_try_full_first = bool(send_opts["voice_send_try_full_first"])
-            voice_send_split_enable = bool(send_opts["voice_send_split_enable"])
-            voice_send_split_max_segments = int(send_opts["voice_send_split_max_segments"])
-            voice_send_music_force_full = bool(send_opts["voice_send_music_force_full"])
-            voice_send_music_disable_split = bool(send_opts["voice_send_music_disable_split"])
             latest_ctx = _latest_queue_task_ctx.get(payload.conversation_id, {})
             latest_trace = normalize_text(str(latest_ctx.get("trace_id", ""))) if isinstance(latest_ctx, dict) else ""
             if getattr(result, "action", "") == "ignore":
@@ -2149,21 +2143,8 @@ def register_handlers(engine: YukikoEngine) -> None:
                     bool(image_urls or video_url or cover_url or record_b64 or audio_file),
                     same_user_newer_turn,
                 )
-            if not is_music_voice_action and audio_file:
-                audio_hint = normalize_text(audio_file).replace("\\", "/").lower()
-                looks_like_music_cache = (
-                    "/storage/cache/music/" in audio_hint
-                    or audio_hint.startswith("storage/cache/music/")
-                    or bool(re.search(r"(?:^|/)(?:netease_|music_)[^/]*\.(?:mp3|m4a|wav|ogg|flac|silk)$", audio_hint))
-                )
-                if looks_like_music_cache:
-                    is_music_voice_action = True
-                    _log.info(
-                        "voice_send_music_action_infer | trace=%s | action=%s | audio=%s",
-                        payload.trace_id,
-                        action or "-",
-                        clip_text(audio_hint, 120),
-                    )
+            # 音乐缓存路径推断已迁入 core.response_delivery.deliver_response（E4）：
+            # 未显式标记点歌时按 audio 路径落在 storage/cache/music/ 或 music_* 命名推断。
             delivered = False
             send_attempts = 0
             send_success = 0
@@ -2183,7 +2164,7 @@ def register_handlers(engine: YukikoEngine) -> None:
             # 统一发送核心：限流/熔断/暂停经 core.response_delivery.build_send_guard
             # （架构收敛任务 B3）。失败标记保留在 _safe_send 内部（no-op 注入，
             # 见 _noop_send_failure_mark），不重复熔断。
-            from core.response_delivery import build_send_guard
+            from core.response_delivery import build_send_guard, deliver_response
 
             async def _raw_platform_send(msg: Message) -> bool:
                 return await _safe_send(bot=bot, event=event, message=msg)
@@ -2217,7 +2198,9 @@ def register_handlers(engine: YukikoEngine) -> None:
                 video_pre_ack_sent = True
                 delivered = True
 
-            # ── 语音/音频消息（点歌功能）──
+            # ── 语音/音频消息（点歌功能）：文案前缀 + 统一发送核心 ──
+            # 点歌语音 4 特性（silk 源互换 / music_force_full / music_disable_split /
+            # 裁剪兜底+整段去重）已迁入 core.response_delivery._send_voice（E4）。
             if record_b64 or audio_file:
                 voice_msg = Message()
                 if reply_text:
@@ -2230,205 +2213,38 @@ def register_handlers(engine: YukikoEngine) -> None:
                     # 仅在文案发送成功时清空，避免失败后文本丢失。
                     if text_ok:
                         reply_text = ""
-                # 发送语音条：优先 file://（NapCat 对本地文件时长识别最准确）
-                sent_voice = False
-                if audio_file:
-                    try:
-                        resolved_audio_path: Path | None = None
-                        audio_source = normalize_text(audio_file)
-                        audio_source_l = audio_source.lower()
-                        try:
-                            if not audio_source_l.startswith(("file://", "http://", "https://", "base64://")):
-                                resolved_audio_path = Path(audio_source).expanduser().resolve()
-                                if not resolved_audio_path.exists() or not resolved_audio_path.is_file():
-                                    resolved_audio_path = None
-                        except Exception:
-                            resolved_audio_path = None
+                # 语音本体走统一发送核心；文本/媒体已在此路径外发送，这里只带语音字段。
+                voice_response = EngineResponse(
+                    action=action,
+                    reason=str(getattr(result, "reason", "") or ""),
+                    record_b64=record_b64,
+                    audio_file=audio_file,
+                )
 
-                        effective_audio_path = resolved_audio_path
-                        source_is_silk = bool(
-                            resolved_audio_path is not None
-                            and resolved_audio_path.suffix.lower() == ".silk"
-                        )
-                        if source_is_silk and resolved_audio_path is not None:
-                            for ext in (".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac"):
-                                candidate = resolved_audio_path.with_suffix(ext)
-                                try:
-                                    if candidate.exists() and candidate.is_file() and candidate.stat().st_size > 1024:
-                                        effective_audio_path = candidate
-                                        _log.info(
-                                            "voice_send_silk_source_swap | trace=%s | silk=%s | split_src=%s",
-                                            payload.trace_id,
-                                            resolved_audio_path.name,
-                                            candidate.name,
-                                        )
-                                        break
-                                except Exception:
-                                    continue
+                async def _voice_platform_send(chain: Any) -> bool:
+                    segments = chain.to_onebot_segments() if hasattr(chain, "to_onebot_segments") else []
+                    msg = Message()
+                    for seg in segments:
+                        msg.append(MessageSegment(type=seg.get("type", "text"), data=seg.get("data", {})))
+                    return await _safe_send(bot=bot, event=event, message=msg)
 
-                        segment_seconds = voice_send_max_seconds if voice_send_max_seconds > 0 else 60
-                        original_duration = 0.0
-                        is_long_audio = False
-                        if effective_audio_path is not None and voice_send_max_seconds > 0:
-                            original_duration = await asyncio.to_thread(_probe_audio_duration_seconds_sync, effective_audio_path)
-                            is_long_audio = original_duration > float(voice_send_max_seconds) + 0.8
-
-                        try_full_for_current = voice_send_try_full_first
-                        split_enable_for_current = voice_send_split_enable
-                        if is_music_voice_action and voice_send_music_force_full:
-                            try_full_for_current = True
-                        if is_music_voice_action and voice_send_music_disable_split:
-                            split_enable_for_current = False
-                        if source_is_silk and effective_audio_path is not None and effective_audio_path != resolved_audio_path:
-                            if is_long_audio and split_enable_for_current:
-                                try_full_for_current = False
-                        record_audio_path = effective_audio_path
-                        # 兜底判断需要 full_audio_uri 恒有值：未走直发时是未编码的原文件 URI。
-                        full_audio_uri = _build_file_uri(
-                            effective_audio_path if effective_audio_path is not None else audio_source
-                        )
-                        tried_full_direct = False
-                        # QQ 语音必须 silk 编码：发送前把源音频转成 silk（截断到 max_seconds），
-                        # 否则 mp3 直发在 QQ 端点开无法播放（NapCat 不保证自动转码）。
-                        # 只在"将直发"分支做整段编码——长音频若不直发（等切片）不白编一遍 60s silk。
-                        if try_full_for_current or not is_long_audio:
-                            if effective_audio_path is not None:
-                                silk_candidate = await _silk_encode_for_record(
-                                    effective_audio_path, voice_send_max_seconds
-                                )
-                                if silk_candidate is not None:
-                                    record_audio_path = silk_candidate
-                            full_audio_uri = _build_file_uri(
-                                record_audio_path if record_audio_path is not None else audio_source
-                            )
-                            if full_audio_uri:
-                                tried_full_direct = True
-                                _log.info(
-                                    "voice_send_try_full | trace=%s | src=%s | duration=%.2fs | max=%ss | long=%s",
-                                    payload.trace_id,
-                                    effective_audio_path.name if effective_audio_path is not None else clip_text(audio_source, 80),
-                                    original_duration,
-                                    voice_send_max_seconds,
-                                    is_long_audio,
-                                )
-                                sent_voice = await send_msg(Message(MessageSegment.record(file=full_audio_uri)))
-                                if sent_voice:
-                                    _log.info("voice_send_try_full_ok | trace=%s", payload.trace_id)
-                                else:
-                                    _log.warning("voice_send_try_full_fail | trace=%s", payload.trace_id)
-
-                        # 长音频：完整发送失败后可自动切片分段发送。
-                        if (
-                            not sent_voice
-                            and effective_audio_path is not None
-                            and is_long_audio
-                            and split_enable_for_current
-                        ):
-                            _log.info(
-                                "voice_send_split_start | trace=%s | src=%s | duration=%.2fs | segment=%ss | max_segments=%d",
-                                payload.trace_id,
-                                effective_audio_path.name,
-                                original_duration,
-                                segment_seconds,
-                                voice_send_split_max_segments,
-                            )
-                            split_parts = await _split_voice_audio_file(
-                                effective_audio_path,
-                                segment_seconds=segment_seconds,
-                                max_segments=voice_send_split_max_segments,
-                            )
-                            if split_parts:
-                                split_ok = True
-                                split_sent_count = 0
-                                for part_idx, part_path in enumerate(split_parts, start=1):
-                                    part_silk = await _silk_encode_for_record(
-                                        part_path, segment_seconds
-                                    )
-                                    part_uri = _build_file_uri(
-                                        part_silk if part_silk is not None else part_path
-                                    )
-                                    part_ok = await send_msg(Message(MessageSegment.record(file=part_uri)))
-                                    if not part_ok:
-                                        split_ok = False
-                                        _log.warning(
-                                            "voice_send_split_part_fail | trace=%s | part=%d/%d | file=%s",
-                                            payload.trace_id,
-                                            part_idx,
-                                            len(split_parts),
-                                            part_path.name,
-                                        )
-                                        break
-                                    split_sent_count += 1
-                                if split_ok and split_sent_count > 0:
-                                    sent_voice = True
-                                    _log.info(
-                                        "voice_send_split_ok | trace=%s | parts=%d",
-                                        payload.trace_id,
-                                        split_sent_count,
-                                    )
-                                elif split_sent_count > 0:
-                                    sent_voice = True
-                                    _log.warning(
-                                        "voice_send_split_partial | trace=%s | sent=%d/%d",
-                                        payload.trace_id,
-                                        split_sent_count,
-                                        len(split_parts),
-                                    )
-                                else:
-                                    _log.warning(
-                                        "voice_send_split_fail | trace=%s | reason=all_parts_send_failed",
-                                        payload.trace_id,
-                                    )
-                            else:
-                                _log.warning(
-                                    "voice_send_split_fail | trace=%s | reason=no_parts | src=%s",
-                                    payload.trace_id,
-                                    effective_audio_path.name,
-                                )
-
-                        # 兜底：按最大秒数裁剪后再发一条，避免整段/分段都失败。
-                        if not sent_voice:
-                            send_audio_path = effective_audio_path
-                            allow_trim_fallback = not (is_music_voice_action and voice_send_music_force_full)
-                            if effective_audio_path is not None and voice_send_max_seconds > 0 and allow_trim_fallback:
-                                prepared_path, prepared_duration, trimmed = await _prepare_voice_audio_file(
-                                    effective_audio_path,
-                                    voice_send_max_seconds,
-                                )
-                                send_audio_path = prepared_path
-                                _log.info(
-                                    "voice_send_prepare | trace=%s | src=%s | send=%s | duration=%.2fs | max=%ss | trimmed=%s",
-                                    payload.trace_id,
-                                    effective_audio_path.name,
-                                    prepared_path.name,
-                                    prepared_duration,
-                                    voice_send_max_seconds,
-                                    trimmed,
-                                )
-
-                            fallback_silk = None
-                            if send_audio_path is not None:
-                                fallback_silk = await _silk_encode_for_record(
-                                    send_audio_path, voice_send_max_seconds
-                                )
-                            fallback_uri = _build_file_uri(
-                                fallback_silk
-                                if fallback_silk is not None
-                                else (send_audio_path if send_audio_path is not None else audio_source)
-                            )
-                            # 已完整尝试过同一路径则不重复发送。
-                            if fallback_uri and (not tried_full_direct or fallback_uri != full_audio_uri):
-                                sent_voice = await send_msg(Message(MessageSegment.record(file=fallback_uri)))
-                            elif not fallback_uri:
-                                _log.warning("voice_send_file_uri_empty | trace=%s | audio=%s", payload.trace_id, clip_text(audio_source, 80))
-                    except Exception as _voice_file_err:
-                        _log.warning("voice_send_file_fail | %s", _voice_file_err)
-                if not sent_voice and record_b64:
-                    try:
-                        sent_voice = await send_msg(Message(MessageSegment.record(file=f"base64://{record_b64}")))
-                    except Exception as _voice_b64_err:
-                        _log.warning("voice_send_b64_fail | %s", _voice_b64_err)
-                if sent_voice:
+                try:
+                    voice_ok = await deliver_response(
+                        engine.config,
+                        voice_response,
+                        _voice_platform_send,
+                        conversation_id=payload.conversation_id,
+                        group_id=payload.group_id,
+                        bot_id=str(getattr(bot, "self_id", "") or ""),
+                        mark_failure_fn=_noop_send_failure_mark,
+                        is_music_voice_action=is_music_voice_action,
+                    )
+                except Exception as _voice_core_err:
+                    _log.warning("voice_send_core_fail | %s", _voice_core_err)
+                    voice_ok = False
+                send_attempts += 1
+                if voice_ok:
+                    send_success += 1
                     delivered = True
                 else:
                     fallback = Message()

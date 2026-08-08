@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -156,6 +157,7 @@ async def _reply_to_session(
     group_id: int = 0,
     bot_id: str = "",
     config: dict[str, Any] | None = None,
+    sleep_fn: Callable[[float], Awaitable[None]] | None = None,
 ) -> None:
     """发送 EngineResponse 到会话，经统一发送核心（文本/图片/视频/语音 + 发送保护）。"""
     from core.response_delivery import deliver_response
@@ -192,8 +194,56 @@ async def _reply_to_session(
         conversation_id=session_id,
         group_id=group_id,
         bot_id=bot_id,
+        sleep_fn=sleep_fn,
         mark_failure_fn=mark_failure_fn,
     )
+
+
+def build_message_handler(
+    engine: Any,
+    adapter: Any,
+    dispatcher: Any,
+    *,
+    bot_id: str,
+    config: dict[str, Any] | None = None,
+    trace_builder: Any = None,
+    api_call: Any = None,
+    sleep_fn: Callable[[float], Awaitable[None]] | None = None,
+) -> Callable[[dict[str, Any]], Awaitable[None]]:
+    """构造平台事件 handler（bridge/primary 共用）：事件 → engine → 统一发送核心。
+
+    消除 register_onebot11_platform 与 run_primary._wire_bridge 的重复接线
+    （同款 _event_to_engine_message + handle_message + deliver_response）。
+    """
+
+    async def _default_trace_builder(conversation_id: str, seq: int) -> str:
+        return f"platform-{conversation_id}-{seq}"
+
+    builder = trace_builder or _default_trace_builder
+
+    async def message_handler(event: dict[str, Any]) -> None:
+        try:
+            payload = await _event_to_engine_message(
+                event,
+                dispatcher=dispatcher,
+                bot_id=bot_id,
+                trace_builder=builder,
+                api_call=api_call,
+            )
+            response: EngineResponse = await engine.handle_message(payload)
+            await _reply_to_session(
+                adapter,
+                str(event.get("conversation_id", "")),
+                response,
+                group_id=int(event.get("group_id", 0) or 0),
+                bot_id=bot_id,
+                config=config,
+                sleep_fn=sleep_fn,
+            )
+        except Exception:
+            _log.warning("platform_message_error", exc_info=True)
+
+    return message_handler
 
 
 async def register_onebot11_platform(
@@ -213,10 +263,6 @@ async def register_onebot11_platform(
         _log.info("onebot11_platform_disabled | config gate off")
         return None
 
-    def _default_trace_builder(conversation_id: str, seq: int) -> str:
-        return f"platform-{conversation_id}-{seq}"
-
-    builder = trace_builder or _default_trace_builder
     adapter = OneBot11Adapter(
         {
             "host": cfg.get("host", "0.0.0.0"),
@@ -231,28 +277,15 @@ async def register_onebot11_platform(
         # 供工具层经 NapCat 调用 OneBot API（music_play 依赖 api_call 才携带 audio_file）。
         return await adapter._send_api(api, kwargs)
 
-    async def message_handler(event: dict[str, Any]) -> None:
-        try:
-            payload = await _event_to_engine_message(
-                event,
-                dispatcher=dispatcher,
-                bot_id=bot_id,
-                trace_builder=builder,
-                api_call=_platform_api_call,
-            )
-            response: EngineResponse = await engine.handle_message(payload)
-            await _reply_to_session(
-                adapter,
-                str(event.get("conversation_id", "")),
-                response,
-                group_id=int(event.get("group_id", 0) or 0),
-                bot_id=bot_id,
-                config=engine.config if isinstance(engine.config, dict) else None,
-            )
-        except Exception:
-            _log.warning("platform_message_error", exc_info=True)
-
-    adapter.message_handler = message_handler
+    adapter.message_handler = build_message_handler(
+        engine,
+        adapter,
+        dispatcher,
+        bot_id=bot_id,
+        config=engine.config if isinstance(engine.config, dict) else None,
+        trace_builder=trace_builder,
+        api_call=_platform_api_call,
+    )
     manager = PlatformManager()
     manager.register("onebot11", adapter)
     await manager.start()
