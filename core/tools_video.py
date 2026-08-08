@@ -4363,6 +4363,32 @@ class ToolVideoMixin:
 # 模块级公开函数。executor 需实现对应 mixin（ToolExecutor 即满足）；私有
 # 实现仍留在 mixin 内，后续阶段可再把实现迁移进公开函数。
 
+# 三个视频能力描述的单一真相源（架构收敛 D8）：agent_tools_media.py /
+# agent_tools_web.py 的 ToolSchema.description 与公开函数 docstring 同源。
+# 注意 browser_resolve_video / video_analyze 是多 consumer 的共享函数
+# （smart_download / analyze_local_video 也复用它），docstring 描述的是它们
+# 的主能力（parse_video / analyze_video），辅消费者各自的描述只在各自 schema。
+PARSE_VIDEO_DESCRIPTION = (
+    "解析短视频链接，返回可发送的视频URL。\n"
+    "支持平台: 抖音(douyin/v.douyin.com)、快手(kuaishou)、B站(bilibili/b23.tv)、AcFun、腾讯视频、爱奇艺、YouTube、优酷、直链视频(.mp4等)。\n"
+    "使用场景: 用户发了视频链接让你解析/下载/发送时使用。\n"
+    "返回 video_url 可直接通过 final_answer 的 video_url 参数发送。\n"
+    "同时返回 qq_safety 安全度评估(safe/risky/blocked)。"
+)
+
+DOUYIN_SEARCH_DESCRIPTION = (
+    "在抖音搜索视频，返回视频标题、作者和链接。\n"
+    "使用场景: 用户说'搜一下抖音上的XX'、'找个抖音视频'时使用"
+)
+
+ANALYZE_VIDEO_DESCRIPTION = (
+    "深度分析视频内容: 提取标题、作者、时长、标签、弹幕热词、热评、字幕等。\n"
+    "B站视频可获取弹幕热词和热评，抖音可获取详情数据。\n"
+    "有本地视频+ffmpeg时还能提取关键帧用AI识别画面内容。\n"
+    "使用场景: 用户要求分析、评价、解说、总结视频内容时使用。\n"
+    "同时返回 qq_safety 安全度评估。"
+)
+
 
 async def browser_resolve_video(
     executor: Any,
@@ -4371,7 +4397,10 @@ async def browser_resolve_video(
     query: str = "",
     method_name: str = "parse_video",
 ) -> ToolResult:
-    """解析视频/图文链接为可发送直链（parse_video 底层能力）。"""
+    """解析视频/图文链接为可发送直链（parse_video 底层能力）。
+
+    描述单一真相源见 PARSE_VIDEO_DESCRIPTION（ToolSchema.description 同源）。
+    """
     return await executor._method_browser_resolve_video(
         method_name, {"url": url}, query
     )
@@ -4383,7 +4412,10 @@ async def douyin_search_video(
     query: str,
     limit: int = 5,
 ) -> ToolResult:
-    """按关键词搜索抖音视频（douyin_search 底层能力）。"""
+    """按关键词搜索抖音视频（douyin_search 底层能力）。
+
+    描述单一真相源见 DOUYIN_SEARCH_DESCRIPTION（ToolSchema.description 同源）。
+    """
     return await executor._method_douyin_search_video(
         "douyin.search_video", {"query": query, "limit": limit}, query
     )
@@ -4399,7 +4431,10 @@ async def video_analyze(
     conversation_id: str = "",
     method_name: str = "analyze_video",
 ) -> ToolResult:
-    """深度视频分析：关键帧 + Vision API + 平台富元数据（analyze_video 底层能力）。"""
+    """深度视频分析：关键帧 + Vision API + 平台富元数据（analyze_video 底层能力）。
+
+    描述单一真相源见 ANALYZE_VIDEO_DESCRIPTION（ToolSchema.description 同源）。
+    """
     return await executor._method_video_analyze(
         method_name,
         {"url": url},

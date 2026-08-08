@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 from core import prompt_loader as _pl
 from core.admin import AdminEngine
 from core.agent import AgentContext, AgentLoop, AgentResult
-from core import media_utils
+from core import media_utils, text_utils
 from core.agent_tools import (
     AgentToolRegistry,
     register_builtin_tools,
@@ -3426,13 +3426,7 @@ class YukikoEngine:
 
     @staticmethod
     def _normalize_short_ping_phrase(text: str) -> str:
-        content = normalize_text(text).lower()
-        if not content:
-            return ""
-
-        content = re.sub(r"\s+", "", content)
-        content = re.sub(r"[。！？!?，,、~…]+$", "", content)
-        return content
+        return text_utils.normalize_short_ping_phrase(text)
 
     def _is_short_ping_message(self, text: str) -> bool:
         if not self.short_ping_phrases:
@@ -3457,35 +3451,11 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_explicit_request(text: str) -> bool:
-        content = normalize_text(text)
-        if not content:
-            return False
-
-        if "?" in content or "？" in content:
-            return True
-
-        if re.match(r"^[!/][a-z0-9_.:-]+", content, flags=re.IGNORECASE):
-            return True
-
-        return False
+        return text_utils.looks_like_explicit_request(text)
 
     @staticmethod
     def _has_control_token(text: str, *tokens: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-
-        for token in tokens:
-            token_norm = normalize_text(token).lower()
-            if not token_norm:
-                continue
-
-            if re.search(
-                rf"(?<![a-z0-9_]){re.escape(token_norm)}(?![a-z0-9_])", content
-            ):
-                return True
-
-        return False
+        return text_utils.has_control_token(text, *tokens)
 
     def _has_structural_media_locator(self, text: str) -> bool:
         content = normalize_text(text).lower()
@@ -3784,18 +3754,7 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_media_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-
-        if re.search(r"https?://[^\s]+", content):
-            return True
-
-        # BV/av 号识别
-        if re.search(r"(?:bv|av)\w{6,}", content, flags=re.IGNORECASE):
-            return True
-
-        return False
+        return text_utils.looks_like_media_request(text)
 
     def _looks_like_video_request(self, text: str) -> bool:
         content = normalize_text(text).lower()
@@ -3845,18 +3804,7 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_low_info_group_chitchat(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return True
-
-        compact = re.sub(r"\s+", "", content)
-        if not compact:
-            return True
-
-        if re.fullmatch(r"[?？!！。./\\,，:：;；~～\-_=+*'\"`·…]{1,12}", compact):
-            return True
-
-        return len(compact) <= 2
+        return text_utils.looks_like_low_info_group_chitchat(text)
 
     @staticmethod
     def _looks_like_video_text_only_intent(text: str) -> bool:
@@ -3866,43 +3814,15 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_download_task_intent(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-
-        return bool(re.search(r"\.(exe|apk|ipa|msi|zip|rar|7z)\b", content))
+        return text_utils.looks_like_download_task_intent(text)
 
     @staticmethod
     def _looks_like_music_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-
-        if re.search(r"https?://[^\s]+", content):
-            return True
-
-        if re.search(r"\.(?:mp3|wav|flac|ogg|m4a|aac)\b", content, flags=re.IGNORECASE):
-            return True
-
-        return YukikoEngine._has_control_token(text, "/music", "/song", "mode=music")
+        return text_utils.looks_like_music_request(text)
 
     @staticmethod
     def _extract_music_keyword(text: str) -> str:
-        content = normalize_text(text)
-        if not content:
-            return ""
-
-        content = re.sub(r"^@\S+\s*", "", content)
-        content = re.sub(r"(?i)(?<!\S)/(?:music|song|search)\b", " ", content)
-        content = re.sub(
-            r"(?i)\b(?:mode|type|platform|source|output|target|title|artist|id)=[^\s]+",
-            " ",
-            content,
-        )
-        content = re.sub(r"\s+", " ", content).strip(
-            "`\"'[](){}<>.,;:!?\uFF0C\u3002\uFF1F\uFF01\uFF1A"
-        )
-        return content
+        return text_utils.extract_music_keyword(text)
 
     def _looks_like_github_request(self, text: str) -> bool:
         content = normalize_text(text).lower()
@@ -3929,29 +3849,11 @@ class YukikoEngine:
 
     @staticmethod
     def _extract_github_repo_from_text(text: str) -> str:
-        content = normalize_text(text)
-        if not content:
-            return ""
-
-        match = re.search(
-            r"https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)",
-            content,
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            return ""
-
-        owner = match.group(1)
-        repo = re.sub(r"\.git$", "", match.group(2), flags=re.IGNORECASE)
-        return f"{owner}/{repo}"
+        return text_utils.extract_github_repo_from_text(text)
 
     @staticmethod
     def _normalize_reply_echo_text(text: str) -> str:
-        content = normalize_text(text).lower()
-        if not content:
-            return ""
-
-        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", content)
+        return text_utils.normalize_reply_echo_text(text)
 
     @classmethod
     def _looks_like_recent_bot_reply_echo(
@@ -4018,34 +3920,7 @@ class YukikoEngine:
 
     @staticmethod
     def _extract_local_path_candidates(text: str) -> list[str]:
-        content = normalize_text(text)
-        if not content:
-            return []
-
-        patterns = (
-            r"[A-Za-z]:\\[^\s\"'<>|?*]+",
-            r"(?:\./|\.\./|/)[^\s\"'<>|?*]+",
-            r"(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10}",
-            r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+",
-        )
-        out: list[str] = []
-        seen: set[str] = set()
-        for pattern in patterns:
-            for raw in re.findall(pattern, content):
-                candidate = normalize_text(str(raw)).strip().rstrip("，。！？!?,.;:)]}")
-                if not candidate:
-                    continue
-
-                lower = candidate.lower()
-                if lower.startswith("http://") or lower.startswith("https://"):
-                    continue
-
-                if candidate in seen:
-                    continue
-
-                seen.add(candidate)
-                out.append(candidate)
-        return out
+        return text_utils.extract_local_path_candidates(text)
 
     @classmethod
     def _pick_local_path_candidate(cls, text: str) -> str:
@@ -4088,166 +3963,28 @@ class YukikoEngine:
 
     @staticmethod
     def _extract_urls_from_text(text: str) -> list[str]:
-        content = normalize_text(text)
-        if not content:
-            return []
-
-        urls = re.findall(
-            r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+",
-            content,
-            flags=re.IGNORECASE,
-        )
-        out: list[str] = []
-        seen: set[str] = set()
-        for item in urls:
-            value = normalize_text(item).rstrip("，。！？!?,.;:)")
-            if not value or value in seen:
-                continue
-
-            seen.add(value)
-            out.append(value)
-        return out
+        return media_utils.extract_urls_from_text(text)
 
     @staticmethod
     def _extract_first_image_url_from_text(text: str) -> str:
-        urls = YukikoEngine._extract_urls_from_text(text)
-        for url in urls:
-            lower = url.lower()
-            if re.search(r"\.(?:jpg|jpeg|png|gif|webp|bmp)(?:\?|$)", lower):
-                return url
-
-            if "multimedia.nt.qq.com.cn" in lower:
-                return url
-
-        return ""
+        return media_utils.extract_first_image_url_from_text(text)
 
     @staticmethod
     def _extract_first_video_url_from_text(text: str) -> str:
-        content = normalize_text(text)
-        urls = YukikoEngine._extract_urls_from_text(content)
-        for url in urls:
-            lower = url.lower()
-            if re.search(r"\.(?:mp4|webm|mov|m4v)(?:\?|$)", lower):
-                return url
-
-            if any(
-                host in lower
-                for host in (
-                    "bilibili.com/video/",
-                    "b23.tv/",
-                    "douyin.com/",
-                    "kuaishou.com/",
-                    "acfun.cn/v/ac",
-                    "acfun.com/v/ac",
-                    "m.acfun.cn/v/",
-                    "v.qq.com/",
-                    "m.v.qq.com/",
-                    "iqiyi.com/",
-                    "iq.com/",
-                    "qiyi.com/",
-                    "youtube.com/",
-                    "youtu.be/",
-                    "tiktok.com/",
-                    "ixigua.com/",
-                )
-            ):
-                return url
-
-        bv_match = re.search(r"\b(BV[0-9A-Za-z]{10})\b", content, flags=re.IGNORECASE)
-        if bv_match:
-            return f"https://www.bilibili.com/video/{bv_match.group(1)}"
-
-        return ""
+        return media_utils.extract_first_video_url_from_text(text)
 
     @staticmethod
     def _is_passive_multimodal_text(text: str) -> bool:
-        content = normalize_text(text)
-        if not content:
-            return False
-
-        if re.fullmatch(
-            r"(?:\[(?:image|video|record|audio|forward|face|at|reply)(?::[^\]]*)?\]\s*)+",
-            content,
-            flags=re.IGNORECASE,
-        ):
-            return True
-
-        return (
-            content.startswith("MULTIMODAL_EVENT")
-            or content.startswith("用户发送多模态消息：")
-            or content.startswith("用户@了你并发送多模态消息：")
-            or content.lower().startswith("user sent multimodal message:")
-            or content.lower().startswith(
-                "user mentioned bot and sent multimodal message:"
-            )
-        )
+        return media_utils.is_passive_multimodal_text(text)
 
     @staticmethod
     def _user_typed_text_for_trigger(raw_text: str) -> str:
-        """从**未压平**的 message.text 里精确切出用户自己打的那段字。
-
-        为什么按行切而不是用 `_extract_multimodal_user_text`：
-        app.py:1487 的结构是确定的 —— `f"{media_event}\\n{clean_text}"`，
-        `media_event` 由 app_helpers._build_multimodal_text 产出、恒为单行，
-        语音转写另起一行 `[语音内容] xxx`。所以换行就是精确边界。
-
-        那个共享 helper 走的是正则启发式，`image:\\s*\\S+` 里的 `\\s*` 会把冒号后的
-        **下一个词**一起吃掉：`image:[image] yukiko 看看` 先被方括号正则压成
-        `image: yukiko 看看`，再被这条吃成 `看看` —— 别名没了，
-        「喊 yukiko 也不回」。实测过，所以这里不复用它。
-
-        本函数只服务 trigger 的「用户到底有没有打字」判断，不动那五个调用点。
-        `[语音内容]` 行**算**用户内容：语音转写就是用户说的话。
-        """
-
-        raw = str(raw_text or "")
-        if not raw:
-            return ""
-        kept: list[str] = []
-        for idx, line in enumerate(raw.split("\n")):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if idx == 0 and re.match(
-                r"^MULTIMODAL_EVENT(?:_AT)?\b", stripped, flags=re.IGNORECASE
-            ):
-                continue
-            kept.append(stripped)
-        return normalize_text(" ".join(kept))
+        """从**未压平**的 message.text 里精确切出用户自己打的那段字。"""
+        return text_utils.user_typed_text_for_trigger(raw_text)
 
     @staticmethod
     def _extract_multimodal_user_text(text: str) -> str:
-        content = normalize_text(text)
-        if not content:
-            return ""
-
-        content = re.sub(
-            r"\bMULTIMODAL_EVENT(?:_AT)?\b", " ", content, flags=re.IGNORECASE
-        )
-        content = content.replace("用户发送多模态消息：", " ").replace(
-            "用户@了你并发送多模态消息：", " "
-        )
-        content = content.replace("user sent multimodal message:", " ").replace(
-            "user mentioned bot and sent multimodal message:",
-            " ",
-        )
-        content = re.sub(
-            r"\[(?:image|video|record|audio|forward|face|at|reply)(?::[^\]]*)?\]",
-            " ",
-            content,
-            flags=re.IGNORECASE,
-        )
-        content = re.sub(
-            r"\b(?:image|video|record|audio|forward)\s*:\s*\S+",
-            " ",
-            content,
-            flags=re.IGNORECASE,
-        )
-        content = normalize_text(content)
-        parts = content.split()
-        while parts and not re.search(r"[A-Za-z0-9一-龥]", parts[0]):
-            parts.pop(0)
-        return normalize_text(" ".join(parts))
+        return media_utils.extract_multimodal_user_text(text)
 
     async def _run_plugin(
         self, name: str, message: str, context: dict[str, Any]
@@ -4356,53 +4093,7 @@ class YukikoEngine:
     def _build_media_summary(
         raw_segments: list[dict[str, Any]], limit: int = 8
     ) -> list[str]:
-        items: list[str] = []
-        for seg in raw_segments or []:
-            if not isinstance(seg, dict):
-                continue
-
-            seg_type = normalize_text(str(seg.get("type", ""))).lower()
-            if not seg_type:
-                continue
-
-            data = seg.get("data", {}) or {}
-            if seg_type in {"text", "at", "reply"}:
-                continue
-
-            if seg_type == "image":
-                url = normalize_text(str(data.get("url", "")))
-                data_uri = normalize_text(str(data.get("memory_data_uri", "")))
-                summary = normalize_text(str(data.get("summary", ""))).lower()
-                file_name = normalize_text(str(data.get("file", ""))).lower()
-                sub_type = normalize_text(str(data.get("sub_type", ""))).lower()
-                image_prefix = (
-                    "image:animated"
-                    if (
-                        sub_type == "1"
-                        or file_name.endswith(".gif")
-                        or "gif" in summary
-                        or "动画表情" in summary
-                    )
-                    else "image"
-                )
-                if data_uri.startswith("data:image"):
-                    items.append(f"{image_prefix}:base64:{clip_text(data_uri, 80)}")
-                else:
-                    items.append(f"{image_prefix}:{clip_text(url or 'no_url', 80)}")
-            elif seg_type == "video":
-                url = normalize_text(str(data.get("url", "")))
-                items.append(f"video:{clip_text(url or 'no_url', 80)}")
-            elif seg_type in {"record", "audio"}:
-                url = normalize_text(str(data.get("url", "")))
-                items.append(f"audio:{clip_text(url or 'no_url', 80)}")
-            elif seg_type == "forward":
-                items.append("forward:message")
-            else:
-                items.append(seg_type)
-            if len(items) >= max(1, limit):
-                break
-
-        return items
+        return media_utils.build_media_summary(raw_segments, limit)
 
     async def _resolve_at_user_names(
         self,
@@ -5276,12 +4967,7 @@ class YukikoEngine:
 
     @staticmethod
     def _clamp_unit_float(value: Any, default: float = 0.5) -> float:
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-
-            numeric = float(default)
-        return max(0.0, min(1.0, numeric))
+        return text_utils.clamp_unit_float(value, default)
 
     def _get_affinity_snapshot(self, user_id: str) -> tuple[int, int]:
         uid = normalize_text(user_id)
@@ -5475,30 +5161,11 @@ class YukikoEngine:
 
     @staticmethod
     def _strip_known_kaomoji_tokens(text: str) -> str:
-        content = str(text or "")
-        if not content:
-            return ""
-
-        known = ("QWQ", "AWA", "OwO", "UwU", "QAQ", ">_<", "TAT", "XD")
-        for token in known:
-            if re.fullmatch(r"[A-Za-z0-9_]+", token):
-                pattern = rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])"
-            else:
-                pattern = re.escape(token)
-            content = re.sub(pattern, " ", content, flags=re.IGNORECASE)
-        return normalize_text(content)
+        return text_utils.strip_known_kaomoji_tokens(text)
 
     @staticmethod
     def _mask_numeric_id(value: str) -> str:
-        raw = normalize_text(value)
-        if not raw:
-            return ""
-
-        if len(raw) <= 4:
-            return "*" * len(raw)
-
-        keep_tail = 3 if len(raw) >= 7 else 2
-        return f"{'*' * (len(raw) - keep_tail)}{raw[-keep_tail:]}"
+        return text_utils.mask_numeric_id(value)
 
     def _apply_privacy_output_guard(self, text: str, action: str = "") -> str:
         content = normalize_text(text)
@@ -5527,48 +5194,7 @@ class YukikoEngine:
 
     @staticmethod
     def _enforce_identity_claim(text: str) -> str:
-        content = normalize_text(text)
-        if not content:
-            return ""
-
-        # 清理模型常见越权身份拒答话术，统一身份口径
-        strips = (
-            r"我注意到这个请求不在我的能力范围内[^。！？]*[。！？]?",
-            r"我是\s*SKIAPI[^。！？]*[。！？]?",
-            r"我专注于帮助开发者[^。！？]*[。！？]?",
-            r"不能扮演[^。！？]*[。！？]?",
-            r"这里的对话似乎是在模拟[^。！？]*[。！？]?",
-        )
-        for pat in strips:
-            content = re.sub(pat, "", content, flags=re.IGNORECASE)
-        content = normalize_text(content)
-        lower = content.lower()
-        vendor_hint = bool(
-            re.search(
-                r"\b(openai|chatgpt|anthropic|claude|gemini|kiro|deepseek|skiapi)\b", lower
-            )
-        )
-        assistant_claim = bool(
-            re.search(
-                r"(?i)\b(i am|i'm)\b.{0,32}\b(ai|assistant|model|bot|ide)\b", content
-            )
-            or re.search(
-                r"(我是|我叫).{0,32}(ai|助手|模型|机器人|ide)",
-                content,
-                flags=re.IGNORECASE,
-            )
-        )
-        if vendor_hint and assistant_claim:
-            return "我是 YuKiKo。"
-
-        if "基于 skiapi 的助手" in lower:
-            return content.replace(
-                "基于 SKIAPI 的助手", "YuKiKo"
-            ).strip("（）() ")
-        if not content:
-            return "我是 YuKiKo。"
-
-        return content
+        return text_utils.enforce_identity_claim(text)
 
     @staticmethod
     def _inject_user_name(reply_text: str, user_name: str, should_address: bool) -> str:
@@ -6263,78 +5889,11 @@ class YukikoEngine:
 
     @staticmethod
     def _extract_choice_index(text: str) -> int | None:
-        content = normalize_text(text)
-        if not content:
-            return None
-
-        compact = re.sub(r"\s+", "", content)
-        unit_pattern = r"(?:\u4e2a|\u500b|\u5f20|\u5f35|\u6761|\u689d|\u53f7|\u865f)"
-        direct_match = re.fullmatch(rf"([1-9]\d?){unit_pattern}?", compact)
-        if direct_match:
-            try:
-                return int(direct_match.group(1))
-
-            except Exception:
-
-                return None
-
-        ordinal_match = re.fullmatch(rf"\u7b2c([1-9]\d?){unit_pattern}", compact)
-        if ordinal_match:
-            try:
-                return int(ordinal_match.group(1))
-
-            except Exception:
-
-                return None
-
-        zh_ordinal = re.fullmatch(
-            rf"\u7b2c([\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341]{{1,3}}){unit_pattern}",
-            compact,
-        )
-        if zh_ordinal:
-            n = YukikoEngine._parse_zh_number(zh_ordinal.group(1))
-            if n is not None and n > 0:
-                return n
-
-        return None
+        return text_utils.extract_choice_index(text)
 
     @staticmethod
     def _parse_zh_number(token: str) -> int | None:
-        value = normalize_text(token)
-        if not value:
-            return None
-
-        mapping = {
-            "一": 1,
-            "二": 2,
-            "两": 2,
-            "三": 3,
-            "四": 4,
-            "五": 5,
-            "六": 6,
-            "七": 7,
-            "八": 8,
-            "九": 9,
-        }
-        if value == "十":
-            return 10
-
-        if "十" not in value:
-            return mapping.get(value)
-
-        # 十一 / 二十 / 二十三
-        parts = value.split("十")
-        if len(parts) != 2:
-            return None
-
-        left = parts[0].strip()
-        right = parts[1].strip()
-        tens = 1 if left == "" else mapping.get(left, 0)
-        ones = 0 if right == "" else mapping.get(right, 0)
-        if tens <= 0:
-            return None
-
-        return tens * 10 + ones
+        return text_utils.parse_zh_number(token)
 
     @staticmethod
     def _looks_like_choice_next(text: str) -> bool:
@@ -6428,13 +5987,7 @@ class YukikoEngine:
 
     @staticmethod
     def _contains_choice_numbered_list(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-
-        has_1 = bool(re.search(r"(?:^|\n)\s*1\s*[\.、\)]", content))
-        has_2 = bool(re.search(r"(?:^|\n)\s*2\s*[\.、\)]", content))
-        return has_1 and has_2
+        return text_utils.contains_choice_numbered_list(text)
 
     def _allow_number_choice_followup(
         self, message: EngineMessage, cached: dict[str, Any]
@@ -7633,19 +7186,8 @@ class YukikoEngine:
 
     @staticmethod
     def _is_fragment_continuation(text: str) -> bool:
-        content = normalize_text(text)
-        if not content:
-            return False
-
-        if len(content) > 42:
-            return False
-
-        return bool(re.fullmatch(r"[?？!！~～…,.，]{1,6}", content))
+        return text_utils.is_fragment_continuation(text)
 
     @staticmethod
     def _is_fragment_timeout_nudge(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-
-        return bool(re.fullmatch(r"[?？!！~～…,.，]{1,8}", content))
+        return text_utils.is_fragment_timeout_nudge(text)

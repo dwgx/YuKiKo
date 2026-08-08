@@ -20,7 +20,6 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlsplit
 
 from core.agent_checkpoint import AgentTurnCheckpoint
 from core.agent_tools import AgentToolRegistry, ToolCallResult
@@ -28,7 +27,7 @@ from core import prompt_loader as _pl
 from core.prompt_navigator import NAVIGATE_SECTION_TOOL, NavigatorState, PromptNavigator
 from core.prompt_policy import PromptPolicy
 from core.loop_guard import LoopGuard, ToolCallRecord, hash_call, hash_result
-from core import media_utils
+from core import media_utils, text_utils
 from core.tool_call_repair import repair_tool_call
 from services.model_client import ModelClient
 from utils.intent import (
@@ -1168,33 +1167,8 @@ class AgentLoop:
 
     @staticmethod
     def _cue_is_negated(content: str, cue: str) -> bool:
-        """确认词前面紧挨着否定词时，这不是确认，是拒绝。
-
-        2026-08-06 子 agent 审计发现：`confirm_cues` 用的是**无锚点子串匹配**，
-        而「我不确认」「别确认」「无法确认」「不要确认」都包含「确认」，于是
-        `_is_confirmation_text` 全部返回 True。取消判定又拦不住它们
-        （cancel_cues 里没有这些词形），所以二次确认这道闸门**在用户明确拒绝时
-        反而放行封禁**。实测四种说法全部走到执行。
-
-        这里只做**语法否定**判定，不是语义词表：中文否定词是一个封闭的小集合，
-        且必须紧邻确认词才算（"确认取消订单" 里的「取消」不该让确认失效）。
-        `use_confirm_token` 打开时走 token 路径，不依赖这层。
-        """
-
-        negators = ("不", "别", "勿", "非", "无法", "未", "没", "莫")
-        # 否定词与确认词之间常隔一个情态字（「不要确认」「不能确认」「不用确认」）。
-        # 这些字本身不表意，剥掉再判否定。注意不能把主语一起剥 ——
-        # 「我要确认」剥成「我」，不是否定词，仍算确认。
-        modals = "要想能会用准许可以得了着"
-        start = 0
-        while True:
-            idx = content.find(cue, start)
-            if idx < 0:
-                return True  # 每一处出现都被否定了
-            prefix = content[:idx].rstrip(modals)
-            if not any(prefix.endswith(neg) for neg in negators):
-                return False  # 存在一处未被否定的确认词 → 视为确认
-            start = idx + 1
+        """确认词前面紧挨着否定词时，这不是确认，是拒绝。"""
+        return text_utils.cue_is_negated(content, cue)
 
     def _is_cancellation_text(
         self, text: str, pending: dict[str, Any] | None = None
@@ -3552,22 +3526,7 @@ class AgentLoop:
 
     @staticmethod
     def _parse_json_object_from_text(text: str) -> dict[str, Any] | None:
-        raw = normalize_text(text)
-        if not raw:
-            return None
-        block = _RE_CODE_BLOCK.search(raw)
-        if block:
-            raw = block.group(1).strip()
-        else:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start >= 0 and end > start:
-                raw = raw[start : end + 1]
-        try:
-            data = json.loads(raw)
-        except Exception:
-            return None
-        return data if isinstance(data, dict) else None
+        return text_utils.parse_json_object_from_text(text)
 
     def _navigator_retry_model_kwargs(self) -> dict[str, str]:
         model = normalize_text(str(getattr(self, "navigator_retry_model", "") or ""))
@@ -3575,13 +3534,7 @@ class AgentLoop:
 
     @staticmethod
     def _strip_urls_and_hosts(text: str) -> str:
-        stripped = _RE_URL_STRIP.sub(" ", normalize_text(text))
-        stripped = _RE_BARE_WEB_HOST.sub(" ", stripped)
-        stripped = re.sub(r"\[CQ:[^\]]+\]", " ", stripped)
-        stripped = re.sub(r"@\S+", " ", stripped)
-        stripped = _RE_PUNCTUATION_CJK.sub(" ", stripped)
-        stripped = _RE_WHITESPACE.sub(" ", stripped).strip()
-        return stripped
+        return text_utils.strip_urls_and_hosts(text)
 
     @staticmethod
     def _has_only_navigator_tool_policy_blocks(steps: list[dict[str, Any]]) -> bool:
@@ -4768,81 +4721,29 @@ class AgentLoop:
     def _extract_first_url(text: str) -> str:
         return media_utils.extract_first_url(text)
 
-    @classmethod
-    def _extract_first_video_url(cls, text: str) -> str:
-        url = cls._extract_first_url(text)
-        if url and cls._looks_like_video_url(url):
-            return url
-        return ""
+    @staticmethod
+    def _extract_first_video_url(text: str) -> str:
+        return media_utils.extract_first_video_url(text)
 
-    @classmethod
-    def _extract_first_image_url(cls, text: str) -> str:
-        for match in _RE_URL_EXTRACT.finditer(text or ""):
-            url = media_utils.strip_trailing_url_noise(match.group(0))
-            if url and cls._looks_like_image_url(url):
-                return url
-        return ""
+    @staticmethod
+    def _extract_first_image_url(text: str) -> str:
+        return media_utils.extract_first_image_url(text)
 
-    @classmethod
-    def _extract_first_web_url(cls, text: str) -> str:
-        explicit = cls._extract_first_url(text)
-        if explicit:
-            return explicit
-        content = normalize_text(text)
-        if not content:
-            return ""
-        match = _RE_BARE_WEB_HOST.search(content)
-        if not match:
-            return ""
-        url = normalize_text(match.group(1)).rstrip(").,，。!?！？")
-        if not url:
-            return ""
-        return f"https://{url}"
+    @staticmethod
+    def _extract_first_web_url(text: str) -> str:
+        return media_utils.extract_first_web_url(text)
 
-    @classmethod
-    def _looks_like_webpage_fetch_request(cls, text: str) -> bool:
-        url = cls._extract_first_web_url(text)
-        if not url:
-            return False
-        if cls._looks_like_image_url(url) or cls._looks_like_video_url(url):
-            return False
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = (
-            "网站",
-            "网页",
-            "页面",
-            "官网",
-            "打开",
-            "看看",
-            "看下",
-            "帮我看",
-            "分析",
-            "介绍",
-            "是什么",
-            "安全吗",
-            "看",
-            "website",
-            "webpage",
-            "site",
-            "page",
-        )
-        return any(cue in content for cue in cues)
+    @staticmethod
+    def _looks_like_webpage_fetch_request(text: str) -> bool:
+        return media_utils.looks_like_webpage_fetch_request(text)
 
     @staticmethod
     def _looks_like_image_url(url: str) -> bool:
         return media_utils.looks_like_image_url(url)
 
-    @classmethod
-    def _text_has_image_hint(cls, text: str) -> bool:
-        norm = normalize_text(text).lower()
-        if not norm:
-            return False
-        if "image:" in norm:
-            return True
-        url = cls._extract_first_url(norm)
-        return bool(url and cls._looks_like_image_url(url))
+    @staticmethod
+    def _text_has_image_hint(text: str) -> bool:
+        return media_utils.text_has_image_hint(text)
 
     @staticmethod
     def _looks_like_video_url(url: str) -> bool:
@@ -4902,53 +4803,16 @@ class AgentLoop:
 
     @staticmethod
     def _looks_like_reference_to_previous_link(text: str) -> bool:
-        t = normalize_text(text).lower()
-        if not t:
-            return False
-        plain = _RE_WHITESPACE.sub("", t)
-        explicit_tokens = (
-            "/source",
-            "source=previous",
-            "source=last",
-            "from=previous",
-            "from=last",
-            "use_previous_url=1",
-            "use_last_url=1",
-        )
-        if any(token in plain for token in explicit_tokens):
-            return True
-        patterns = (
-            r"(?:^|\s)/source(?:\s|$)",
-            r"(?:^|\s)(?:source|from)\s*=\s*(?:previous|last)(?:\s|$)",
-        )
-        return any(re.search(pattern, t) for pattern in patterns)
+        return text_utils.looks_like_reference_to_previous_link(text)
 
     @staticmethod
     def _to_declared_flag(value: Any) -> bool:
-        """把模型声明的布尔参数读成 bool。
-
-        模型可能给真 bool，也可能给 "true"/"false" 字符串；后者用 bool() 判断会把
-        "false" 当真。这里只做类型解析，不读用户原文，因此不是意图猜测。
-        """
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return value != 0
-        return normalize_text(str(value or "")).lower() in {"true", "1", "yes", "y", "on"}
+        """把模型声明的布尔参数读成 bool。"""
+        return text_utils.to_declared_flag(value)
 
     @staticmethod
     def _to_safe_int(value: Any) -> int:
-        if isinstance(value, bool):
-            return 0
-        if isinstance(value, int):
-            return value
-        text = normalize_text(str(value))
-        if not text or not re.fullmatch(r"-?\d+", text):
-            return 0
-        try:
-            return int(text)
-        except ValueError:
-            return 0
+        return text_utils.to_safe_int(value)
 
     def _extract_candidate_qq_id(self, ctx: AgentContext) -> int:
         # 1) 优先当前消息中 @ 的目标（且不是 bot 自己）
@@ -4987,54 +4851,15 @@ class AgentLoop:
 
     @staticmethod
     def _infer_lookup_keyword(text: str) -> str:
-        t = normalize_text(text)
-        if not t:
-            return ""
-        t = re.sub(r"^(?i:/(?:lookup|wiki))\s*", "", t)
-        t = re.sub(r"^(?i:keyword)\s*=\s*", "", t)
-        t = _RE_PUNCTUATION_CJK.sub(" ", t)
-        t = _RE_WHITESPACE.sub(" ", t).strip()
-        return t[:80]
+        return text_utils.infer_lookup_keyword(text)
 
     @staticmethod
     def _infer_split_video_mode(text: str) -> str:
-        t = normalize_text(text).lower()
-        if not t:
-            return ""
-        plain = _RE_WHITESPACE.sub("", t)
-        if "mode=audio" in plain:
-            return "audio"
-        if "mode=cover" in plain:
-            return "cover"
-        if "mode=frames" in plain or "mode=frame" in plain:
-            return "frames"
-        if "mode=clip" in plain or re.search(
-            r"\b\d+(?:\.\d+)?\s*(?:s|sec|seconds?)\s*-\s*\d+(?:\.\d+)?\s*(?:s|sec|seconds?)\b",
-            t,
-        ):
-            return "clip"
-        return ""
+        return text_utils.infer_split_video_mode(text)
 
     @staticmethod
     def _parse_time_token_to_seconds(token: str) -> float | None:
-        raw = normalize_text(token).lower()
-        if not raw:
-            return None
-        clock = re.fullmatch(r"(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?", raw)
-        if clock:
-            h_or_m = int(clock.group(1))
-            m_or_s = int(clock.group(2))
-            sec_part = clock.group(3)
-            if sec_part is None:
-                return float(max(0, h_or_m * 60 + m_or_s))
-            return float(max(0, h_or_m * 3600 + m_or_s * 60 + int(sec_part)))
-        second = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:秒|s)?", raw)
-        if second:
-            try:
-                return max(0.0, float(second.group(1)))
-            except ValueError:
-                return None
-        return None
+        return text_utils.parse_time_token_to_seconds(token)
 
     @classmethod
     def _infer_video_time_hints(cls, text: str) -> dict[str, float]:
@@ -5065,25 +4890,7 @@ class AgentLoop:
 
     @staticmethod
     def _infer_frame_count_hint(text: str) -> int:
-        t = normalize_text(text)
-        if not t:
-            return 0
-        m = re.search(
-            r"(?:max_frames|frame_count)\s*=\s*(\d{1,2})", t, flags=re.IGNORECASE
-        )
-        if not m:
-            m = re.search(
-                r"(\d{1,2})\s*(?:screenshots?|frames?)", t, flags=re.IGNORECASE
-            )
-        if not m:
-            m = re.search(r"(\d{1,2})\s*(?:张|幀|帧)", t, flags=re.IGNORECASE)
-        if not m:
-            return 0
-        try:
-            value = int(m.group(1))
-        except ValueError:
-            return 0
-        return max(1, min(12, value))
+        return text_utils.infer_frame_count_hint(text)
 
     def _rebuild_query_with_context(self, text: str, ctx: AgentContext) -> str:
         raw = normalize_text(text)
@@ -5113,36 +4920,11 @@ class AgentLoop:
 
     @staticmethod
     def _is_context_continuation_phrase(text: str) -> bool:
-        t = normalize_text(text).lower()
-        if not t:
-            return False
-        plain = _RE_WHITESPACE.sub("", t)
-        explicit_tokens = ("/next", "next=1", "continue=1", "context=continue")
-        if any(token in plain for token in explicit_tokens):
-            return True
-        if len(t) <= 16 and re.fullmatch(r"[?？!！,，.。~\-\s]*", t):
-            return True
-        if len(t) <= 12 and any(
-            cue in t
-            for cue in (
-                "继续找",
-                "你找",
-                "找啊",
-                "查啊",
-                "搜啊",
-                "去找",
-                "那你找",
-            )
-        ):
-            return True
-        return False
+        return text_utils.is_context_continuation_phrase(text)
 
     @staticmethod
     def _strip_continuation_prefix(text: str) -> str:
-        t = normalize_text(text)
-        t = re.sub(r"^(?i:/(?:next|continue))\s*[?？:：,，]?\s*", "", t)
-        t = normalize_text(t)
-        return t
+        return text_utils.strip_continuation_prefix(text)
 
     def _extract_recent_topic(self, ctx: AgentContext, current_text: str) -> str:
         current = normalize_text(current_text)
@@ -5297,16 +5079,8 @@ class AgentLoop:
 
     @staticmethod
     def _looks_like_image_question(text: str) -> bool:
-        """Weak check: does the text ask about an image?
-
-        Chinese keyword matching removed. Only explicit control tokens accepted.
-        Image pipeline is driven by raw_segments / URL structural signals.
-        """
-        t = (text or "").lower()
-        # Only accept explicit control tokens
-        if any(tok in t for tok in ("/analyze", "mode=analyze", "ocr=true")):
-            return True
-        return False
+        """Weak check: does the text ask about an image?"""
+        return text_utils.looks_like_image_question(text)
 
     def _append_tool_result(
         self,
@@ -5506,63 +5280,13 @@ class AgentLoop:
 
     @staticmethod
     def _normalize_tool_call(data: Any) -> dict[str, Any] | None:
-        """将不同格式的 tool call 统一为 {"tool": ..., "args": ...}。
-
-        支持的格式:
-        - 标准: {"tool": "...", "args": {...}}
-        - OpenAI: {"name": "...", "arguments": {...}}
-        - 弱模型: {"function": "...", "parameters": {...}}
-        - 弱模型: {"action": "...", "input": {...}}
-        """
-        if not isinstance(data, dict):
-            return None
-        if "tool" in data:
-            return data
-        # OpenAI function calling 格式: {"name": "tool", "arguments": {...}}
-        if "name" in data:
-            return {
-                "tool": data["name"],
-                "args": data.get("arguments", data.get("args", data.get("parameters", {}))),
-            }
-        # 弱模型常见: {"function": "tool", "parameters": {...}}
-        if "function" in data and isinstance(data["function"], str):
-            return {
-                "tool": data["function"],
-                "args": data.get("parameters", data.get("arguments", data.get("args", {}))),
-            }
-        # 弱模型常见: {"action": "tool", "input": {...}}
-        if "action" in data and isinstance(data["action"], str):
-            return {
-                "tool": data["action"],
-                "args": data.get("input", data.get("parameters", data.get("args", {}))),
-            }
-        return None
+        """将不同格式的 tool call 统一为 {"tool": ..., "args": ...}。"""
+        return text_utils.normalize_tool_call(data)
 
     @staticmethod
     def _find_json_end(text: str) -> int | None:
         """找到第一个完整 JSON 对象的结束位置 (括号匹配)。"""
-        depth = 0
-        in_string = False
-        escape = False
-        for i, ch in enumerate(text):
-            if escape:
-                escape = False
-                continue
-            if ch == "\\" and in_string:
-                escape = True
-                continue
-            if ch == '"' and not escape:
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return i
-        return None
+        return text_utils.find_json_end(text)
 
     @classmethod
     def _trim_recovered_final_answer_text(cls, content: str) -> str:
@@ -6243,22 +5967,7 @@ class AgentLoop:
 
     @staticmethod
     def _normalize_media_url(url: str) -> str:
-        value = normalize_text(url).strip()
-        if not value:
-            return ""
-        try:
-            parsed = urlsplit(value)
-            if parsed.scheme.lower() not in {"http", "https"}:
-                return ""
-            host = parsed.netloc.lower()
-            path = parsed.path or ""
-            query = parsed.query or ""
-            # 去掉 fragment；query 保留，避免同路径不同资源被误合并。
-            return f"{parsed.scheme.lower()}://{host}{path}" + (
-                f"?{query}" if query else ""
-            )
-        except Exception:
-            return ""
+        return media_utils.normalize_media_url(url)
 
     @classmethod
     def _url_matches_known_media(cls, candidate: str, known_urls: set[str]) -> bool:
@@ -6363,18 +6072,7 @@ class AgentLoop:
 
     @staticmethod
     def _extract_media_refs_from_segments(segments: list[dict[str, Any]]) -> list[str]:
-        refs: list[str] = []
-        for seg in segments or []:
-            if not isinstance(seg, dict):
-                continue
-            data = seg.get("data", {}) or {}
-            if not isinstance(data, dict):
-                continue
-            for key in ("memory_data_uri", "url", "file", "path"):
-                value = normalize_text(str(data.get(key, "")))
-                if value:
-                    refs.append(value)
-        return refs
+        return media_utils.extract_media_refs_from_segments(segments)
 
     def _collect_known_local_media_paths(
         self, steps: list[dict[str, Any]], ctx: AgentContext
@@ -6396,18 +6094,7 @@ class AgentLoop:
 
     @staticmethod
     def _sanitize_profile_summary(summary: str) -> str:
-        content = normalize_text(summary)
-        if not content:
-            return ""
-        # 避免把可识别画像统计直接喂给模型，降低隐私泄露概率。
-        content = re.sub(
-            r"(?:QQ号|qq号|消息数|发言数|发了\d+条消息|凌晨\d+点(?:左右)?活跃|活跃时段|作息规律)[^。；;\n]*[。；;]?",
-            "",
-            content,
-            flags=re.IGNORECASE,
-        )
-        content = _RE_WHITESPACE_2PLUS.sub(" ", content).strip()
-        return content
+        return text_utils.sanitize_profile_summary(summary)
 
     @staticmethod
     def _elapsed(t0: float) -> int:
@@ -6415,30 +6102,7 @@ class AgentLoop:
 
     @staticmethod
     def _looks_like_english_refusal_text(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        refusal_markers = (
-            "i can't",
-            "i cannot",
-            "i can’t",
-            "i'm not able",
-            "i’m not able",
-            "unable to",
-            "cannot help with that request",
-            "can't help with that request",
-            "text-based ai assistant",
-            "as an ai",
-            "adult content",
-            "sexually explicit",
-            "18+",
-            "nsfw",
-        )
-        if not any(marker in content for marker in refusal_markers):
-            return False
-        cjk_count = sum(1 for ch in content if "\u4e00" <= ch <= "\u9fff")
-        alpha_count = sum(1 for ch in content if ch.isalpha())
-        return alpha_count > 0 and cjk_count <= 2
+        return text_utils.looks_like_english_refusal_text(text)
 
     @classmethod
     def _normalize_final_answer_text(cls, text: str) -> str:

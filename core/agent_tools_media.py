@@ -38,6 +38,11 @@ from core.image_gen import (
 def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config: dict[str, Any]) -> None:
     """注册媒体分析相关工具。"""
 
+    # 描述单一真相源（架构收敛 D8）：常量定义在 core/tools_*.py，本文件与底层
+    # 公开函数 docstring 同源，避免同一能力在 agent 层与 router 层各写一份。
+    from core.tools_video import ANALYZE_VIDEO_DESCRIPTION, PARSE_VIDEO_DESCRIPTION
+    from core.tools_vision import ANALYZE_IMAGE_DESCRIPTION
+
     registry.register(
         ToolSchema(
             name="generate_image",
@@ -60,13 +65,7 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
     registry.register(
         ToolSchema(
             name="parse_video",
-            description=(
-                "解析短视频链接，返回可发送的视频URL。\n"
-                "支持平台: 抖音(douyin/v.douyin.com)、快手(kuaishou)、B站(bilibili/b23.tv)、AcFun、腾讯视频、爱奇艺、YouTube、优酷、直链视频(.mp4等)。\n"
-                "使用场景: 用户发了视频链接让你解析/下载/发送时使用。\n"
-                "返回 video_url 可直接通过 final_answer 的 video_url 参数发送。\n"
-                "同时返回 qq_safety 安全度评估(safe/risky/blocked)。"
-            ),
+            description=PARSE_VIDEO_DESCRIPTION,
             parameters={
                 "type": "object",
                 "properties": {
@@ -108,13 +107,7 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
     registry.register(
         ToolSchema(
             name="analyze_video",
-            description=(
-                "深度分析视频内容: 提取标题、作者、时长、标签、弹幕热词、热评、字幕等。\n"
-                "B站视频可获取弹幕热词和热评，抖音可获取详情数据。\n"
-                "有本地视频+ffmpeg时还能提取关键帧用AI识别画面内容。\n"
-                "使用场景: 用户要求分析、评价、解说、总结视频内容时使用。\n"
-                "同时返回 qq_safety 安全度评估。"
-            ),
+            description=ANALYZE_VIDEO_DESCRIPTION,
             parameters={
                 "type": "object",
                 "properties": {
@@ -131,12 +124,7 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
     registry.register(
         ToolSchema(
             name="analyze_image",
-            description=(
-                "识别/分析图片内容（AI视觉识别）。\n"
-                "可指定 url 参数传入图片链接，未指定时自动从当前消息中提取图片。\n"
-                "使用场景: 用户发图片问'这是什么'、'看看这张图'、'识别一下'、'图里写了什么'时使用。\n"
-                "也可用于识别表情包内容、截图文字、商品图片等。"
-            ),
+            description=ANALYZE_IMAGE_DESCRIPTION,
             parameters={
                 "type": "object",
                 "properties": {

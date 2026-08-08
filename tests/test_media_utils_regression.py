@@ -119,6 +119,176 @@ class UrlKindDetectionTests(unittest.TestCase):
         self.assertFalse(media_utils.looks_like_video_url(""))
 
 
+class D9MediaUrlExtractionTests(unittest.TestCase):
+    """D9 新增的媒体 URL 提取/识别函数。"""
+
+    def test_extract_first_image_url(self) -> None:
+        self.assertEqual(
+            media_utils.extract_first_image_url("看 https://a.com/x.png 这张"),
+            "https://a.com/x.png",
+        )
+        self.assertEqual(media_utils.extract_first_image_url("https://a.com/x.mp4"), "")
+        self.assertEqual(media_utils.extract_first_image_url(""), "")
+
+    def test_extract_first_video_url(self) -> None:
+        self.assertEqual(
+            media_utils.extract_first_video_url("看 https://bilibili.com/video/BV1xx"),
+            "https://bilibili.com/video/BV1xx",
+        )
+        self.assertEqual(media_utils.extract_first_video_url("https://a.com/x.jpg"), "")
+
+    def test_extract_first_web_url(self) -> None:
+        self.assertEqual(
+            media_utils.extract_first_web_url("看 https://a.com/x"),
+            "https://a.com/x",
+        )
+        self.assertEqual(
+            media_utils.extract_first_web_url("打开 github.com 看看"),
+            "https://github.com",
+        )
+        self.assertEqual(media_utils.extract_first_web_url("没有链接"), "")
+
+    def test_looks_like_webpage_fetch_request(self) -> None:
+        self.assertTrue(media_utils.looks_like_webpage_fetch_request("帮我打开 github.com 看看"))
+        self.assertFalse(media_utils.looks_like_webpage_fetch_request("看 https://a.com/x.png"))
+        self.assertFalse(media_utils.looks_like_webpage_fetch_request("你好"))
+
+    def test_text_has_image_hint(self) -> None:
+        self.assertTrue(media_utils.text_has_image_hint("image:[image] 这是图"))
+        self.assertTrue(media_utils.text_has_image_hint("https://a.com/x.png"))
+        self.assertFalse(media_utils.text_has_image_hint("你好"))
+
+    def test_normalize_media_url(self) -> None:
+        self.assertEqual(
+            media_utils.normalize_media_url("https://A.com/path?q=1#frag"),
+            "https://a.com/path?q=1",
+        )
+        self.assertEqual(media_utils.normalize_media_url("ftp://x.com/a"), "")
+        self.assertEqual(media_utils.normalize_media_url(""), "")
+
+    def test_extract_media_refs_from_segments(self) -> None:
+        segs = [
+            {"type": "image", "data": {"url": "https://a.com/x.png"}},
+            {"type": "text", "data": {"text": "hi"}},
+            {"type": "file", "data": {"path": "/tmp/a.jpg"}},
+        ]
+        refs = media_utils.extract_media_refs_from_segments(segs)
+        self.assertIn("https://a.com/x.png", refs)
+        self.assertIn("/tmp/a.jpg", refs)
+        self.assertEqual(media_utils.extract_media_refs_from_segments([]), [])
+
+    def test_extract_urls_from_text(self) -> None:
+        self.assertEqual(
+            media_utils.extract_urls_from_text("看 https://a.com/x 和 https://b.com/y"),
+            ["https://a.com/x", "https://b.com/y"],
+        )
+        self.assertEqual(media_utils.extract_urls_from_text("没链接"), [])
+
+    def test_extract_first_image_url_from_text(self) -> None:
+        self.assertEqual(
+            media_utils.extract_first_image_url_from_text("看 https://a.com/x.png 和 https://b.com/y.jpg"),
+            "https://a.com/x.png",
+        )
+        self.assertEqual(media_utils.extract_first_image_url_from_text("https://a.com/x.mp4"), "")
+
+    def test_extract_first_video_url_from_text(self) -> None:
+        self.assertEqual(
+            media_utils.extract_first_video_url_from_text("看 https://a.com/x.mp4"),
+            "https://a.com/x.mp4",
+        )
+        self.assertEqual(
+            media_utils.extract_first_video_url_from_text("只有 BV1234567890"),
+            "https://www.bilibili.com/video/BV1234567890",
+        )
+        self.assertEqual(media_utils.extract_first_video_url_from_text("没视频"), "")
+
+    def test_is_passive_multimodal_text(self) -> None:
+        self.assertTrue(media_utils.is_passive_multimodal_text("[image]"))
+        self.assertTrue(media_utils.is_passive_multimodal_text("MULTIMODAL_EVENT ..."))
+        self.assertFalse(media_utils.is_passive_multimodal_text("普通消息"))
+
+    def test_extract_multimodal_user_text(self) -> None:
+        self.assertEqual(
+            media_utils.extract_multimodal_user_text("MULTIMODAL_EVENT\n[image] 看看这个"),
+            "看看这个",
+        )
+        self.assertEqual(media_utils.extract_multimodal_user_text(""), "")
+
+    def test_build_media_summary(self) -> None:
+        segs = [
+            {"type": "image", "data": {"url": "https://a.com/x.png"}},
+            {"type": "video", "data": {"url": "https://a.com/v.mp4"}},
+        ]
+        summary = media_utils.build_media_summary(segs)
+        self.assertIn("image:https://a.com/x.png", summary)
+        self.assertIn("video:https://a.com/v.mp4", summary)
+
+
+class D9AgentForwarderConsistencyTests(unittest.TestCase):
+    """D9 新增 agent.py 薄转发与 media_utils 行为一致。"""
+
+    def setUp(self) -> None:
+        self.loop = AgentLoop.__new__(AgentLoop)
+
+    def test_agent_media_forwarders_match(self) -> None:
+        self.assertEqual(
+            self.loop._extract_first_image_url("看 https://a.com/x.png"),
+            "https://a.com/x.png",
+        )
+        self.assertEqual(
+            self.loop._extract_first_video_url("看 https://bilibili.com/video/BV1xx"),
+            "https://bilibili.com/video/BV1xx",
+        )
+        self.assertEqual(
+            self.loop._extract_first_web_url("打开 github.com 看看"),
+            "https://github.com",
+        )
+        self.assertTrue(self.loop._looks_like_webpage_fetch_request("帮我打开 github.com 看看"))
+        self.assertTrue(self.loop._text_has_image_hint("https://a.com/x.png"))
+        self.assertEqual(
+            self.loop._normalize_media_url("https://A.com/path?q=1#frag"),
+            "https://a.com/path?q=1",
+        )
+        refs = self.loop._extract_media_refs_from_segments(
+            [{"type": "image", "data": {"url": "https://a.com/x.png"}}]
+        )
+        self.assertEqual(refs, ["https://a.com/x.png"])
+
+
+class D9EngineForwarderConsistencyTests(unittest.TestCase):
+    """D9 新增 engine.py 薄转发与 media_utils 行为一致。"""
+
+    def setUp(self) -> None:
+        from core.engine import YukikoEngine
+
+        self.engine = YukikoEngine.__new__(YukikoEngine)
+
+    def test_engine_media_forwarders_match(self) -> None:
+        self.assertEqual(
+            self.engine._extract_urls_from_text("看 https://a.com/x"),
+            ["https://a.com/x"],
+        )
+        self.assertEqual(
+            self.engine._extract_first_image_url_from_text("看 https://a.com/x.png"),
+            "https://a.com/x.png",
+        )
+        self.assertEqual(
+            self.engine._extract_first_video_url_from_text("看 https://a.com/x.mp4"),
+            "https://a.com/x.mp4",
+        )
+        self.assertTrue(self.engine._is_passive_multimodal_text("[image]"))
+        self.assertEqual(
+            self.engine._extract_multimodal_user_text("MULTIMODAL_EVENT 看看"),
+            "看看",
+        )
+        self.assertEqual(
+            self.engine._build_media_summary(
+                [{"type": "image", "data": {"url": "https://a.com/x.png"}}]
+            ),
+            ["image:https://a.com/x.png"],
+        )
+
+
 class ForwarderConsistencyTests(unittest.TestCase):
     """搬移后，agent.py 上的薄转发 staticmethod 仍指向 media_utils，行为一致。"""
 

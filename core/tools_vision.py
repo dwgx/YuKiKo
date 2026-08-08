@@ -2582,6 +2582,16 @@ class ToolVisionMixin:
 # 实现仍留在 mixin 内，后续阶段可再把实现迁移进公开函数。
 
 
+# analyze_image 能力描述的单一真相源（架构收敛 D8）：agent_tools_media.py 的
+# ToolSchema.description 与 media_analyze_image 的 docstring 同源。
+ANALYZE_IMAGE_DESCRIPTION = (
+    "识别/分析图片内容（AI视觉识别）。\n"
+    "可指定 url 参数传入图片链接，未指定时自动从当前消息中提取图片。\n"
+    "使用场景: 用户发图片问'这是什么'、'看看这张图'、'识别一下'、'图里写了什么'时使用。\n"
+    "也可用于识别表情包内容、截图文字、商品图片等。"
+)
+
+
 async def media_analyze_image(
     executor: Any,
     *,
@@ -2593,7 +2603,10 @@ async def media_analyze_image(
     conversation_id: str = "",
     api_call: Callable[..., Awaitable[Any]] | None = None,
 ) -> ToolResult:
-    """识别/分析图片内容（analyze_image 底层能力）。"""
+    """识别/分析图片内容（analyze_image 底层能力）。
+
+    描述单一真相源见 ANALYZE_IMAGE_DESCRIPTION（ToolSchema.description 同源）。
+    """
     return await executor._method_media_analyze_image(
         method_name,
         method_args,

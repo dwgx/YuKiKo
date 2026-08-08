@@ -39,14 +39,16 @@ def _register_ai_method_tools(
     tool_iface_cfg = ((config or {}).get("search") or {}).get("tool_interface") or {}
     github_enable = bool(tool_iface_cfg.get("github_enable", False))
 
+    # 描述单一真相源（架构收敛 D8）：常量定义在 core/tools_*.py，本文件与底层
+    # 公开函数 docstring 同源，避免同一能力在 agent 层与 router 层各写一份。
+    from core.tools_github import GITHUB_README_DESCRIPTION, GITHUB_SEARCH_DESCRIPTION
+    from core.tools_search import FETCH_WEBPAGE_DESCRIPTION
+    from core.tools_video import DOUYIN_SEARCH_DESCRIPTION
+
     registry.register(
         ToolSchema(
             name="fetch_webpage",
-            description=(
-                "访问指定URL网页，返回页面标题、状态码和内容摘要。\n"
-                "使用场景: 用户给了一个链接让你看看内容、总结网页、查看文章时使用。\n"
-                "注意: 不能访问内网地址，有超时限制"
-            ),
+            description=FETCH_WEBPAGE_DESCRIPTION,
             parameters={
                 "type": "object",
                 "properties": {
@@ -63,10 +65,7 @@ def _register_ai_method_tools(
         registry.register(
             ToolSchema(
                 name="github_search",
-                description=(
-                    "在GitHub搜索开源仓库，返回仓库名、星标数、简介和链接。\n"
-                    "使用场景: 用户问'有什么好用的XX库'、'搜一下GitHub上的XX'时使用"
-                ),
+                description=GITHUB_SEARCH_DESCRIPTION,
                 parameters={
                     "type": "object",
                     "properties": {
@@ -82,11 +81,7 @@ def _register_ai_method_tools(
         registry.register(
             ToolSchema(
                 name="github_readme",
-                description=(
-                    "读取指定GitHub仓库的README摘要。\n"
-                    "使用场景: 用户说'看看这个仓库'、'这个项目是干什么的'时使用。\n"
-                    "支持 owner/repo 格式或完整GitHub URL"
-                ),
+                description=GITHUB_README_DESCRIPTION,
                 parameters={
                     "type": "object",
                     "properties": {
@@ -102,10 +97,7 @@ def _register_ai_method_tools(
     registry.register(
         ToolSchema(
             name="douyin_search",
-            description=(
-                "在抖音搜索视频，返回视频标题、作者和链接。\n"
-                "使用场景: 用户说'搜一下抖音上的XX'、'找个抖音视频'时使用"
-            ),
+            description=DOUYIN_SEARCH_DESCRIPTION,
             parameters={
                 "type": "object",
                 "properties": {

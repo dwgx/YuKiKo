@@ -581,6 +581,19 @@ class ToolGithubMixin:
 # 模块级公开函数。executor 需实现对应 mixin（ToolExecutor 即满足）；私有
 # 实现仍留在 mixin 内，后续阶段可再把实现迁移进公开函数。
 
+# 两个 GitHub 能力描述的单一真相源（架构收敛 D8）：agent_tools_web.py 的
+# ToolSchema.description 与公开函数 docstring 同源，避免同一能力写两份。
+GITHUB_SEARCH_DESCRIPTION = (
+    "在GitHub搜索开源仓库，返回仓库名、星标数、简介和链接。\n"
+    "使用场景: 用户问'有什么好用的XX库'、'搜一下GitHub上的XX'时使用"
+)
+
+GITHUB_README_DESCRIPTION = (
+    "读取指定GitHub仓库的README摘要。\n"
+    "使用场景: 用户说'看看这个仓库'、'这个项目是干什么的'时使用。\n"
+    "支持 owner/repo 格式或完整GitHub URL"
+)
+
 
 async def browser_github_search(
     executor: Any,
@@ -588,7 +601,10 @@ async def browser_github_search(
     query: str,
     language: str = "",
 ) -> ToolResult:
-    """在 GitHub 搜索仓库（github_search 底层能力）。"""
+    """在 GitHub 搜索仓库（github_search 底层能力）。
+
+    描述单一真相源见 GITHUB_SEARCH_DESCRIPTION（ToolSchema.description 同源）。
+    """
     method_args: dict[str, Any] = {"query": query}
     if language:
         method_args["language"] = language
@@ -602,7 +618,10 @@ async def browser_github_readme(
     *,
     repo: str,
 ) -> ToolResult:
-    """读取 GitHub 仓库 README 摘要（github_readme 底层能力）。"""
+    """读取 GitHub 仓库 README 摘要（github_readme 底层能力）。
+
+    描述单一真相源见 GITHUB_README_DESCRIPTION（ToolSchema.description 同源）。
+    """
     method_args: dict[str, Any] = {}
     if "/" in repo and not repo.startswith("http"):
         method_args["repo"] = repo

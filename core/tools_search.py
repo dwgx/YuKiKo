@@ -488,6 +488,15 @@ class ToolSearchMixin:
 # 模块级公开函数。executor 需实现对应 mixin（ToolExecutor 即满足）；私有
 # 实现仍留在 mixin 内，后续阶段可再把实现迁移进公开函数。
 
+# fetch_webpage 能力描述的单一真相源（架构收敛 D8）：agent_tools_web.py 的
+# ToolSchema.description 与浏览器抓取工具的 docstring 都从这里取，避免同一
+# 能力在 agent 层与 router 层各写一份导致漂移。
+FETCH_WEBPAGE_DESCRIPTION = (
+    "访问指定URL网页，返回页面标题、状态码和内容摘要。\n"
+    "使用场景: 用户给了一个链接让你看看内容、总结网页、查看文章时使用。\n"
+    "注意: 不能访问内网地址，有超时限制"
+)
+
 
 async def browser_fetch_url(
     executor: Any,
@@ -495,7 +504,10 @@ async def browser_fetch_url(
     url: str,
     query: str = "",
 ) -> ToolResult:
-    """抓取网页并返回摘要（fetch_webpage 底层能力）。"""
+    """抓取网页并返回摘要（fetch_webpage 底层能力）。
+
+    描述单一真相源见 FETCH_WEBPAGE_DESCRIPTION（ToolSchema.description 同源）。
+    """
     return await executor._method_browser_fetch_url(
         "browser.fetch_url", {"url": url}, query
     )

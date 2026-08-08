@@ -123,6 +123,7 @@ async def _event_to_engine_message(
         conversation_id=conversation_id,
         user_id=str(event.get("user_id", "")),
         user_name="",
+        sender_role=str(event.get("sender_role", "") or ""),
         text=str(event.get("text", "")),
         message_id=str(event.get("message_id", "")),
         seq=seq,

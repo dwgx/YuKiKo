@@ -114,6 +114,12 @@ class OneBot11Adapter(Platform):
         group_id = payload.get("group_id")
         message_id = str(payload.get("message_id", ""))
         chain = MessageChain.from_onebot_segments(payload.get("message"))
+        sender = payload.get("sender")
+        sender_role = (
+            str(sender.get("role", "")).lower()
+            if isinstance(sender, dict) and sender.get("role")
+            else ""
+        )
         if message_type == "group":
             conversation_id = f"group:{group_id}"
         else:
@@ -125,6 +131,7 @@ class OneBot11Adapter(Platform):
             "group_id": int(group_id) if group_id else 0,
             "message_id": message_id,
             "is_private": message_type != "group",
+            "sender_role": sender_role,
             "text": chain.get_plain_text(),
             "chain": chain,
         }
