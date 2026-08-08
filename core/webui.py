@@ -4228,12 +4228,107 @@ async def chat_agent_state(
     return {"items": rows, "total": len(rows)}
 
 
+def _memory_origin_class_counts(memory: Any) -> tuple[dict[str, int], int]:
+    """统计 embeddings 各 origin_class 层级的记录数，返回 (layers, total)。"""
+    if not bool(getattr(memory, "enable_vector_memory", True)):
+        return {}, 0
+    db_path = getattr(memory, "db_path", None)
+    if not db_path or not Path(db_path).is_file():
+        return {}, 0
+    conn = _open_sqlite_readonly(Path(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT origin_class, COUNT(*) FROM embeddings GROUP BY origin_class ORDER BY COUNT(*) DESC;"
+        ).fetchall()
+    finally:
+        conn.close()
+    layers = {str(row[0] or "untrusted"): int(row[1]) for row in rows}
+    return layers, sum(layers.values())
+
+
+def _fetch_memory_rows(
+    memory: Any,
+    *,
+    origin_class: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """按 origin_class 过滤读取 embeddings 行，条目结构与 list_memory_records 一致（额外含 origin_class）。"""
+    if not bool(getattr(memory, "enable_vector_memory", True)):
+        return [], 0
+    db_path = getattr(memory, "db_path", None)
+    if not db_path or not Path(db_path).is_file():
+        return [], 0
+    clauses: list[str] = []
+    params: list[Any] = []
+    origin = normalize_text(origin_class)
+    if origin:
+        clauses.append("origin_class = ?")
+        params.append(origin)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    conn = _open_sqlite_readonly(Path(db_path))
+    try:
+        total_row = conn.execute(
+            f"SELECT COUNT(*) FROM embeddings {where_sql};",
+            tuple(params),
+        ).fetchone()
+        total = int(total_row[0]) if total_row else 0
+        rows = conn.execute(
+            f"""
+            SELECT id, conversation_id, user_id, role, content, created_at, origin_class
+            FROM embeddings
+            {where_sql}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?;
+            """,
+            tuple(params + [int(limit), int(offset)]),
+        ).fetchall()
+    finally:
+        conn.close()
+    get_display_name = getattr(memory, "get_display_name", None)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        conv = str(row[1] or "")
+        uid = str(row[2] or "")
+        display_name = uid
+        if callable(get_display_name):
+            display_name = normalize_text(str(get_display_name(uid))) or uid
+        out.append(
+            {
+                "id": int(row[0]),
+                "conversation_id": conv,
+                "conversation_label": conv,
+                "user_id": uid,
+                "display_name": display_name,
+                "role": str(row[3] or ""),
+                "content": str(row[4] or ""),
+                "created_at": str(row[5] or ""),
+                "origin_class": str(row[6] or "untrusted"),
+            }
+        )
+    return out, total
+
+
+@router.get("/memory/summary", dependencies=[Depends(_check_auth)])
+async def get_memory_summary():
+    """记忆分层统计：按 origin_class 分层计数（user/agent/untrusted 等）与总量。"""
+    e = _engine
+    if not e or not hasattr(e, "memory"):
+        raise HTTPException(503, "记忆引擎未初始化")
+    memory = getattr(e, "memory", None)
+    if memory is None:
+        raise HTTPException(503, "记忆引擎未初始化")
+    layers, total = _memory_origin_class_counts(memory)
+    return {"total": total, "layers": layers}
+
+
 @router.get("/memory/records", dependencies=[Depends(_check_auth)])
 async def get_memory_records(
     conversation_id: str = Query(""),
     user_id: str = Query(""),
     role: str = Query(""),
     keyword: str = Query(""),
+    origin_class: str = Query(""),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
 ):
@@ -4245,14 +4340,18 @@ async def get_memory_records(
         raise HTTPException(503, "记忆引擎未初始化")
 
     offset = (int(page) - 1) * int(page_size)
-    items, total = memory.list_memory_records(
-        conversation_id=normalize_text(conversation_id),
-        user_id=normalize_text(user_id),
-        role=normalize_text(role).lower(),
-        keyword=normalize_text(keyword),
-        limit=int(page_size),
-        offset=offset,
-    )
+    origin = normalize_text(origin_class)
+    if origin:
+        items, total = _fetch_memory_rows(memory, origin_class=origin, limit=int(page_size), offset=offset)
+    else:
+        items, total = memory.list_memory_records(
+            conversation_id=normalize_text(conversation_id),
+            user_id=normalize_text(user_id),
+            role=normalize_text(role).lower(),
+            keyword=normalize_text(keyword),
+            limit=int(page_size),
+            offset=offset,
+        )
     return {"items": items, "total": total, "page": int(page), "page_size": int(page_size)}
 
 
@@ -4385,6 +4484,42 @@ async def post_memory_compact(request: Request):
         "message": ("记忆整理预览完成" if dry_run else "记忆整理执行完成"),
         "result": payload,
     }
+
+
+def _skill_meta_to_dict(skill: Any) -> dict[str, Any]:
+    """把 SkillMeta 序列化成市场列表条目（getattr 容错鸭子对象，便于测试）。"""
+    return {
+        "name": str(getattr(skill, "name", "")),
+        "description": str(getattr(skill, "description", "")),
+        "description_zh": str(getattr(skill, "description_zh", "")),
+        "homepage": getattr(skill, "homepage", None),
+        "user_invocable": bool(getattr(skill, "user_invocable", True)),
+        "disable_model_invocation": bool(getattr(skill, "disable_model_invocation", False)),
+        "always": bool(getattr(skill, "always", False)),
+        "requires": dict(getattr(skill, "requires", {}) or {}),
+        "install": list(getattr(skill, "install", []) or []),
+    }
+
+
+@router.get("/skills", dependencies=[Depends(_check_auth)])
+async def get_skills():
+    """技能市场列表：SKILL.md 声明的技能元数据（name/description/门控信息）。"""
+    e = _engine
+    if not e:
+        raise HTTPException(503, "引擎未初始化")
+    registry = getattr(e, "skill_registry", None)
+    if registry is None:
+        return {"items": [], "total": 0}
+    load = getattr(registry, "load", None)
+    if not callable(load):
+        return {"items": [], "total": 0}
+    try:
+        skills = load() or []
+    except Exception:
+        _log.exception("skill_registry_load_failed")
+        skills = []
+    items = [_skill_meta_to_dict(skill) for skill in skills]
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/image-gen", dependencies=[Depends(_check_auth)])

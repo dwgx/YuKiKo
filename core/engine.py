@@ -949,6 +949,38 @@ class YukikoEngine:
                     personality=self.personality,
                     model_client=self.model_client,
                 )
+                # ── 轻量组件重建（与 __init__/async_init 同构，不碰重量级）──
+                # search 必须先于 tools：ToolExecutor 持有 search_engine 引用，
+                # 旧引用会让搜索配置的改动在 router 路静默失效。
+                self.search = SearchEngine(self.config.get("search", {}))
+                self._rebuild_affinity()
+                # skill_registry 缓存扫描结果，重建才能看到新落的 SKILL.md；
+                # read_skill 闭包绑定旧实例，必须重注册。
+                self.skill_registry = SkillRegistry(self.project_root / "skills")
+                self._rebind_light_tool_registrations()
+                # 表情系统：与 __init__ 同构 —— 重建 + 按需重扫。
+                sticker_cfg = self.config.get("sticker", {})
+                self.sticker = StickerManager(
+                    storage_dir=self.storage_dir / "sticker",
+                    config=sticker_cfg,
+                )
+                if sticker_cfg.get("enabled", True) and hasattr(
+                    self, "agent_tool_registry"
+                ):
+                    qq_path = sticker_cfg.get("qq_data_path")
+                    scan_result = self.sticker.scan(
+                        qq_data_path=qq_path if qq_path and qq_path != "auto" else None,
+                    )
+                    register_sticker_tools(
+                        self.agent_tool_registry, model_client=self.model_client
+                    )
+                    self.logger.info(
+                        "sticker_reload | faces=%d emojis=%d registered=%d unregistered=%d",
+                        scan_result["faces"],
+                        scan_result["emojis"],
+                        self.sticker.registered_count,
+                        len(self.sticker.get_unregistered()),
+                    )
                 self.tools = ToolExecutor(
                     search_engine=self.search,
                     image_engine=self.image,
@@ -967,7 +999,9 @@ class YukikoEngine:
                             else None
                         ),
                     )
-                self._async_init_done = False  # re-run async_init on next message
+                # 不重置 _async_init_done：重置会让下一条消息重跑 plugins.setup_all
+                # （幂等性未验证）和 MCP 连接器初始化。插件已在启动时 setup 过，
+                # reload 只重跑 plugins.load() 读配置。
                 self.logger.info("配置热重载完成")
             return ok, msg
 
@@ -987,7 +1021,52 @@ class YukikoEngine:
             personality=self.personality,
             model_client=self.model_client,
         )
+        # 好感度提示服务读 self.affinity（engine._build_turn_context），
+        # 不重建的话行为模式切换后提示仍用旧实例的状态。
+        self._rebuild_affinity()
         self.logger.info("runtime_policy_components_refreshed | reason=%s", reason or "-")
+
+    def _rebuild_affinity(self) -> None:
+        """先落盘再重建好感度引擎：不 flush 会丢掉最多 180s 的未持久化互动。"""
+        if hasattr(self, "affinity"):
+            try:
+                self.affinity.save()
+                self.affinity.flush()
+            except Exception:
+                self.logger.warning("affinity_flush_before_rebuild_failed", exc_info=True)
+        self.affinity = AffinityEngine(storage_dir=str(self.storage_dir / "affinity"))
+
+    def _rebind_light_tool_registrations(self) -> None:
+        """把闭包绑定旧组件的 agent 工具重注册到新实例（register 按名覆盖）。
+
+        read_skill 绑定 skill_registry、搜索工具绑定 search_engine、好感度工具
+        绑定 affinity，重建后不重注册会让 agent 路继续用旧实例。提示词 hint 会
+        重复追加（registry 无去重），可接受：内容相同，不影响行为。
+        """
+        if not hasattr(self, "agent_tool_registry"):
+            return
+        register_skill_tools(self.agent_tool_registry, self.skill_registry)
+        register_builtin_tools(
+            registry=self.agent_tool_registry,
+            search_engine=self.search,
+            image_engine=getattr(self, "image", None),
+            model_client=self.model_client,
+            config=self.config,
+        )
+        if hasattr(self, "image_gen"):
+            try:
+                from core.enhanced_tools import register_enhanced_tools
+
+                register_enhanced_tools(
+                    registry=self.agent_tool_registry,
+                    affinity=self.affinity,
+                    image_gen=self.image_gen,
+                    config=self.config,
+                )
+            except Exception:
+                self.logger.warning(
+                    "enhanced_tools_register_failed_on_reload", exc_info=True
+                )
 
     @staticmethod
     def _deep_merge_plain(base: Any, patch: Any) -> Any:
