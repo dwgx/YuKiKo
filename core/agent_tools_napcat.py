@@ -3575,10 +3575,13 @@ async def _handle_smart_download(args: dict[str, Any], context: dict[str, Any]) 
     # 1) 视频/音频优先走解析链，避免直接下到网页壳
     if kind in {"auto", "video", "audio"} and tool_executor and re.match(r"^https?://", original_url, flags=re.IGNORECASE):
         try:
-            resolved = await tool_executor._method_browser_resolve_video(
-                method_name="smart_download",
-                method_args={"url": original_url},
+            from core.tools_video import browser_resolve_video
+
+            resolved = await browser_resolve_video(
+                tool_executor,
+                url=original_url,
                 query=original_url,
+                method_name="smart_download",
             )
             payload = resolved.payload or {}
             if resolved.ok and normalize_text(str(payload.get("video_url", ""))):

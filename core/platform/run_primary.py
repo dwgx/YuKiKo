@@ -102,46 +102,6 @@ def _platform_voice_max_seconds(engine: Any) -> int:
     return 60
 
 
-def _platform_voice_options(engine: Any) -> dict[str, Any]:
-    """平台路径语音发送选项：与 app.py `_resolve_runtime_send_options` 的 `bot.*` 对齐。"""
-    bot_cfg = engine.config.get("bot", {}) if isinstance(engine.config, dict) else {}
-    if not isinstance(bot_cfg, dict):
-        bot_cfg = {}
-    return {
-        "voice_send_max_seconds": _platform_voice_max_seconds(engine),
-        "voice_send_try_full_first": bool(bot_cfg.get("voice_send_try_full_first", False)),
-        "voice_send_split_enable": bool(bot_cfg.get("voice_send_split_enable", True)),
-        "voice_send_split_max_segments": max(
-            1, min(20, int(bot_cfg.get("voice_send_split_max_segments", 8) or 8))
-        ),
-    }
-
-
-def _resolve_local_audio_path(audio_file: str) -> Path | None:
-    """把 `response.audio_file` 解析成本地文件路径；远程/内联源返回 None。"""
-    audio_source = str(audio_file or "").strip()
-    if not audio_source:
-        return None
-    audio_l = audio_source.lower()
-    if audio_l.startswith("file://"):
-        try:
-            candidate = Path(audio_source[len("file://") :]).expanduser().resolve()
-            if candidate.exists() and candidate.is_file():
-                return candidate
-        except Exception:
-            return None
-        return None
-    if audio_l.startswith(("http://", "https://", "base64://", "data:")):
-        return None
-    try:
-        candidate = Path(audio_source).expanduser().resolve()
-        if candidate.exists() and candidate.is_file():
-            return candidate
-    except Exception:
-        return None
-    return None
-
-
 async def _platform_sleep(seconds: float) -> None:
     """可替换的 sleep 钩子：让限流等待在测试里可打桩。"""
     if seconds > 0:
@@ -206,179 +166,49 @@ def _build_send_guard(
     group_id: int,
     bot_id: str,
 ) -> Any:
-    """构造发送保护闭包：token-bucket 限流 + 按群熔断 + bot 级发送暂停。"""
-    from app import (
-        _check_bot_send_suspended,
-        _check_group_send_block,
-        _get_send_bucket,
-        _resolve_send_rate_profile,
-    )
+    """薄封装：委托统一发送核心 `core.response_delivery.build_send_guard`。
+
+    保留此名字供既有调用方/回归测试使用；实现已收敛到 response_delivery。
+    """
+    from core.response_delivery import build_send_guard as _build_guard
 
     config = engine.config if isinstance(engine.config, dict) else {}
-    max_per_window, window_seconds, warn_threshold, rate_enable = _resolve_send_rate_profile(
-        config
+
+    async def sender(chain: Any) -> bool:
+        return await adapter.send_by_session(conversation_id, chain)
+
+    # 经闭包按调用时解析模块全局，让测试对 `_platform_sleep` /
+    # `_mark_platform_send_failure` 的 patch 在 guard 构建之后依然生效。
+    async def sleep_fn(seconds: float) -> None:
+        await _platform_sleep(seconds)
+
+    def mark_failure_fn(gid: int, bid: str, reason: str) -> None:
+        # 兼容既有回归测试对旧 reason 标签的断言。
+        if reason == "send_rejected":
+            reason = "platform_send_rejected"
+        _mark_platform_send_failure(gid, bid, reason)
+
+    return _build_guard(
+        config,
+        sender,
+        conversation_id=conversation_id,
+        group_id=group_id,
+        bot_id=bot_id,
+        sleep_fn=sleep_fn,
+        mark_failure_fn=mark_failure_fn,
     )
-
-    async def guard_send(chain: Any) -> bool:
-        suspended, suspend_reason = _check_bot_send_suspended(bot_id)
-        if suspended:
-            _log.warning(
-                "platform_send_skipped_bot_suspended | bot=%s | conversation=%s | reason=%s",
-                bot_id or "-",
-                conversation_id,
-                suspend_reason,
-            )
-            return False
-        blocked, block_reason = _check_group_send_block(group_id)
-        if blocked:
-            _log.warning(
-                "platform_send_skipped_group_blocked | conversation=%s | reason=%s",
-                conversation_id,
-                block_reason,
-            )
-            return False
-        if rate_enable:
-            bucket = _get_send_bucket(
-                conversation_id=conversation_id,
-                group_id=group_id,
-                max_per_window=max_per_window,
-                refill_seconds=window_seconds,
-                warn_threshold=warn_threshold,
-            )
-            wait_seconds, _rate_flag = bucket.reserve()
-            if wait_seconds > 0:
-                _log.warning(
-                    "platform_send_rate_limit_wait | conversation=%s | wait=%.2fs | used=%d/%d",
-                    conversation_id,
-                    wait_seconds,
-                    bucket.used_in_window(),
-                    bucket.capacity,
-                )
-                await _platform_sleep(wait_seconds)
-        try:
-            ok = await adapter.send_by_session(conversation_id, chain)
-        except Exception as exc:
-            _log.warning("platform_send_fail | conversation=%s | err=%s", conversation_id, exc)
-            _maybe_mark_platform_send_block(group_id, bot_id, str(exc))
-            return False
-        if not ok:
-            _log.warning("platform_send_rejected | conversation=%s", conversation_id)
-            _mark_platform_send_failure(group_id, bot_id, "platform_send_rejected")
-        return ok
-
-    return guard_send
-
-
-async def _send_voice_response(
-    response: Any,
-    guard_send: Any,
-    *,
-    conversation_id: str,
-    voice_opts: dict[str, Any],
-) -> None:
-    """发送语音产物：短音频单条 silk record；长音频按段切分逐段发送（含发送保护）。"""
-    audio_file = str(getattr(response, "audio_file", "") or "")
-    record_b64 = str(getattr(response, "record_b64", "") or "")
-    if not audio_file and not record_b64:
-        return
-    from app import _probe_audio_duration_seconds_sync, _silk_encode_for_record, _split_voice_audio_file
-
-    from core.napcat_compat import build_napcat_file_reference
-    from core.platform.components import MessageChain, Record
-
-    max_seconds = int(voice_opts.get("voice_send_max_seconds", 60) or 60)
-    split_enable = bool(voice_opts.get("voice_send_split_enable", True))
-    split_max_segments = int(voice_opts.get("voice_send_split_max_segments", 8) or 8)
-    try_full_first = bool(voice_opts.get("voice_send_try_full_first", False))
-
-    local_path = _resolve_local_audio_path(audio_file)
-    duration = 0.0
-    if local_path is not None:
-        duration = await asyncio.to_thread(_probe_audio_duration_seconds_sync, local_path)
-    is_long_audio = max_seconds > 0 and duration > float(max_seconds) + 0.8
-
-    sent_voice = False
-    if local_path is not None and is_long_audio and split_enable:
-        # 与 app.py 默认策略对齐：长音频默认直接走分段（try_full_first=False 时跳过整段直发）。
-        if try_full_first:
-            ref = await _resolve_record_ref(response, max_seconds)
-            if ref:
-                sent_voice = await guard_send(MessageChain([Record(file=ref)]))
-        if not sent_voice:
-            segment_seconds = max_seconds if max_seconds > 0 else 60
-            split_parts = await _split_voice_audio_file(
-                local_path,
-                segment_seconds=segment_seconds,
-                max_segments=split_max_segments,
-            )
-            if split_parts:
-                sent_count = 0
-                for part_idx, part_path in enumerate(split_parts, start=1):
-                    part_silk = await _silk_encode_for_record(part_path, segment_seconds)
-                    part_uri = build_napcat_file_reference(
-                        part_silk if part_silk is not None else part_path
-                    )
-                    part_ok = await guard_send(MessageChain([Record(file=part_uri)]))
-                    if not part_ok:
-                        _log.warning(
-                            "platform_voice_split_part_fail | conversation=%s | part=%d/%d | file=%s",
-                            conversation_id,
-                            part_idx,
-                            len(split_parts),
-                            part_path.name,
-                        )
-                        break
-                    sent_count += 1
-                if sent_count > 0:
-                    sent_voice = True
-                    _log.info(
-                        "platform_voice_split_done | conversation=%s | sent=%d/%d",
-                        conversation_id,
-                        sent_count,
-                        len(split_parts),
-                    )
-            else:
-                _log.warning(
-                    "platform_voice_split_no_parts | conversation=%s | src=%s",
-                    conversation_id,
-                    audio_file,
-                )
-    if not sent_voice:
-        ref = await _resolve_record_ref(response, max_seconds)
-        if ref:
-            sent_voice = await guard_send(MessageChain([Record(file=ref)]))
-        elif record_b64:
-            sent_voice = await guard_send(MessageChain([Record(file=f"base64://{record_b64}")]))
-    if not sent_voice:
-        _log.warning("platform_voice_send_fail | conversation=%s", conversation_id)
 
 
 async def _resolve_record_ref(response: Any, voice_max_seconds: int) -> str:
-    """把 EngineResponse 的音频产物转成 OneBot record 的 file 引用（silk）。"""
-    audio_file = str(getattr(response, "audio_file", "") or "")
-    record_b64 = str(getattr(response, "record_b64", "") or "")
-    if audio_file:
-        try:
-            from app import _silk_encode_for_record
+    """薄封装：委托统一发送核心 `core.response_delivery._resolve_record_ref`。"""
+    from core.response_delivery import _resolve_record_ref as _impl
 
-            from core.napcat_compat import build_napcat_file_reference
-
-            silk = await _silk_encode_for_record(
-                Path(audio_file), voice_max_seconds
-            )
-            if silk is not None:
-                return build_napcat_file_reference(silk)
-        except Exception:
-            _log.warning("platform_voice_silk_fail | audio=%s", audio_file, exc_info=True)
-    if record_b64:
-        return f"base64://{record_b64}"
-    return ""
+    return await _impl(response, voice_max_seconds)
 
 
 def _wire_bridge(engine: Any, adapter: Any, cfg: dict[str, object]) -> None:
     """把 adapter 事件接进 engine 消息管线（与 NoneBot 主路径的 process/send 对齐）。"""
     from core.platform.bridge import _event_to_engine_message
-    from core.platform.components import Image, MessageChain, Plain, Video
     from core.queue import GroupQueueDispatcher
 
     dispatcher = GroupQueueDispatcher(
@@ -392,6 +222,8 @@ def _wire_bridge(engine: Any, adapter: Any, cfg: dict[str, object]) -> None:
 
     async def message_handler(event: dict[str, object]) -> None:
         try:
+            from core.response_delivery import deliver_response
+
             payload = _event_to_engine_message(
                 event,
                 dispatcher=dispatcher,
@@ -402,39 +234,21 @@ def _wire_bridge(engine: Any, adapter: Any, cfg: dict[str, object]) -> None:
             response = await engine.handle_message(payload)
             conversation_id = str(event.get("conversation_id", ""))
             group_id = int(event.get("group_id", 0) or 0)
-            guard_send = _build_send_guard(
-                engine,
-                adapter,
+            config = engine.config if isinstance(engine.config, dict) else {}
+
+            async def sender(chain: Any) -> bool:
+                return await adapter.send_by_session(conversation_id, chain)
+
+            # 统一发送核心：语义拆分文本 + 限流/熔断/暂停 + 图片/视频 + 语音 silk 分段。
+            await deliver_response(
+                config,
+                response,
+                sender,
                 conversation_id=conversation_id,
                 group_id=group_id,
                 bot_id=bot_id,
-            )
-            # 静态内容：文本 + 图片 + 视频（不含语音），先发。
-            components: list[Any] = []
-            # EngineResponse 的文本字段是 reply_text（不是 text）。
-            text = str(getattr(response, "reply_text", "") or "")
-            if text:
-                components.append(Plain(text))
-            # 图片
-            image_url = str(getattr(response, "image_url", "") or "")
-            raw_urls = getattr(response, "image_urls", []) or []
-            image_urls = [str(u) for u in raw_urls if str(u)]
-            if image_url and image_url not in image_urls:
-                image_urls.insert(0, image_url)
-            for url in image_urls[:4]:
-                components.append(Image(file=url))
-            # 视频
-            video_url = str(getattr(response, "video_url", "") or "")
-            if video_url:
-                components.append(Video(file=video_url))
-            if components:
-                await guard_send(MessageChain(components))
-            # 语音：短音频单条 silk record；长音频按段切分逐条发送（含发送保护）。
-            await _send_voice_response(
-                response,
-                guard_send,
-                conversation_id=conversation_id,
-                voice_opts=_platform_voice_options(engine),
+                sleep_fn=_platform_sleep,
+                mark_failure_fn=_mark_platform_send_failure,
             )
         except Exception:
             _log.warning("platform_msg_error", exc_info=True)

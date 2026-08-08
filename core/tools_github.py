@@ -574,3 +574,40 @@ class ToolGithubMixin:
             if owner.lower() not in {"http", "https"}:
                 return f"{owner}/{repo}"
         return ""
+
+
+# ── 公开接口（架构收敛 C1b）──────────────────────────────────────────
+# agent 工具层不再直接调 ToolExecutor 的私有 _method_* 穿墙，改走这里的
+# 模块级公开函数。executor 需实现对应 mixin（ToolExecutor 即满足）；私有
+# 实现仍留在 mixin 内，后续阶段可再把实现迁移进公开函数。
+
+
+async def browser_github_search(
+    executor: Any,
+    *,
+    query: str,
+    language: str = "",
+) -> ToolResult:
+    """在 GitHub 搜索仓库（github_search 底层能力）。"""
+    method_args: dict[str, Any] = {"query": query}
+    if language:
+        method_args["language"] = language
+    return await executor._method_browser_github_search(
+        "browser.github_search", method_args, query,
+    )
+
+
+async def browser_github_readme(
+    executor: Any,
+    *,
+    repo: str,
+) -> ToolResult:
+    """读取 GitHub 仓库 README 摘要（github_readme 底层能力）。"""
+    method_args: dict[str, Any] = {}
+    if "/" in repo and not repo.startswith("http"):
+        method_args["repo"] = repo
+    else:
+        method_args["url"] = repo
+    return await executor._method_browser_github_readme(
+        "browser.github_readme", method_args, repo,
+    )

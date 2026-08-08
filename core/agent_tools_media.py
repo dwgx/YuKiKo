@@ -899,7 +899,10 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
         )
 
     try:
-        result = await tool_executor._method_media_analyze_image(
+        from core.tools_vision import media_analyze_image
+
+        result = await media_analyze_image(
+            tool_executor,
             method_name="analyze_image",
             method_args=method_args,
             query=query,

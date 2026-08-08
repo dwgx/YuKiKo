@@ -28,6 +28,7 @@ from core import prompt_loader as _pl
 from core.prompt_navigator import NAVIGATE_SECTION_TOOL, NavigatorState, PromptNavigator
 from core.prompt_policy import PromptPolicy
 from core.loop_guard import LoopGuard, ToolCallRecord, hash_call, hash_result
+from core import media_utils
 from core.tool_call_repair import repair_tool_call
 from services.model_client import ModelClient
 from utils.intent import (
@@ -52,8 +53,6 @@ _RE_BARE_WEB_HOST = re.compile(
     r"(?::\d{2,5})?(?:/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?)",
     re.IGNORECASE,
 )
-_RE_IMAGE_EXT = re.compile(r"\.(?:jpg|jpeg|png|gif|webp|bmp|heic|heif|avif)(?=$|[?#&!@_/])")
-_RE_VIDEO_EXT = re.compile(r"\.(?:mp4|webm|mov|m4v)(?:\?|$)")
 _RE_QQ_NUMBER = re.compile(r"(?<!\d)([1-9]\d{5,11})(?!\d)")
 # 弱模型防护用的宽范围 CJK 标点匹配（见下方 L59）
 # 注意: 旧的窄范围定义已移除，统一使用下方宽范围版本
@@ -108,23 +107,6 @@ _MISSING_ARG_HINTS: dict[str, str] = {
         "只是让你取内容/校验/看信息就填 false。不要因为消息里出现「发」字就填 true。"
     ),
 }
-
-
-def _strip_trailing_url_noise(url: str) -> str:
-    target = normalize_text(url).strip().rstrip(").,，。!?！？】》」』")
-    if not target:
-        return ""
-    suffix_re = re.compile(
-        r"(?:解析|分析|看看|看下|看一下|下载|下載|发我|發我|发出来|發出來|"
-        r"转发|轉發|总结|總結|解说|解說|parse|analyze|download)+$",
-        re.IGNORECASE,
-    )
-    for _ in range(4):
-        cleaned = suffix_re.sub("", target).rstrip(").,，。!?！？】》」』")
-        if cleaned == target:
-            break
-        target = cleaned
-    return target
 
 
 @dataclass(slots=True)
@@ -4748,10 +4730,7 @@ class AgentLoop:
 
     @staticmethod
     def _extract_first_url(text: str) -> str:
-        m = _RE_URL_EXTRACT.search(text or "")
-        if not m:
-            return ""
-        return _strip_trailing_url_noise(m.group(0))
+        return media_utils.extract_first_url(text)
 
     @classmethod
     def _extract_first_video_url(cls, text: str) -> str:
@@ -4763,7 +4742,7 @@ class AgentLoop:
     @classmethod
     def _extract_first_image_url(cls, text: str) -> str:
         for match in _RE_URL_EXTRACT.finditer(text or ""):
-            url = _strip_trailing_url_noise(match.group(0))
+            url = media_utils.strip_trailing_url_noise(match.group(0))
             if url and cls._looks_like_image_url(url):
                 return url
         return ""
@@ -4817,17 +4796,7 @@ class AgentLoop:
 
     @staticmethod
     def _looks_like_image_url(url: str) -> bool:
-        target = normalize_text(url).lower()
-        if not target:
-            return False
-        if target.startswith("data:image/"):
-            return True
-        if _RE_IMAGE_EXT.search(target):
-            return True
-        # QQ/NT 常见图片下载链接没有文件后缀
-        if "multimedia.nt.qq.com.cn/download" in target:
-            return True
-        return False
+        return media_utils.looks_like_image_url(url)
 
     @classmethod
     def _text_has_image_hint(cls, text: str) -> bool:
@@ -4841,30 +4810,7 @@ class AgentLoop:
 
     @staticmethod
     def _looks_like_video_url(url: str) -> bool:
-        target = normalize_text(url).lower()
-        if not target:
-            return False
-        if _RE_VIDEO_EXT.search(target):
-            return True
-        return any(
-            host in target
-            for host in (
-                "bilibili.com/video/",
-                "b23.tv/",
-                "douyin.com/",
-                "iesdouyin.com/",
-                "kuaishou.com/",
-                "acfun.cn/v/ac",
-                "acfun.com/v/ac",
-                "m.acfun.cn/v/",
-                "v.qq.com/",
-                "m.v.qq.com/",
-                "qq.com/x/",
-                "youku.com/v_show/",
-                "iqiyi.com/",
-                "mgtv.com/",
-            )
-        )
+        return media_utils.looks_like_video_url(url)
 
     @classmethod
     def _extract_recent_media_url(cls, ctx: AgentContext, media_type: str) -> str:
@@ -6253,28 +6199,11 @@ class AgentLoop:
 
     @staticmethod
     def _is_placeholder_media_url(url: str) -> bool:
-        value = normalize_text(url).lower()
-        if not value:
-            return False
-        if not (value.startswith("http://") or value.startswith("https://")):
-            return False
-        blocked_tokens = (
-            "example.com",
-            "example.org",
-            "example.net",
-            "localhost",
-            "127.0.0.1",
-            "0.0.0.0",
-            ".invalid/",
-        )
-        return any(token in value for token in blocked_tokens)
+        return media_utils.is_placeholder_media_url(url)
 
     @staticmethod
     def _is_local_media_path(url: str) -> bool:
-        value = normalize_text(url)
-        if not value:
-            return False
-        return not value.lower().startswith(("http://", "https://"))
+        return media_utils.is_local_media_path(url)
 
     @staticmethod
     def _normalize_media_url(url: str) -> str:
@@ -6364,12 +6293,7 @@ class AgentLoop:
 
     @staticmethod
     def _normalize_local_media_path(path: str) -> str:
-        value = normalize_text(path).strip()
-        if not value:
-            return ""
-        if value.lower().startswith(("http://", "https://")):
-            return ""
-        return value.replace("\\", "/").lower()
+        return media_utils.normalize_local_media_path(path)
 
     @classmethod
     def _collect_local_paths_from_payload(cls, payload: Any, out: set[str]) -> None:

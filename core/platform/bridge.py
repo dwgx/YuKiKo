@@ -14,7 +14,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 from core.engine_types import EngineMessage, EngineResponse
-from core.platform.components import MessageChain, Plain
 from core.platform.manager import PlatformManager
 from core.platform.onebot11 import OneBot11Adapter
 
@@ -81,27 +80,32 @@ async def _reply_to_session(
     session_id: str,
     response: EngineResponse,
     voice_max_seconds: int = 60,
+    *,
+    group_id: int = 0,
+    bot_id: str = "",
+    config: dict[str, Any] | None = None,
 ) -> None:
-    """发送 EngineResponse 到会话：文本 + 语音（silk record）+ 图片 + 视频。"""
-    from core.platform.run_primary import _resolve_record_ref
-    from core.platform.components import Image, Record, Video
+    """发送 EngineResponse 到会话，经统一发送核心（文本/图片/视频/语音 + 发送保护）。"""
+    from core.response_delivery import deliver_response
 
-    components: list[Any] = []
-    # EngineResponse 的文本字段是 reply_text（不是 text）。
-    text = str(getattr(response, "reply_text", "") or "")
-    if text:
-        components.append(Plain(text))
-    record_ref = await _resolve_record_ref(response, voice_max_seconds)
-    if record_ref:
-        components.append(Record(file=record_ref))
-    image_url = str(getattr(response, "image_url", "") or "")
-    if image_url:
-        components.append(Image(file=image_url))
-    video_url = str(getattr(response, "video_url", "") or "")
-    if video_url:
-        components.append(Video(file=video_url))
-    if components:
-        await adapter.send_by_session(session_id, MessageChain(components))
+    cfg = dict(config or {})
+    bot_cfg = cfg.get("bot")
+    if not isinstance(bot_cfg, dict):
+        cfg["bot"] = {}
+    if "voice_send_max_seconds" not in cfg["bot"]:
+        cfg["bot"]["voice_send_max_seconds"] = voice_max_seconds
+
+    async def sender(chain: Any) -> bool:
+        return await adapter.send_by_session(session_id, chain)
+
+    await deliver_response(
+        cfg,
+        response,
+        sender,
+        conversation_id=session_id,
+        group_id=group_id,
+        bot_id=bot_id,
+    )
 
 
 async def register_onebot11_platform(
@@ -149,7 +153,14 @@ async def register_onebot11_platform(
                 api_call=_platform_api_call,
             )
             response: EngineResponse = await engine.handle_message(payload)
-            await _reply_to_session(adapter, str(event.get("conversation_id", "")), response)
+            await _reply_to_session(
+                adapter,
+                str(event.get("conversation_id", "")),
+                response,
+                group_id=int(event.get("group_id", 0) or 0),
+                bot_id=bot_id,
+                config=engine.config if isinstance(engine.config, dict) else None,
+            )
         except Exception:
             _log.warning("platform_message_error", exc_info=True)
 

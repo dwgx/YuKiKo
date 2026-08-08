@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from core import prompt_loader as _pl
 from core.admin import AdminEngine
 from core.agent import AgentContext, AgentLoop, AgentResult
+from core import media_utils
 from core.agent_tools import (
     AgentToolRegistry,
     register_builtin_tools,
@@ -7309,23 +7310,7 @@ class YukikoEngine:
 
     @staticmethod
     def _is_placeholder_media_url(url: str) -> bool:
-        value = normalize_text(url).lower()
-        if not value:
-            return False
-
-        if not (value.startswith("http://") or value.startswith("https://")):
-            return False
-
-        blocked_tokens = (
-            "example.com",
-            "example.org",
-            "example.net",
-            "localhost",
-            "127.0.0.1",
-            "0.0.0.0",
-            ".invalid/",
-        )
-        return any(token in value for token in blocked_tokens)
+        return media_utils.is_placeholder_media_url(url)
 
     def _sanitize_cached_media_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):

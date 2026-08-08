@@ -8,6 +8,7 @@ import io
 import mimetypes
 import re
 
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -2573,3 +2574,32 @@ class ToolVisionMixin:
         ):
             return True
         return False
+
+
+# ── 公开接口（架构收敛 C1b）──────────────────────────────────────────
+# agent 工具层不再直接调 ToolExecutor 的私有 _method_* 穿墙，改走这里的
+# 模块级公开函数。executor 需实现对应 mixin（ToolExecutor 即满足）；私有
+# 实现仍留在 mixin 内，后续阶段可再把实现迁移进公开函数。
+
+
+async def media_analyze_image(
+    executor: Any,
+    *,
+    method_name: str = "analyze_image",
+    method_args: dict[str, Any],
+    query: str,
+    message_text: str,
+    raw_segments: list[dict[str, Any]],
+    conversation_id: str = "",
+    api_call: Callable[..., Awaitable[Any]] | None = None,
+) -> ToolResult:
+    """识别/分析图片内容（analyze_image 底层能力）。"""
+    return await executor._method_media_analyze_image(
+        method_name,
+        method_args,
+        query,
+        message_text,
+        raw_segments,
+        conversation_id=conversation_id,
+        api_call=api_call,
+    )

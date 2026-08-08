@@ -165,14 +165,11 @@ async def _handle_github_search(args: dict[str, Any], context: dict[str, Any]) -
     query = str(args.get("query", "")).strip()
     if not query:
         return ToolCallResult(ok=False, error="missing query")
-    method_args: dict[str, Any] = {"query": query}
     lang = str(args.get("language", "")).strip()
-    if lang:
-        method_args["language"] = lang
     try:
-        result = await tool_executor._method_browser_github_search(
-            "browser.github_search", method_args, query,
-        )
+        from core.tools_github import browser_github_search
+
+        result = await browser_github_search(tool_executor, query=query, language=lang)
         text = str((result.payload or {}).get("text", ""))
         return ToolCallResult(ok=result.ok, display=clip_text(text, 800), error=result.error)
     except Exception as exc:
@@ -186,15 +183,10 @@ async def _handle_github_readme(args: dict[str, Any], context: dict[str, Any]) -
     repo = str(args.get("repo", "")).strip()
     if not repo:
         return ToolCallResult(ok=False, error="missing repo")
-    method_args: dict[str, Any] = {}
-    if "/" in repo and not repo.startswith("http"):
-        method_args["repo"] = repo
-    else:
-        method_args["url"] = repo
     try:
-        result = await tool_executor._method_browser_github_readme(
-            "browser.github_readme", method_args, repo,
-        )
+        from core.tools_github import browser_github_readme
+
+        result = await browser_github_readme(tool_executor, repo=repo)
         text = str((result.payload or {}).get("text", ""))
         return ToolCallResult(ok=result.ok, display=clip_text(text, 800), error=result.error)
     except Exception as exc:
