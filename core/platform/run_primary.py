@@ -43,9 +43,15 @@ def _build_app(engine: Any) -> Any:  # type: ignore[no-untyped-def]
 
     app = FastAPI()
 
-    @app.websocket("/onebot/v11/ws")
     async def _onebot_ws(websocket: Any) -> None:
         await adapter.handle_starlette_ws(websocket)
+
+    # FastAPI 0.141 的 @app.websocket 在真实 uvicorn 下对 ws 升级会提前 close(403)
+    # （与 starlette 1.3 / uvicorn 0.50 的兼容问题，TestClient 测不出，只影响真实连接）。
+    # 改用 Starlette WebSocketRoute 挂同端口：HTTP 走 FastAPI（WebUI），ws 走此路由。
+    from starlette.routing import WebSocketRoute
+
+    app.router.routes.append(WebSocketRoute("/onebot/v11/ws", _onebot_ws))
 
     from core.webui import init_webui
 
