@@ -58,6 +58,9 @@ class OneBot11Adapter(Platform):
         self.bot_id = str(config.get("bot_id", ""))
         self._server: Any = None
         self._active_ws: Any = None
+        # NapCat 反连连接（第一个）：固定用于 API 转发与事件接收；额外连接不替换它。
+        self._napcat_ws: Any = None
+        self._napcat_send: Any = None
         self._authenticated = False
         self._pending_api: dict[str, asyncio.Future[Any]] = {}
         # 发送抽象：websockets 库接口 vs Starlette WebSocket（挂 uvicorn 时用）。
@@ -189,18 +192,18 @@ class OneBot11Adapter(Platform):
                 pass
             return
         self._authenticated = True
-        if self._active_ws is not None and self._active_ws is not websocket:
-            # 只接受一个活跃反连连接（NapCat）。额外连接（调试/劫持）会覆盖
-            # _active_ws，导致 _send_api 把 OneBot 请求发到错误连接（自环）。
-            # NapCat 重连时旧连接会先断开、finally 清理 _active_ws 后再接受新连接。
-            _log.warning("onebot_ws_extra_connection_rejected")
-            try:
-                await websocket.close(code=4001)
-            except Exception:
-                pass
-            return
-        self._active_ws = websocket
-        self._ws_send_text = lambda text: websocket.send_text(text)
+        # 第一个连接视为 NapCat（固定用于 API 转发 + 事件接收）。
+        # 额外连接（调试/WebUI 直连）独立接受：可发 API 请求、不替换 NapCat，
+        # 避免 _send_api 把请求发到错误连接（自环）。
+        is_napcat = self._napcat_ws is None
+        if is_napcat:
+            self._napcat_ws = websocket
+            self._napcat_send = lambda text: websocket.send_text(text)
+            self._active_ws = websocket
+            self._ws_send_text = self._napcat_send
+            _log.info("onebot_ws_connected | napcat")
+        else:
+            _log.info("onebot_ws_extra_connected | debug")
         await websocket.accept()
         try:
             while True:
@@ -214,20 +217,23 @@ class OneBot11Adapter(Platform):
                     continue
                 if "action" in payload:
                     await self._handle_api(websocket, payload)
-                else:
+                elif is_napcat:
+                    # 事件只从 NapCat 连接进来；额外连接不冒充事件源。
                     await self._dispatch_event(payload)
         except Exception:
             pass
         finally:
-            # 连接断开后清引用，NapCat 重连时才能接受新连接。
+            if self._napcat_ws is websocket:
+                self._napcat_ws = None
+                self._napcat_send = None
             if self._active_ws is websocket:
                 self._active_ws = None
                 self._ws_send_text = None
 
     async def _send_text(self, text: str) -> None:
-        """统一发送文本：Starlette WebSocket 用 send_text，websockets 库用 send。"""
-        if self._ws_send_text is not None:
-            await self._ws_send_text(text)
+        """统一发送文本：固定经 NapCat 连接（Starlette 用 send_text，websockets 用 send）。"""
+        if self._napcat_send is not None:
+            await self._napcat_send(text)
         elif self._active_ws is not None:
             await self._active_ws.send(text)
 
@@ -240,7 +246,11 @@ class OneBot11Adapter(Platform):
         echo = payload.get("echo")
         data = await self._dispatch_api(action, params)
         response = {"status": "ok", "retcode": 0, "data": data, "echo": echo}
-        await self._send_text(json.dumps(response, ensure_ascii=False))
+        # 响应必须发回**请求来源连接**（NapCat 的 API 响应走 NapCat 连接，调试连接走调试连接），
+        # 不能用 _send_text（那固定发到 NapCat 连接）。
+        send_back = getattr(websocket, "send_text", None) or getattr(websocket, "send", None)
+        if send_back is not None:
+            await send_back(json.dumps(response, ensure_ascii=False))
 
     async def _dispatch_api(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         """API 分派：支持 OneBot 核心动作（发送/撤回/改群名片/取消息）。
@@ -261,8 +271,8 @@ class OneBot11Adapter(Platform):
         return response.get("data", {})
 
     async def _send_api(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
-        """上行 OneBot API 调用并等响应（echo 匹配）。"""
-        if self._active_ws is None:
+        """上行 OneBot API 调用并等响应（echo 匹配）。固定经 NapCat 连接转发。"""
+        if self._napcat_ws is None:
             return {"status": "failed", "retcode": -1, "data": {}}
         echo = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
