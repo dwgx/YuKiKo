@@ -149,9 +149,9 @@ async def _handle_fetch_webpage(args: dict[str, Any], context: dict[str, Any]) -
     if not url:
         return ToolCallResult(ok=False, error="missing url")
     try:
-        result = await tool_executor._method_browser_fetch_url(
-            "browser.fetch_url", {"url": url}, url,
-        )
+        from core.tools_search import browser_fetch_url
+
+        result = await browser_fetch_url(tool_executor, url=url, query=url)
         text = str((result.payload or {}).get("text", ""))
         return ToolCallResult(ok=result.ok, display=clip_text(text, 800), error=result.error)
     except Exception as exc:
@@ -209,9 +209,9 @@ async def _handle_douyin_search(args: dict[str, Any], context: dict[str, Any]) -
     if not query:
         return ToolCallResult(ok=False, error="missing query")
     try:
-        result = await tool_executor._method_douyin_search_video(
-            "douyin.search_video", {"query": query}, query,
-        )
+        from core.tools_video import douyin_search_video
+
+        result = await douyin_search_video(tool_executor, query=query)
         text = str((result.payload or {}).get("text", ""))
         return ToolCallResult(ok=result.ok, display=clip_text(text, 800), error=result.error)
     except Exception as exc:

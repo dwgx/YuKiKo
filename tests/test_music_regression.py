@@ -450,16 +450,17 @@ class MusicRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("明确匹配", result.display)
 
     async def test_handle_music_play_returns_media_when_play_succeeds(self) -> None:
-        class FakeExecutor:
-            async def execute(self, **kwargs):
-                return ToolResult(
+        class FakeMusicEngine:
+            async def play(self, keyword: str, as_voice: bool = True, title: str = "", artist: str = ""):
+                return MusicPlayResult(
                     ok=True,
-                    tool_name="music_play",
-                    payload={
-                        "text": "给你点了蛋堡的《热水澡》~",
-                        "audio_file": "storage/cache/music/demo.mp3",
-                    },
+                    song=MusicSearchResult(song_id=0, name=keyword, artist=artist),
+                    audio_path="storage/cache/music/demo.mp3",
+                    message="给你点了蛋堡的《热水澡》~",
                 )
+
+        class FakeExecutor:
+            _music_engine = FakeMusicEngine()
 
         result = await _handle_music_play(
             {"title": "热水澡", "artist": "蛋堡"},

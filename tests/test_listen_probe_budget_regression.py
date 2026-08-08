@@ -22,11 +22,10 @@ ai_listen_max_probes_per_hour = 6
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
-
 from core.config_templates import _built_in_config_defaults
 from core.trigger import TriggerEngine
 
@@ -94,7 +93,7 @@ class BudgetStillHasAHardCeilingTests(unittest.TestCase):
         """配额用尽后必须真的停下来。"""
 
         engine = _engine({"ai_listen_max_probes_per_hour": 3})
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for _ in range(3):
             self.assertTrue(engine._probe_budget_ok("group:1", now))
             engine._commit_probe("group:1", now)
@@ -104,7 +103,7 @@ class BudgetStillHasAHardCeilingTests(unittest.TestCase):
 
     def test_budget_recovers_after_the_window(self) -> None:
         engine = _engine({"ai_listen_max_probes_per_hour": 2})
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for _ in range(2):
             engine._commit_probe("group:1", now)
         self.assertFalse(engine._probe_budget_ok("group:1", now))
@@ -117,13 +116,13 @@ class BudgetStillHasAHardCeilingTests(unittest.TestCase):
         """0 = 关闭旁听，这个语义不能被改动破坏。"""
 
         engine = _engine({"ai_listen_max_probes_per_hour": 0})
-        self.assertFalse(engine._probe_budget_ok("group:1", datetime.now(timezone.utc)))
+        self.assertFalse(engine._probe_budget_ok("group:1", datetime.now(UTC)))
 
     def test_budget_is_per_conversation(self) -> None:
         """一个群用满不该影响另一个群。"""
 
         engine = _engine({"ai_listen_max_probes_per_hour": 1})
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         engine._commit_probe("group:1", now)
         self.assertFalse(engine._probe_budget_ok("group:1", now))
         self.assertTrue(engine._probe_budget_ok("group:2", now))
@@ -140,8 +139,8 @@ class TalkingAboutTheBotGuidanceReachesAllPromptSourcesTests(unittest.TestCase):
     ANCHOR = "第五种同样不该沉默的情形"
 
     def test_python_payload_has_the_guidance(self) -> None:
-        src = Path("core/prompt_navigator.py").read_text(encoding="utf-8")
-        self.assertIn(self.ANCHOR, src, "Python payload 缺这段指引")
+        src = Path("core/prompt_navigator_data.yml").read_text(encoding="utf-8")
+        self.assertIn(self.ANCHOR, src, "数据文件缺这段指引")
 
     def test_template_has_the_guidance(self) -> None:
         src = Path("config/templates/master.template.yml").read_text(encoding="utf-8")
@@ -158,7 +157,7 @@ class TalkingAboutTheBotGuidanceReachesAllPromptSourcesTests(unittest.TestCase):
     def test_guidance_still_tells_the_model_to_stay_silent_about_others(self) -> None:
         """反向：不能变成「什么都接」。谈论别人时仍要沉默。"""
 
-        src = Path("core/prompt_navigator.py").read_text(encoding="utf-8")
+        src = Path("core/prompt_navigator_data.yml").read_text(encoding="utf-8")
         self.assertIn(
             "话题里的人不是你",
             src,

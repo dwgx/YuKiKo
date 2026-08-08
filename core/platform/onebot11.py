@@ -18,6 +18,20 @@ import uuid
 from collections.abc import Mapping
 from typing import Any
 
+
+def _mask_sensitive_response(text: str) -> str:
+    """截断并脱敏 OneBot 响应里的敏感键（token/cookie/凭证），供日志诊断。"""
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for key in list(data.keys()):
+                if any(s in str(key).lower() for s in ("token", "secret", "cookie", "credential")):
+                    data[key] = "[redacted]"
+            return json.dumps(data, ensure_ascii=False)[:400]
+    except Exception:
+        pass
+    return text[:400]
+
 import websockets
 
 from core.platform.base import Platform, PlatformMetadata, PlatformStatus
@@ -168,6 +182,14 @@ class OneBot11Adapter(Platform):
                 pass
             return
         self._authenticated = True
+        if self._active_ws is not None and self._active_ws is not websocket:
+            # NapCat 会按 reconnectInterval 重连；旧连接可能还没被 finally 清理。
+            # 这里允许新连接替换旧连接（关闭旧的），保证反连连接总是可恢复的。
+            _log.info("onebot_ws_reconnect | replacing_old_ws")
+            try:
+                await self._active_ws.close(code=4000)
+            except Exception:
+                pass
         self._active_ws = websocket
         self._ws_send_text = lambda text: websocket.send_text(text)
         await websocket.accept()
@@ -187,6 +209,11 @@ class OneBot11Adapter(Platform):
                     await self._dispatch_event(payload)
         except Exception:
             pass
+        finally:
+            # 连接断开后清引用，NapCat 重连时才能接受新连接。
+            if self._active_ws is websocket:
+                self._active_ws = None
+                self._ws_send_text = None
 
     async def _send_text(self, text: str) -> None:
         """统一发送文本：Starlette WebSocket 用 send_text，websockets 库用 send。"""
@@ -260,4 +287,14 @@ class OneBot11Adapter(Platform):
         else:
             return False
         response = await self._send_api(action, params)
-        return int(response.get("retcode", -1)) == 0
+        ok = int(response.get("retcode", -1)) == 0
+        if not ok:
+            # 记录 NapCat 返回的原始响应，定位 send_group_msg 被拒的具体 retcode/错误。
+            _log.warning(
+                "onebot_send_failed | action=%s | session=%s | retcode=%s | resp=%s",
+                action,
+                session_id,
+                response.get("retcode"),
+                _mask_sensitive_response(str(response)[:400]),
+            )
+        return ok

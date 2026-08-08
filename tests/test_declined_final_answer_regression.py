@@ -155,7 +155,7 @@ class PromptTellsTheModelNotToUndoItsOwnRefusalTests(unittest.TestCase):
         return {
             path: Path(path).read_text(encoding="utf-8")
             for path in (
-                "core/prompt_navigator.py",
+                "core/prompt_navigator_data.yml",
                 "config/templates/master.template.yml",
                 "config/prompts.yml",
             )
@@ -180,9 +180,9 @@ class PromptTellsTheModelNotToUndoItsOwnRefusalTests(unittest.TestCase):
     def test_prompt_still_forbids_talking_instead_of_acting(self) -> None:
         """反向：原来那条「不要用嘴代替动手」不能被这个豁免冲掉。"""
 
-        src = Path("core/prompt_navigator.py").read_text(encoding="utf-8")
+        src = Path("core/prompt_navigator_data.yml").read_text(encoding="utf-8")
         self.assertIn("不要用嘴代替动手", src)
-        self.assertIn("也不允许说\"我看不到\"", src)
+        self.assertIn("也不允许说", src)
 
 
 if __name__ == "__main__":

@@ -557,11 +557,9 @@ async def _handle_parse_video(args: dict[str, Any], context: dict[str, Any]) -> 
 
     query = url  # 用 URL 作为 query
     try:
-        result = await tool_executor._method_browser_resolve_video(
-            method_name="parse_video",
-            method_args={"url": url},
-            query=query,
-        )
+        from core.tools_video import browser_resolve_video
+
+        result = await browser_resolve_video(tool_executor, url=url, query=query)
     except Exception as exc:
         _log.warning("parse_video_error | url=%s | %s", url[:80], exc)
         return ToolCallResult(ok=False, error=f"parse_video_error: {exc}", display=f"视频解析失败: {exc}")
@@ -682,9 +680,11 @@ async def _handle_analyze_video(args: dict[str, Any], context: dict[str, Any]) -
     conversation_id = str(context.get("conversation_id", ""))
 
     try:
-        result = await tool_executor._method_video_analyze(
-            method_name="analyze_video",
-            method_args={"url": url},
+        from core.tools_video import video_analyze
+
+        result = await video_analyze(
+            tool_executor,
+            url=url,
             query=url,
             message_text=message_text,
             raw_segments=raw_segments if isinstance(raw_segments, list) else [],
@@ -1773,18 +1773,17 @@ async def _handle_analyze_local_video(args: dict[str, Any], context: dict[str, A
         if isinstance(segs, list):
             merged_segments.extend(item for item in segs if isinstance(item, dict))
 
-    method_args: dict[str, Any] = {}
-    if explicit_url:
-        method_args["url"] = explicit_url
-
     try:
-        result = await tool_executor._method_video_analyze(
-            method_name="analyze_local_video",
-            method_args=method_args,
+        from core.tools_video import video_analyze
+
+        result = await video_analyze(
+            tool_executor,
+            url=explicit_url,
             query=message_text or explicit_url,
             message_text=message_text,
             raw_segments=merged_segments,
             conversation_id=conversation_id,
+            method_name="analyze_local_video",
         )
     except Exception as exc:
         _log.warning("analyze_local_video_error | %s", exc)

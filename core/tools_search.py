@@ -481,3 +481,21 @@ class ToolSearchMixin:
         if any(cue in content for cue in generic):
             return True
         return len(content) <= 8 and content in {"搜", "搜索", "查", "去搜", "去查"}
+
+
+# ── 公开接口（架构收敛 C1）──────────────────────────────────────────
+# agent 工具层不再直接调 ToolExecutor 的私有 _method_* 穿墙，改走这里的
+# 模块级公开函数。executor 需实现对应 mixin（ToolExecutor 即满足）；私有
+# 实现仍留在 mixin 内，后续阶段可再把实现迁移进公开函数。
+
+
+async def browser_fetch_url(
+    executor: Any,
+    *,
+    url: str,
+    query: str = "",
+) -> ToolResult:
+    """抓取网页并返回摘要（fetch_webpage 底层能力）。"""
+    return await executor._method_browser_fetch_url(
+        "browser.fetch_url", {"url": url}, query
+    )

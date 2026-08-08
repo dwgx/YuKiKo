@@ -2092,3 +2092,33 @@ def build_music_keyword(keyword: str, title: str = "", artist: str = "") -> str:
 
     cleaned = [part for part in parts if part]
     return " ".join(cleaned)
+
+
+# 点歌命令常见前缀。tools_music_exec.py 的 _music_search/_music_play 各内联了
+# 一份相同表；架构收敛 C1 后 agent 工具层直接调 MusicEngine，这里提供公开的
+# 去前缀函数，避免在 agent 工具层再抄第三份。
+MUSIC_COMMAND_PREFIXES: tuple[str, ...] = (
+    "点歌",
+    "听歌",
+    "放歌",
+    "搜歌",
+    "播放",
+    "来首",
+    "来一首",
+    "唱",
+    "/music",
+    "/song",
+)
+
+
+def strip_music_command_prefix(keyword: str) -> str:
+    """去掉点歌命令常见前缀，返回清洗后的关键词。
+
+    与 tools_music_exec.py 内联前缀表保持一致：空输入返回空串，
+    命中前缀则剥离后去首尾空白。
+    """
+    kw = str(keyword or "").strip()
+    for prefix in MUSIC_COMMAND_PREFIXES:
+        if kw.startswith(prefix):
+            kw = kw[len(prefix) :].strip()
+    return kw

@@ -16,6 +16,7 @@ from typing import Any
 
 import yaml
 
+from core.config_schema import validate_config
 from core.config_templates import deep_merge_dict, load_config_template
 from core.crypto import DecryptionError, SecretManager
 
@@ -32,6 +33,7 @@ class ConfigManager:
         self._config_file = config_dir / "config.yml"
         self._secret = SecretManager(storage_dir / ".secret_key")
         self._data: dict[str, Any] = {}
+        self._last_validation_issues: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self.load()
 
@@ -64,6 +66,7 @@ class ConfigManager:
                 self._data = self._secret.decrypt_dict(resolved)  # type: ignore[assignment]
             except DecryptionError as exc:
                 raise RuntimeError(f"配置中的加密字段无法解密: {exc}") from exc
+            self._validate_runtime_config()
             _log.info("配置已加载: %s", self._config_file)
 
     def reload(self) -> tuple[bool, str]:
@@ -80,7 +83,28 @@ class ConfigManager:
     def secret(self) -> SecretManager:
         return self._secret
 
+    @property
+    def last_validation_issues(self) -> list[dict[str, Any]]:
+        """最近一次 load() 的 schema 校验结果（类型不匹配 / 必填缺失）。"""
+        return list(self._last_validation_issues)
+
     # ── private ───────────────────────────────────────────────
+    def _validate_runtime_config(self) -> None:
+        """按 schema 校验运行时配置，只记 warning，不阻断启动。
+
+        漂移（模板与内置默认值、或用户 config.yml 的类型矛盾）静默错下去会
+        拖到消费端才炸，这里在启动/热重载时尽早暴露。
+        """
+        self._last_validation_issues = validate_config(self._data)
+        for issue in self._last_validation_issues:
+            _log.warning(
+                "config_validation | kind=%s | path=%s | expected=%s | actual=%s",
+                issue["kind"],
+                issue["path"],
+                issue["expected"],
+                issue["actual"],
+            )
+
     @staticmethod
     def _load_yaml(path: Path) -> dict[str, Any]:
         if not path.exists():

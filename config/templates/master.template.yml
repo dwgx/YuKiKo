@@ -53,7 +53,7 @@ config:
     allow_search: true
     allow_image: true
     allow_non_to_me: true
-    private_chat_mode: false
+    private_chat_mode: 'off'
     private_chat_whitelist: []
     max_reply_chars: 520
     max_reply_chars_proactive: 220

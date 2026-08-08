@@ -4356,3 +4356,55 @@ class ToolVideoMixin:
         # 或者模型直接改调 analyze_video —— _prompt_cues 早已全局停用（恒返回空元组），
         # 原来的词表判断本就永假。
         return False
+
+
+# ── 公开接口（架构收敛 C1）──────────────────────────────────────────
+# agent 工具层不再直接调 ToolExecutor 的私有 _method_* 穿墙，改走这里的
+# 模块级公开函数。executor 需实现对应 mixin（ToolExecutor 即满足）；私有
+# 实现仍留在 mixin 内，后续阶段可再把实现迁移进公开函数。
+
+
+async def browser_resolve_video(
+    executor: Any,
+    *,
+    url: str,
+    query: str = "",
+    method_name: str = "parse_video",
+) -> ToolResult:
+    """解析视频/图文链接为可发送直链（parse_video 底层能力）。"""
+    return await executor._method_browser_resolve_video(
+        method_name, {"url": url}, query
+    )
+
+
+async def douyin_search_video(
+    executor: Any,
+    *,
+    query: str,
+    limit: int = 5,
+) -> ToolResult:
+    """按关键词搜索抖音视频（douyin_search 底层能力）。"""
+    return await executor._method_douyin_search_video(
+        "douyin.search_video", {"query": query, "limit": limit}, query
+    )
+
+
+async def video_analyze(
+    executor: Any,
+    *,
+    url: str,
+    query: str = "",
+    message_text: str = "",
+    raw_segments: list[dict[str, Any]] | None = None,
+    conversation_id: str = "",
+    method_name: str = "analyze_video",
+) -> ToolResult:
+    """深度视频分析：关键帧 + Vision API + 平台富元数据（analyze_video 底层能力）。"""
+    return await executor._method_video_analyze(
+        method_name,
+        {"url": url},
+        query,
+        message_text=message_text,
+        raw_segments=raw_segments,
+        conversation_id=conversation_id,
+    )

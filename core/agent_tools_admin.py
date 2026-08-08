@@ -496,10 +496,12 @@ async def _handle_bilibili_audio_extract(args: dict[str, Any], context: dict[str
 
 
 async def _handle_music_play(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    """通过 tool_executor 播放音乐，返回音频信息让 app.py 统一发送。
+    """直接调 MusicEngine 播放音乐，返回音频信息让 app.py 统一发送。
 
-    不在此处直接发送语音，避免与 app.py 发送层重复发送。
-    音频文件路径通过 data 字段传递，由 engine → app.py 的 send_response 统一处理。
+    架构收敛 C1：不再经 tool_executor.execute(action="music_play") 路由，
+    改由 agent 工具层直接调 core.music.MusicEngine.play()。不在此处直接发送
+    语音，避免与 app.py 发送层重复发送；音频文件路径通过 data 字段传递，
+    由 engine → app.py 的 send_response 统一处理。
     """
     raw_keyword = str(args.get("keyword", "")).strip()
     # URL 不能被 normalize（会破坏协议和路径），检测到 URL 时保留原始值
@@ -511,35 +513,33 @@ async def _handle_music_play(args: dict[str, Any], context: dict[str, Any]) -> T
         keyword = f"{title} {artist}".strip()
     if not keyword:
         return ToolCallResult(ok=False, error="missing keyword")
+    # 原 router 层 _music_play 在这里剥点歌前缀；直接调 MusicEngine 后由公开
+    # 辅助函数承接，避免在 agent 工具层再抄一份前缀表。
+    from core.music import strip_music_command_prefix
+
+    keyword = strip_music_command_prefix(keyword)
+    if not keyword:
+        return ToolCallResult(ok=False, error="missing keyword")
 
     tool_executor = context.get("tool_executor")
-    group_id = int(context.get("group_id", 0) or 0)
     api_call = context.get("api_call")
 
     if tool_executor is None:
         return ToolCallResult(ok=False, error="tool_executor unavailable")
 
     try:
-        result = await tool_executor.execute(
-            action="music_play",
-            tool_name="music_play",
-            tool_args={"keyword": keyword, "title": title, "artist": artist},
-            message_text=keyword,
-            conversation_id=str(context.get("conversation_id", "")),
-            user_id=str(context.get("user_id", "")),
-            user_name=str(context.get("user_name", "")),
-            group_id=group_id,
-            api_call=api_call,
-            trace_id=str(context.get("trace_id", "")),
+        music_engine = getattr(tool_executor, "_music_engine", None) or context.get("music_engine")
+        if music_engine is None:
+            return ToolCallResult(ok=False, error="music_engine_unavailable")
+        result = await music_engine.play(
+            keyword, as_voice=True, title=title, artist=artist
         )
     except Exception as exc:
         return ToolCallResult(ok=False, error=f"music_play_error: {exc}")
 
     if result is None or not result.ok:
         error_msg = getattr(result, "error", "unknown") if result else "no_result"
-        text = ""
-        if result and hasattr(result, "payload"):
-            text = str(result.payload.get("text", ""))
+        text = getattr(result, "message", "") if result else ""
         # 提供更详细的错误信息
         if not text:
             if error_msg == "no_results":
@@ -550,7 +550,18 @@ async def _handle_music_play(args: dict[str, Any], context: dict[str, Any]) -> T
                 text = f"播放失败: {error_msg}"
         return ToolCallResult(ok=False, error=error_msg, display=text)
 
-    payload = result.payload if result and isinstance(result.payload, dict) else {}
+    # 与 router 层 _music_play 保持一致的 payload 构造：仅在有 api_call 时
+    # 暴露音频文件路径，发送层按策略决定「整段发 / 分段发 / 回退 silk」。
+    payload: dict[str, Any] = {"text": getattr(result, "message", "")}
+    if getattr(result, "audio_path", "") and api_call:
+        payload["audio_file"] = result.audio_path
+        if getattr(result, "silk_path", ""):
+            payload["audio_file_silk"] = result.silk_path
+    elif getattr(result, "silk_path", "") and api_call:
+        payload["audio_file"] = result.silk_path
+    elif getattr(result, "silk_b64", "") and api_call:
+        payload["record_b64"] = result.silk_b64
+
     text = str(payload.get("text", ""))
     audio_file = str(payload.get("audio_file", ""))
     audio_file_silk = str(payload.get("audio_file_silk", ""))
