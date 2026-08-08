@@ -221,7 +221,9 @@ def build_message_handler(
     （同款 _event_to_engine_message + handle_message + deliver_response）。
     """
 
-    async def _default_trace_builder(conversation_id: str, seq: int) -> str:
+    # 注意：必须是同步函数——_event_to_engine_message 同步调用 trace_builder，
+    # async def 会返回协程对象当 trace_id（日志出现 <coroutine object...> + RuntimeWarning）。
+    def _default_trace_builder(conversation_id: str, seq: int) -> str:
         return f"platform-{conversation_id}-{seq}"
 
     builder = trace_builder or _default_trace_builder
