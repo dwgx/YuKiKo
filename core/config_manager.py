@@ -66,10 +66,13 @@ class ConfigManager:
                 raw = merged
             resolved = self._resolve_env_vars(raw)
             try:
-                self._data = self._secret.decrypt_dict(resolved)  # type: ignore[assignment]
+                decrypted = self._secret.decrypt_dict(resolved)  # type: ignore[assignment]
             except DecryptionError as exc:
                 raise RuntimeError(f"配置中的加密字段无法解密: {exc}") from exc
-            self._validate_runtime_config()
+            # 先校验（strict 下失败抛异常，_data 保持旧值）再落盘，避免热重载失败形成双态：
+            # config_manager 服务新非法配置而 engine.config 还是旧对象。
+            self._validate_runtime_config(decrypted)
+            self._data = decrypted
             _log.info("配置已加载: %s", self._config_file)
 
     def reload(self) -> tuple[bool, str]:
@@ -92,7 +95,7 @@ class ConfigManager:
         return list(self._last_validation_issues)
 
     # ── private ───────────────────────────────────────────────
-    def _validate_runtime_config(self) -> None:
+    def _validate_runtime_config(self, data: dict[str, Any] | None = None) -> None:
         """按 schema 校验运行时配置。
 
         漂移（模板与内置默认值、或用户 config.yml 的类型矛盾）静默错下去会
@@ -100,7 +103,8 @@ class ConfigManager:
         当 `validation.strict: true` 或环境变量 `YUKIKO_CONFIG_STRICT=1` 时
         校验失败抛 ConfigValidationError 阻断启动。
         """
-        self._last_validation_issues = validate_config(self._data)
+        target = data if data is not None else self._data
+        self._last_validation_issues = validate_config(target)
         for issue in self._last_validation_issues:
             _log.warning(
                 "config_validation | kind=%s | path=%s | expected=%s | actual=%s",
@@ -109,17 +113,27 @@ class ConfigManager:
                 issue["expected"],
                 issue["actual"],
             )
-        if self._last_validation_issues and self._strict_mode_enabled():
+        if self._last_validation_issues and self._strict_mode_enabled(target):
             detail = "; ".join(
                 f"{i['path']}: expected {i['expected']}, got {i['actual']}"
                 for i in self._last_validation_issues
             )
             raise ConfigValidationError(f"配置校验失败（strict 模式）: {detail}")
 
-    def _strict_mode_enabled(self) -> bool:
-        """strict 模式开关：环境变量 YUKIKO_CONFIG_STRICT=1 或配置 validation.strict=true。"""
+    def _strict_mode_enabled(self, data: dict[str, Any] | None = None) -> bool:
+        """strict 模式开关：环境变量 YUKIKO_CONFIG_STRICT=1 或配置 validation.strict=true。
+
+        从**待校验的配置**（而非已落盘的 self._data）读取 validation.strict，
+        否则 strict 配置本身在热重载/首次加载时读不到。
+        """
         env_strict = os.environ.get(_STRICT_ENV_VAR, "") == "1"
-        cfg_strict = bool(self.get(_STRICT_CONFIG_KEY, False))
+        target = data if data is not None else self._data
+        raw_strict: Any = False
+        if isinstance(target, dict):
+            validation_cfg = target.get("validation")
+            if isinstance(validation_cfg, dict):
+                raw_strict = validation_cfg.get("strict", False)
+        cfg_strict = str(raw_strict).strip().lower() in {"1", "true", "yes"}
         return env_strict or cfg_strict
 
     @staticmethod

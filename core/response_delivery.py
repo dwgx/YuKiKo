@@ -365,9 +365,10 @@ async def deliver_response(
         return chunks
 
     # 文本：语义拆分逐条发送。语音路径下作为语音的文案前缀（app.py 顺序）。
+    # 文本失败不中断：语音/媒体仍要发（NapCat 拒文本时点歌语音不应整个丢失）。
     for chunk in _chunks_for(text):
         if not await guard_send(MessageChain([Plain(chunk)])):
-            return
+            _log.warning("deliver_text_chunk_fail | conversation=%s", conversation_id)
 
     # 语音：短音频单条 silk record；长音频按段切分逐条发送（含发送保护）。
     if has_voice:

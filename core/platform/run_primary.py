@@ -239,6 +239,14 @@ def _wire_bridge(engine: Any, adapter: Any, cfg: dict[str, object]) -> None:
             async def sender(chain: Any) -> bool:
                 return await adapter.send_by_session(conversation_id, chain)
 
+            def mark_failure_fn(gid: int, bid: str, reason: str) -> None:
+                # send_rejected（NapCat 返回 retcode!=0）保持 platform_send_rejected 标签；
+                # 异常按 299 限频 / 120 禁言分类标记，其他错误不标记（避免瞬断整 bot 停发）。
+                if reason == "send_rejected":
+                    _mark_platform_send_failure(gid, bid, "platform_send_rejected")
+                else:
+                    _maybe_mark_platform_send_block(gid, bid, reason)
+
             # 统一发送核心：语义拆分文本 + 限流/熔断/暂停 + 图片/视频 + 语音 silk 分段。
             await deliver_response(
                 config,
@@ -248,7 +256,7 @@ def _wire_bridge(engine: Any, adapter: Any, cfg: dict[str, object]) -> None:
                 group_id=group_id,
                 bot_id=bot_id,
                 sleep_fn=_platform_sleep,
-                mark_failure_fn=_mark_platform_send_failure,
+                mark_failure_fn=mark_failure_fn,
             )
         except Exception:
             _log.warning("platform_msg_error", exc_info=True)

@@ -162,13 +162,28 @@ async def _reply_to_session(
 
     cfg = dict(config or {})
     bot_cfg = cfg.get("bot")
-    if not isinstance(bot_cfg, dict):
+    if isinstance(bot_cfg, dict):
+        # 深拷贝 bot 段：注入 voice_send_max_seconds 不能改写线上 engine.config。
+        cfg["bot"] = dict(bot_cfg)
+    else:
         cfg["bot"] = {}
     if "voice_send_max_seconds" not in cfg["bot"]:
         cfg["bot"]["voice_send_max_seconds"] = voice_max_seconds
 
     async def sender(chain: Any) -> bool:
         return await adapter.send_by_session(session_id, chain)
+
+    def mark_failure_fn(gid: int, bid: str, reason: str) -> None:
+        # 与平台主路径一致：send_rejected 保持标签；异常按 299/120 分类，其他不标记。
+        from core.platform.run_primary import (
+            _mark_platform_send_failure,
+            _maybe_mark_platform_send_block,
+        )
+
+        if reason == "send_rejected":
+            _mark_platform_send_failure(gid, bid, "platform_send_rejected")
+        else:
+            _maybe_mark_platform_send_block(gid, bid, reason)
 
     await deliver_response(
         cfg,
@@ -177,6 +192,7 @@ async def _reply_to_session(
         conversation_id=session_id,
         group_id=group_id,
         bot_id=bot_id,
+        mark_failure_fn=mark_failure_fn,
     )
 
 

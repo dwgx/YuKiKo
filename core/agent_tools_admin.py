@@ -17,6 +17,7 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse
 import httpx
 from core.agent_tools_types import PromptHint, ToolCallResult, ToolSchema
 from core.agent_tools_registry import AgentToolRegistry
+from core.music import MUSIC_PLAY_DESCRIPTION
 from core.napcat_compat import call_napcat_api
 from core.recalled_messages import (
     build_conversation_id as _build_recall_conversation_id,
@@ -128,13 +129,7 @@ def _register_admin_tools(registry: AgentToolRegistry) -> None:
     registry.register(
         ToolSchema(
             name="music_play",
-            description=(
-                "按关键词直接点歌并播放（优先 Alger API，自动下载可播音频并发送语音）。\n"
-                "使用场景: 用户说“点歌 XXX”“来首 XXX”“放歌 XXX”时优先使用本工具。\n"
-                "注意：如果用户明确指定歌手或版本，请优先分开传 title / artist，再把补充限定词放进 keyword。\n"
-                "内部音源顺序应理解为：Alger/官方优先，其次站内正规替代音源，再其次 SoundCloud，最后才是 B 站。\n"
-                "如果标题或歌手对不上，不要为了“能播”就换歌。"
-            ),
+            description=MUSIC_PLAY_DESCRIPTION,
             parameters={
                 "type": "object",
                 "properties": {

@@ -9,6 +9,15 @@ Capabilities:
 """
 from __future__ import annotations
 
+# music_play 工具的描述单一真相源（agent 工具 schema 引用此常量）。
+MUSIC_PLAY_DESCRIPTION = (
+    "按关键词直接点歌并播放（优先 Alger API，自动下载可播音频并发送语音）。\n"
+    "使用场景: 用户说“点歌 XXX”“来首 XXX”“放歌 XXX”时优先使用本工具。\n"
+    "注意：如果用户明确指定歌手或版本，请优先分开传 title / artist，再把补充限定词放进 keyword。\n"
+    "内部音源顺序应理解为：Alger/官方优先，其次站内正规替代音源，再其次 SoundCloud，最后才是 B 站。\n"
+    "如果标题或歌手对不上，不要为了“能播”就换歌。"
+)
+
 import asyncio
 import base64
 import contextlib
