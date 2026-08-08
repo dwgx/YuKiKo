@@ -215,6 +215,9 @@ class AgentResult:
     tool_calls_made: int = 0
     total_time_ms: int = 0
     steps: list[dict[str, Any]] = field(default_factory=list)
+    # 超时/兜底结果的恢复凭据：本回合 checkpoint 的 trace_id，非空时调用方
+    # 可把它作为 resume_checkpoint_id 传入下一次 run 从快照续跑。
+    resume_checkpoint_id: str = ""
 
 
 class AgentLoop:
@@ -1465,8 +1468,51 @@ class AgentLoop:
         }
         return prompt
 
-    async def run(self, ctx: AgentContext) -> AgentResult:
-        """执行 Agent 循环，返回最终结果。"""
+    def _resolve_restored_payload(
+        self,
+        ctx: AgentContext,
+        *,
+        resume_checkpoint: dict[str, Any] | None,
+        resume_checkpoint_id: str,
+    ) -> dict[str, Any] | None:
+        """定位本回合的恢复载荷，找不到返回 None。
+
+        优先级：显式 resume_checkpoint 载荷 > resume_checkpoint_id 从存储加载
+        > 本 trace_id 的历史 checkpoint 文件（与引入参数前的行为一致）。
+        """
+        if isinstance(resume_checkpoint, dict) and resume_checkpoint:
+            return resume_checkpoint
+        checkpoint = (
+            AgentTurnCheckpoint(self.checkpoint_dir)
+            if getattr(self, "checkpoint_dir", None)
+            else None
+        )
+        if checkpoint is None:
+            return None
+        if resume_checkpoint_id:
+            try:
+                return checkpoint.load(resume_checkpoint_id)
+            except Exception:
+                return None
+        try:
+            return checkpoint.load(ctx.trace_id)
+        except Exception:
+            return None
+
+    async def run(
+        self,
+        ctx: AgentContext,
+        *,
+        resume_checkpoint: dict[str, Any] | None = None,
+        resume_checkpoint_id: str = "",
+    ) -> AgentResult:
+        """执行 Agent 循环，返回最终结果。
+
+        resume_checkpoint：显式传入的 checkpoint 载荷（含 step_idx/messages/steps），
+        从此快照续跑、跳过已完成步骤；resume_checkpoint_id：按 id（trace_id）从
+        checkpoint 存储加载后再续跑。两者都不传时维持历史行为：同 trace_id 的既有
+        checkpoint 文件仍会自动恢复，没有文件则从零开始。
+        """
         t0 = time.monotonic()
         steps: list[dict[str, Any]] = []
         strict_tool_routing = self._strict_tool_routing_enabled()
@@ -1520,27 +1566,35 @@ class AgentLoop:
         _tool_timeout_free_budget = 3
         step_idx = -1
         # 回合 checkpoint：超时重试时从上次保存的 step_idx/messages/steps 恢复。
+        # 恢复源优先级见 _resolve_restored_payload：显式 resume 参数 > 存储按 id
+        # 加载 > 本 trace_id 历史文件。
         checkpoint = (
             AgentTurnCheckpoint(self.checkpoint_dir)
             if getattr(self, "checkpoint_dir", None)
             else None
         )
-        if checkpoint is not None:
-            restored = checkpoint.load(ctx.trace_id)
-            if restored:
-                restored_messages = restored.get("messages")
-                if isinstance(restored_messages, list) and restored_messages:
-                    messages = restored_messages
-                    if messages and messages[0].get("role") == "system":
-                        messages[0] = {"role": "system", "content": system_prompt}
-                restored_steps = restored.get("steps")
-                if isinstance(restored_steps, list):
-                    steps = restored_steps
+        restored = self._resolve_restored_payload(
+            ctx,
+            resume_checkpoint=resume_checkpoint,
+            resume_checkpoint_id=resume_checkpoint_id,
+        )
+        if restored is not None:
+            restored_messages = restored.get("messages")
+            if isinstance(restored_messages, list) and restored_messages:
+                messages = restored_messages
+                if messages and messages[0].get("role") == "system":
+                    messages[0] = {"role": "system", "content": system_prompt}
+            restored_steps = restored.get("steps")
+            if isinstance(restored_steps, list):
+                steps = restored_steps
+            try:
                 step_idx = int(restored.get("step_idx", -1))
-                _log.info(
-                    "agent_turn_restored | trace=%s | step_idx=%d | steps=%d | msgs=%d",
-                    ctx.trace_id, step_idx, len(steps), len(messages),
-                )
+            except (TypeError, ValueError):
+                step_idx = -1
+            _log.info(
+                "agent_turn_restored | trace=%s | step_idx=%d | steps=%d | msgs=%d",
+                ctx.trace_id, step_idx, len(steps), len(messages),
+            )
         while step_idx < self.max_steps - 1:
             step_idx += 1
             # 总超时保护
@@ -2756,18 +2810,6 @@ class AgentLoop:
                     )
                 except Exception:
                     pass
-            # 完整恢复 checkpoint：每步保存 step_idx/messages/steps，超时重试可续跑。
-            if checkpoint is not None:
-                try:
-                    checkpoint.save(
-                        trace_id=ctx.trace_id,
-                        step_idx=step_idx,
-                        messages=messages,
-                        steps=steps,
-                    )
-                except Exception:
-                    pass
-
             # 记录 side-effect 发送工具已发送的媒体 URL
             if result.ok and result_tool_name in self._SIDE_EFFECT_SEND_TOOLS:
                 # 从工具返回的 data 中提取媒体 URL
@@ -2848,6 +2890,19 @@ class AgentLoop:
                 response_text,
                 tool_result_msg["tool_result"]
             )
+
+            # 完整恢复 checkpoint：本步已完成（steps/messages 均已更新）后落盘，
+            # 超时重试从 step_idx+1 续跑时带着本步结果，不丢已完成步骤。
+            if checkpoint is not None:
+                try:
+                    checkpoint.save(
+                        trace_id=ctx.trace_id,
+                        step_idx=step_idx,
+                        messages=messages,
+                        steps=steps,
+                    )
+                except Exception:
+                    pass
 
         # 达到 max_steps，用最后的信息兜底
         _log.warning(
@@ -5805,6 +5860,17 @@ class AgentLoop:
             steps=steps,
         )
 
+    def _current_checkpoint_id(self, ctx: AgentContext) -> str:
+        """本回合已落盘 checkpoint 的 trace_id，无则空串。"""
+        if not getattr(self, "checkpoint_dir", None):
+            return ""
+        try:
+            if AgentTurnCheckpoint(self.checkpoint_dir).load(ctx.trace_id):
+                return ctx.trace_id
+        except Exception:
+            return ""
+        return ""
+
     async def _build_fallback_result(
         self,
         ctx: AgentContext,
@@ -5819,6 +5885,9 @@ class AgentLoop:
             return self._undirected_silent_result(
                 ctx, steps, tool_calls_made, t0, reason
             )
+        # 带出恢复凭据：本回合已落盘 checkpoint 时附上 checkpoint_id（= trace_id），
+        # 调用方（queue 超时重试）可把它作为 resume_checkpoint_id 续跑，而非从头再来。
+        resume_checkpoint_id = self._current_checkpoint_id(ctx)
         # 找最后一个可直接面向用户展示的步骤。
         for step in reversed(steps):
             display = normalize_text(str(step.get("display", "")))
@@ -5851,6 +5920,7 @@ class AgentLoop:
                     tool_calls_made=tool_calls_made,
                     total_time_ms=self._elapsed(t0),
                     steps=steps,
+                    resume_checkpoint_id=resume_checkpoint_id,
                 )
         # 工具失败时，只有工具自己写的那句人话才可以直接转给用户（避免二次 LLM
         # 超时后丢失真实原因）。循环里合成的 "<tool> 失败: <error>" 带 display_synthetic
@@ -5886,6 +5956,7 @@ class AgentLoop:
                 tool_calls_made=tool_calls_made,
                 total_time_ms=self._elapsed(t0),
                 steps=steps,
+                resume_checkpoint_id=resume_checkpoint_id,
             )
 
         # 没有可外发的步骤结果 → 按失败类别兜底。
@@ -5931,6 +6002,7 @@ class AgentLoop:
             tool_calls_made=tool_calls_made,
             total_time_ms=self._elapsed(t0),
             steps=steps,
+            resume_checkpoint_id=resume_checkpoint_id,
         )
 
     @classmethod

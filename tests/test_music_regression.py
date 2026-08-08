@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 from types import ModuleType
+from unittest.mock import AsyncMock, patch
 
 from core.agent_tools import (
     _handle_music_play,
@@ -425,25 +426,30 @@ class MusicRegressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handle_music_search_propagates_exact_match_failure(self) -> None:
         class FakeExecutor:
-            async def execute(self, **kwargs):
-                return ToolResult(
+            _music_engine = object()  # 任意非 None：C1c 后 handler 直调公开函数，引擎被 patch
+
+        with patch(
+            "core.tools_music_exec.search_music_with_intent",
+            AsyncMock(
+                return_value=ToolResult(
                     ok=False,
                     tool_name="music_search",
                     error="no_exact_match",
                     payload={"text": "没找到和《洗澡水》明确匹配的歌曲。"},
                 )
-
-        result = await _handle_music_search(
-            {"title": "洗澡水", "artist": "蛋堡"},
-            {
-                "tool_executor": FakeExecutor(),
-                "conversation_id": "",
-                "user_id": "",
-                "user_name": "",
-                "group_id": 0,
-                "api_call": None,
-            },
-        )
+            ),
+        ):
+            result = await _handle_music_search(
+                {"title": "洗澡水", "artist": "蛋堡"},
+                {
+                    "tool_executor": FakeExecutor(),
+                    "conversation_id": "",
+                    "user_id": "",
+                    "user_name": "",
+                    "group_id": 0,
+                    "api_call": None,
+                },
+            )
 
         self.assertFalse(result.ok)
         self.assertEqual(result.error, "no_exact_match")
@@ -532,32 +538,41 @@ class MusicRegressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handle_music_play_by_id_requires_media_payload(self) -> None:
         class FakeExecutor:
-            async def execute(self, **kwargs):
-                return ToolResult(
+            _music_engine = object()  # C1c 后 handler 直调公开函数，引擎被 patch
+
+        with patch(
+            "core.tools_music_exec.play_music_by_id",
+            AsyncMock(
+                return_value=ToolResult(
                     ok=True,
                     tool_name="music_play_by_id",
                     payload={"text": "热水澡"},
                 )
-
-        result = await _handle_music_play_by_id(
-            {"song_id": 76897, "song_name": "热水澡", "artist": "蛋堡"},
-            {
-                "tool_executor": FakeExecutor(),
-                "conversation_id": "",
-                "user_id": "",
-                "user_name": "",
-                "group_id": 0,
-                "api_call": object(),
-            },
-        )
+            ),
+        ):
+            result = await _handle_music_play_by_id(
+                {"song_id": 76897, "song_name": "热水澡", "artist": "蛋堡"},
+                {
+                    "tool_executor": FakeExecutor(),
+                    "conversation_id": "",
+                    "user_id": "",
+                    "user_name": "",
+                    "group_id": 0,
+                    "api_call": object(),
+                },
+            )
 
         self.assertFalse(result.ok)
         self.assertEqual(result.error, "voice_prepare_failed")
 
     async def test_handle_music_play_by_id_returns_media_when_available(self) -> None:
         class FakeExecutor:
-            async def execute(self, **kwargs):
-                return ToolResult(
+            _music_engine = object()  # C1c 后 handler 直调公开函数，引擎被 patch
+
+        with patch(
+            "core.tools_music_exec.play_music_by_id",
+            AsyncMock(
+                return_value=ToolResult(
                     ok=True,
                     tool_name="music_play_by_id",
                     payload={
@@ -566,18 +581,19 @@ class MusicRegressionTests(unittest.IsolatedAsyncioTestCase):
                         "audio_file_silk": "storage/cache/music/demo.silk",
                     },
                 )
-
-        result = await _handle_music_play_by_id(
-            {"song_id": 76897, "song_name": "热水澡", "artist": "蛋堡"},
-            {
-                "tool_executor": FakeExecutor(),
-                "conversation_id": "",
-                "user_id": "",
-                "user_name": "",
-                "group_id": 0,
-                "api_call": object(),
-            },
-        )
+            ),
+        ):
+            result = await _handle_music_play_by_id(
+                {"song_id": 76897, "song_name": "热水澡", "artist": "蛋堡"},
+                {
+                    "tool_executor": FakeExecutor(),
+                    "conversation_id": "",
+                    "user_id": "",
+                    "user_name": "",
+                    "group_id": 0,
+                    "api_call": object(),
+                },
+            )
 
         self.assertTrue(result.ok)
         self.assertEqual(result.data.get("audio_file"), "storage/cache/music/demo.mp3")

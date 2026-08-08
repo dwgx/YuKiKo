@@ -282,10 +282,12 @@ def _make_search_media_handler(search_engine: Any) -> ToolHandler:
         mode = "video" if media_type == "video" else "image"
 
         try:
-            result = await tool_executor.execute(
-                action="search",
-                tool_name="search_media",
-                tool_args={"query": search_query, "mode": mode},
+            from core.tools_search import search_media as _search_media_public
+
+            result = await _search_media_public(
+                tool_executor,
+                query=search_query,
+                mode=mode,
                 message_text=str(context.get("message_text", "")) or search_query,
                 conversation_id=str(context.get("conversation_id", "")),
                 user_id=str(context.get("user_id", "")),

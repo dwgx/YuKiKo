@@ -295,7 +295,12 @@ async def _handle_config_update(args: dict[str, Any], context: dict[str, Any]) -
 
 
 async def _handle_music_search(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    """搜索歌曲，返回结果列表。"""
+    """搜索歌曲，返回结果列表。
+
+    架构收敛 C1c：不再经 tool_executor.execute(action="music_search") 路由，
+    改由 agent 工具层直接调 core.tools_music_exec.search_music_with_intent
+    （前缀剥离与标题/歌手意图过滤在公开函数内，与 router 层同一实现）。
+    """
     raw_keyword = str(args.get("keyword", "")).strip()
     is_url = bool(re.search(r"https?://", raw_keyword))
     keyword = raw_keyword if is_url else normalize_matching_text(raw_keyword)
@@ -311,16 +316,17 @@ async def _handle_music_search(args: dict[str, Any], context: dict[str, Any]) ->
         return ToolCallResult(ok=False, error="tool_executor unavailable")
 
     try:
-        result = await tool_executor.execute(
-            action="music_search",
-            tool_name="music_search",
-            tool_args={"keyword": keyword, "title": title, "artist": artist, "limit": 8},
-            message_text=keyword,
-            conversation_id=str(context.get("conversation_id", "")),
-            user_id=str(context.get("user_id", "")),
-            user_name=str(context.get("user_name", "")),
-            group_id=int(context.get("group_id", 0) or 0),
-            api_call=context.get("api_call"),
+        from core.tools_music_exec import search_music_with_intent
+
+        music_engine = getattr(tool_executor, "_music_engine", None) or context.get("music_engine")
+        if music_engine is None:
+            return ToolCallResult(ok=False, error="music_engine_unavailable")
+        result = await search_music_with_intent(
+            music_engine,
+            keyword=keyword,
+            title=title,
+            artist=artist,
+            limit=8,
         )
         if not result.ok:
             payload = result.payload if isinstance(getattr(result, "payload", None), dict) else {}
@@ -357,7 +363,13 @@ async def _handle_music_search(args: dict[str, Any], context: dict[str, Any]) ->
 
 
 async def _handle_music_play_by_id(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    """根据歌曲 ID 播放音乐。"""
+    """根据歌曲 ID 播放音乐。
+
+    架构收敛 C1c：不再经 tool_executor.execute(action="music_play_by_id") 路由，
+    改由 agent 工具层直接调 core.tools_music_exec.play_music_by_id（内部直调
+    MusicEngine._play_song，与 router 层同一实现）。api_call 上下文保留：
+    底层用它门控是否在 payload 里暴露音频文件路径。
+    """
     song_id = int(args.get("song_id", 0) or 0)
     if song_id <= 0:
         return ToolCallResult(ok=False, error="invalid song_id")
@@ -365,33 +377,25 @@ async def _handle_music_play_by_id(args: dict[str, Any], context: dict[str, Any]
     song_name = normalize_matching_text(str(args.get("song_name", "")))
     artist = normalize_matching_text(str(args.get("artist", "")))
     keyword = normalize_matching_text(str(args.get("keyword", "")))
-    source = normalize_matching_text(str(args.get("source", "")))
-    source_url = normalize_text(str(args.get("source_url", "")))
 
     tool_executor = context.get("tool_executor")
-    group_id = int(context.get("group_id", 0) or 0)
     api_call = context.get("api_call")
 
     if tool_executor is None:
         return ToolCallResult(ok=False, error="tool_executor unavailable")
 
     try:
-        result = await tool_executor.execute(
-            action="music_play_by_id",
-            tool_name="music_play_by_id",
-            tool_args={
-                "song_id": song_id,
-                "song_name": song_name,
-                "artist": artist,
-                "keyword": keyword,
-                "source": source,
-                "source_url": source_url,
-            },
-            message_text="",
-            conversation_id=str(context.get("conversation_id", "")),
-            user_id=str(context.get("user_id", "")),
-            user_name=str(context.get("user_name", "")),
-            group_id=group_id,
+        from core.tools_music_exec import play_music_by_id
+
+        music_engine = getattr(tool_executor, "_music_engine", None) or context.get("music_engine")
+        if music_engine is None:
+            return ToolCallResult(ok=False, error="music_engine_unavailable")
+        result = await play_music_by_id(
+            music_engine,
+            song_id=song_id,
+            song_name=song_name,
+            artist=artist,
+            keyword=keyword,
             api_call=api_call,
         )
         if not result.ok:
@@ -438,7 +442,12 @@ async def _handle_music_play_by_id(args: dict[str, Any], context: dict[str, Any]
 
 
 async def _handle_bilibili_audio_extract(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    """从 Bilibili 提取音频作为音乐回退方案。"""
+    """从 Bilibili 提取音频作为音乐回退方案。
+
+    架构收敛 C1c：不再经 tool_executor.execute(action="bilibili_audio_extract")
+    路由，改由 agent 工具层直接调 core.tools_video.bilibili_audio_extract_video
+    （底层与 router 层同一 mixin 实现）。
+    """
     keyword = normalize_text(str(args.get("keyword", "")))
     if not keyword:
         return ToolCallResult(ok=False, error="missing keyword")
@@ -451,16 +460,14 @@ async def _handle_bilibili_audio_extract(args: dict[str, Any], context: dict[str
         return ToolCallResult(ok=False, error="tool_executor unavailable")
 
     try:
-        result = await tool_executor.execute(
-            action="bilibili_audio_extract",
-            tool_name="bilibili_audio_extract",
-            tool_args={"keyword": keyword},
+        from core.tools_video import bilibili_audio_extract_video
+
+        result = await bilibili_audio_extract_video(
+            tool_executor,
+            keyword=keyword,
             message_text=keyword,
-            conversation_id=str(context.get("conversation_id", "")),
-            user_id=str(context.get("user_id", "")),
-            user_name=str(context.get("user_name", "")),
-            group_id=group_id,
             api_call=api_call,
+            group_id=group_id,
         )
         if not result.ok:
             # 同 _handle_music_play_by_id：不要把人话丢掉只留错误码。

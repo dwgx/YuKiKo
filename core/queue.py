@@ -17,6 +17,9 @@ class QueueDispatchResult:
     seq: int
     pending_count: int = 0
     trace_id: str = ""
+    # 超时取消时带出恢复凭据：该次尝试的 checkpoint 以 trace_id 为文件名，
+    # 重试方拿到 resume_token 即可作为 resume_checkpoint_id 从快照续跑。
+    resume_token: str = ""
 
 
 @dataclass(slots=True)
@@ -445,12 +448,19 @@ class GroupQueueDispatcher:
             status = "cancelled"
             reason = "process_error"
 
+        # 只有 process_timeout 值得续跑：取消/出错时 agent 状态可能不一致。
+        resume_token = (
+            item.trace_id
+            if status == "cancelled" and reason == "process_timeout"
+            else ""
+        )
         dispatch = QueueDispatchResult(
             status=status,
             reason=reason,
             conversation_id=conversation_id,
             seq=item.seq,
             trace_id=item.trace_id,
+            resume_token=resume_token,
         )
         await self._finalize_item(state=state, item=item, dispatch=dispatch)
 

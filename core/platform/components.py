@@ -146,9 +146,7 @@ class MessageChain:
             if seg_type == "text":
                 chain.components.append(Plain(text=str(data.get("text", ""))))
             elif seg_type == "image":
-                chain.components.append(
-                    Image(file=str(data.get("file", "")), url=str(data.get("url", "")))
-                )
+                chain.components.append(Image(file=str(data.get("file", "")), url=str(data.get("url", ""))))
             elif seg_type == "at":
                 qq = str(data.get("qq", ""))
                 if qq == "all":
@@ -156,15 +154,18 @@ class MessageChain:
                 else:
                     chain.components.append(At(qq=qq))
             elif seg_type == "reply":
-                chain.components.append(Reply(message_id=str(data.get("id", ""))))
+                # 取回引用：message_id 保留在 Reply 组件里；非标准实现可能把 id
+                # 放在 message_id 键下，一并兜住。
+                chain.components.append(Reply(message_id=str(data.get("id", "") or data.get("message_id", ""))))
             elif seg_type == "record":
-                chain.components.append(
-                    Record(file=str(data.get("file", "")), url=str(data.get("url", "")))
-                )
+                chain.components.append(Record(file=str(data.get("file", "")), url=str(data.get("url", ""))))
             elif seg_type == "video":
-                chain.components.append(
-                    Video(file=str(data.get("file", "")), url=str(data.get("url", "")))
-                )
+                chain.components.append(Video(file=str(data.get("file", "")), url=str(data.get("url", ""))))
             elif seg_type == "face":
                 chain.components.append(Face(id=str(data.get("id", ""))))
+            elif seg_type in {"mface", "marketface"}:
+                # 蓝图 §4.4（2）：商城表情段跳过，不转组件、不进 message_str。
+                # 入站转换对未知段类型本就静默跳过，这里显式列出 mface 系，
+                # 表明是有意的行为而非漏了分支。
+                continue
         return chain

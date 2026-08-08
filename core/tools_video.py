@@ -16,6 +16,7 @@ import sys
 
 from html import unescape
 from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
@@ -4442,4 +4443,22 @@ async def video_analyze(
         message_text=message_text,
         raw_segments=raw_segments,
         conversation_id=conversation_id,
+    )
+
+
+async def bilibili_audio_extract_video(
+    executor: Any,
+    *,
+    keyword: str,
+    message_text: str = "",
+    api_call: Callable[..., Awaitable[Any]] | None = None,
+    group_id: int = 0,
+) -> ToolResult:
+    """从 Bilibili 提取音频作为音乐回退方案（bilibili_audio_extract 底层能力）。
+
+    搜索 B 站视频、下载音频、转 SILK 的完整链路留在 executor 的 mixin 实现内，
+    这里只做公开入口；能力描述单一真相源见 agent_tools_admin.py 的 ToolSchema。
+    """
+    return await executor._bilibili_audio_extract(
+        {"keyword": keyword}, message_text, api_call, group_id
     )

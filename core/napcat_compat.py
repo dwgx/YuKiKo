@@ -1,27 +1,34 @@
 from __future__ import annotations
 
+import logging
 import os
 import platform
 import re
 import shutil
+import time
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
-from urllib.parse import unquote, urlparse
+from typing import Any
+from urllib.parse import parse_qsl, unquote, urlparse
 
-NAPCAT_ID_KEYS = frozenset({
-    "bot_id",
-    "group_id",
-    "group_openid",
-    "message_id",
-    "operator_id",
-    "peer_id",
-    "qq",
-    "self_id",
-    "target_id",
-    "target_user_id",
-    "user_id",
-    "user_openid",
-})
+_log = logging.getLogger("yukiko.napcat_compat")
+
+NAPCAT_ID_KEYS = frozenset(
+    {
+        "bot_id",
+        "group_id",
+        "group_openid",
+        "message_id",
+        "operator_id",
+        "peer_id",
+        "qq",
+        "self_id",
+        "target_id",
+        "target_user_id",
+        "user_id",
+        "user_openid",
+    }
+)
 NAPCAT_API_ALIASES: dict[str, str] = {
     "send_group_message": "send_group_msg",
     "send_private_message": "send_private_msg",
@@ -38,6 +45,16 @@ NAPCAT_API_ALIASES: dict[str, str] = {
 _VERSION_PART_RE = re.compile(r"\d+")
 _URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _STRING_ID_VERSION_FLOOR = (4, 8, 115)
+
+# 蓝图 §9.5：早期 NapCat 的 get_group_file_url 收 `{file_id, group}`，现版
+# schema 收 `{group_id, file_id}`（NapCat main 源码 GetGroupFileUrl.ts）。
+# 两种拼写都收，统一归一成现版 group_id，老的 group 拼写不会被新 NapCat 拒。
+NAPCAT_API_PARAM_ALIASES: dict[str, dict[str, str]] = {
+    "get_group_file_url": {"group": "group_id"},
+}
+
+# QQ CDN 图片 URL 约 2h 过期（蓝图 §9.4 / §9.7-5），过期后 NapCat 报 url expired。
+IMAGE_URL_TTL_SECONDS = 2 * 60 * 60
 
 
 def _clean_text(value: Any) -> str:
@@ -134,9 +151,27 @@ def _normalize_value(value: Any, *, parent_key: str = "") -> Any:
     return value
 
 
+def _apply_api_param_aliases(api: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """按 API 的参数别名表重命名顶层参数（如 get_group_file_url 的 group → group_id）。
+
+    目标键已显式出现时丢弃冗余别名键，绝不覆盖显式值。
+    """
+    aliases = NAPCAT_API_PARAM_ALIASES.get(api)
+    if not aliases:
+        return kwargs
+    normalized: dict[str, Any] = {}
+    for raw_key, value in kwargs.items():
+        target = aliases.get(_clean_text(raw_key))
+        if target is not None:
+            if target not in kwargs and target not in normalized:
+                normalized[target] = value
+            continue
+        normalized[raw_key] = value
+    return normalized
+
+
 def normalize_napcat_api_kwargs(api: str, kwargs: Mapping[str, Any] | None) -> dict[str, Any]:
-    _ = api
-    source = dict(kwargs or {})
+    source = _apply_api_param_aliases(api, dict(kwargs or {}))
     return _normalize_value(source)
 
 
@@ -158,6 +193,112 @@ async def call_napcat_api(
 
 async def call_napcat_bot_api(bot: Any, api: str, **kwargs: Any) -> Any:
     return await call_napcat_api(bot.call_api, api, **kwargs)
+
+
+# ── QQ CDN 图片 URL 过期（约 2h）检测与刷新 ──
+
+
+def parse_image_url_expiry_ts(url: Any) -> int | None:
+    """从 QQ CDN 图片 URL 的 `t=` 参数里取出过期时间戳（epoch 秒）。
+
+    取不到可解析的时间戳时返回 None —— 普通 http 直链没有 t= 参数，
+    检测函数据此对它永远判「未过期」，绝不误伤。
+    """
+    parsed = urlparse(_clean_text(url))
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key != "t":
+            continue
+        text = _clean_text(value)
+        if not text:
+            continue
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        try:
+            return int(text, 16)
+        except ValueError:
+            continue
+    return None
+
+
+def is_qq_image_url_expired(
+    url: Any,
+    *,
+    now: int | None = None,
+    ttl_seconds: int = IMAGE_URL_TTL_SECONDS,
+) -> bool:
+    """判断 QQ CDN 图片 URL 是否已过期（`t=` 时间戳早于 TTL 边界）。
+
+    没有可解析的 `t=` 时间戳时返回 False —— 宁可漏报也不误报，
+    避免把普通 http 直链误判成过期。发送路径在发送前调用它决定要不要刷新。
+    """
+    ts = parse_image_url_expiry_ts(url)
+    if ts is None:
+        return False
+    return (now if now is not None else int(time.time())) - ts > ttl_seconds
+
+
+def extract_image_url_from_msg_payload(payload: Any) -> str:
+    """从 get_msg 回包里取出第一条 image 段的 url（用于刷新过期 URL）。"""
+    outer = payload if isinstance(payload, dict) else {}
+    data = outer.get("data") if isinstance(outer.get("data"), dict) else outer
+    segments = data.get("message") if isinstance(data.get("message"), list) else None
+    for segment in segments or []:
+        if not isinstance(segment, dict) or segment.get("type") != "image":
+            continue
+        seg_data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
+        url = _clean_text(seg_data.get("url"))
+        if url:
+            return url
+        file_ref = _clean_text(seg_data.get("file"))
+        if file_ref.lower().startswith(("http://", "https://")):
+            return file_ref
+    return ""
+
+
+async def refresh_expired_image_url(
+    url: Any,
+    api_call: Callable[..., Awaitable[Any]] | None,
+    *,
+    message_id: str = "",
+) -> str:
+    """尽力刷新 QQ CDN 图片 URL（约 2h 过期，蓝图 §9.4）。
+
+    - 给了 message_id：`get_msg{message_id}` 从原消息段取回新鲜 url。
+    - url 是 `file://<hash>` 内部资源引用：`get_image{file}` 换成本地路径
+      （本地路径不随 rkey 过期，等价于刷新）。
+    - 其余情况（或刷新失败）原样返回，绝不抛异常 —— 发送路径把它当尽力而为，
+      失败仍按原 URL 发送。
+    """
+    source = _clean_text(url)
+    if not source or api_call is None:
+        return source
+    if message_id:
+        try:
+            payload = await api_call("get_msg", message_id=message_id)
+            refreshed = extract_image_url_from_msg_payload(payload)
+            if refreshed:
+                return refreshed
+        except Exception as exc:
+            _log.warning(
+                "image_url_refresh_get_msg_failed | message_id=%s | %s",
+                message_id,
+                exc,
+            )
+    if source.lower().startswith("file://"):
+        try:
+            payload = await api_call("get_image", file=source)
+        except Exception as exc:
+            _log.warning("image_url_refresh_get_image_failed | src=%s | %s", source, exc)
+            return source
+        data = payload.get("data") if isinstance(payload, dict) else None
+        data = data if isinstance(data, dict) else {}
+        for key in ("file", "file_path", "path", "local_path"):
+            candidate = _clean_text(data.get(key))
+            if candidate:
+                return candidate
+    return source
 
 
 def extract_napcat_version_info(payload: Any) -> dict[str, str]:

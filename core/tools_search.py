@@ -5,12 +5,20 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import unquote, urlparse
 import logging as _logging
 
 from utils.text import clip_text, normalize_text
-from core.tools_types import ToolResult, _tool_trace_tag, _normalize_multimodal_query, _unwrap_redirect_url, _is_known_image_signature
+from core.tools_types import (
+    ToolResult,
+    _tool_trace_id_ctx,
+    _tool_trace_tag,
+    _normalize_multimodal_query,
+    _unwrap_redirect_url,
+    _is_known_image_signature,
+)
 from core.search import SearchResult
 
 _tool_log = _logging.getLogger("yukiko.tools")
@@ -511,3 +519,41 @@ async def browser_fetch_url(
     return await executor._method_browser_fetch_url(
         "browser.fetch_url", {"url": url}, query
     )
+
+
+async def search_media(
+    executor: Any,
+    *,
+    query: str,
+    mode: str,
+    message_text: str = "",
+    conversation_id: str = "",
+    user_id: str = "",
+    user_name: str = "",
+    group_id: int = 0,
+    api_call: Callable[..., Awaitable[Any]] | None = None,
+    raw_segments: list[dict[str, Any]] | None = None,
+    bot_id: str = "",
+    trace_id: str = "",
+) -> ToolResult:
+    """搜索并推送图片/视频/GIF（search_media 底层能力）。
+
+    复用 executor 的 _search 全链路（媒体记忆、直链探测、image/video 模式路由），
+    与 router 层 execute(action="search") 走同一实现；trace 经 _tool_trace_id_ctx
+    透传，保证 _search 内部的日志仍带 trace 标记。
+    """
+    token = _tool_trace_id_ctx.set(normalize_text(trace_id))
+    try:
+        return await executor._search(
+            tool_args={"query": query, "mode": mode},
+            message_text=message_text,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            user_name=user_name,
+            group_id=group_id,
+            api_call=api_call,
+            raw_segments=raw_segments or [],
+            bot_id=bot_id,
+        )
+    finally:
+        _tool_trace_id_ctx.reset(token)
