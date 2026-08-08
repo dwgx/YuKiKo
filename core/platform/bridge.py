@@ -31,6 +31,28 @@ def _event_to_engine_message(
     conversation_id = str(event.get("conversation_id", ""))
     seq = dispatcher.next_seq(conversation_id)
     trace_id = trace_builder(conversation_id=conversation_id, seq=seq)
+    # 从 MessageChain 提取 @/媒体/回复，避免平台路径丢失群聊结构信息
+    # （bot 是否被 @、有没有图片、at 了谁）。
+    chain = event.get("chain")
+    raw_segments: list[Any] = []
+    mentioned = False
+    at_other_user_ids: list[str] = []
+    reply_to_message_id = ""
+    if chain is not None:
+        try:
+            raw_segments = chain.to_onebot_segments()
+            for comp in chain.components:
+                comp_type = type(comp).__name__
+                if comp_type == "At":
+                    qq = str(getattr(comp, "qq", "") or "")
+                    if qq == bot_id:
+                        mentioned = True
+                    elif qq and qq != "all":
+                        at_other_user_ids.append(qq)
+                elif comp_type == "Reply":
+                    reply_to_message_id = str(getattr(comp, "message_id", "") or "")
+        except Exception:
+            _log.warning("platform_chain_parse_fail", exc_info=True)
     return EngineMessage(
         conversation_id=conversation_id,
         user_id=str(event.get("user_id", "")),
@@ -38,15 +60,16 @@ def _event_to_engine_message(
         text=str(event.get("text", "")),
         message_id=str(event.get("message_id", "")),
         seq=seq,
-        raw_segments=[],
+        raw_segments=raw_segments,
         queue_depth=dispatcher.pending_count(conversation_id),
-        mentioned=False,
+        mentioned=mentioned,
         is_private=bool(event.get("is_private", False)),
         timestamp=datetime.now(UTC),
         group_id=int(event.get("group_id", 0) or 0),
         bot_id=bot_id,
-        at_other_user_ids=[],
+        at_other_user_ids=at_other_user_ids,
         trace_id=trace_id,
+        reply_to_message_id=reply_to_message_id,
         event_payload={},
     )
 

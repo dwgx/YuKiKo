@@ -177,5 +177,48 @@ class PlatformMediaSendTests(unittest.TestCase):
         self.assertEqual(_platform_voice_max_seconds(_E()), 45)
 
 
+class PlatformInboundParseTests(unittest.TestCase):
+    """平台路径入站解析：@/媒体/回复不再丢失。"""
+
+    def test_mentioned_and_at_extracted_from_chain(self) -> None:
+        from core.platform.bridge import _event_to_engine_message
+        from core.platform.components import At, MessageChain, Plain
+
+        class _D:
+            def next_seq(self, cid): return 1
+            def pending_count(self, cid): return 0
+
+        chain = MessageChain([Plain("hi"), At(qq="2488687937"), At(qq="12345")])
+        event = {
+            "conversation_id": "group:1", "user_id": "999", "text": "hi",
+            "message_id": "m1", "is_private": False, "group_id": 1, "chain": chain,
+        }
+        msg = _event_to_engine_message(
+            event, dispatcher=_D(), bot_id="2488687937",
+            trace_builder=lambda conversation_id, seq: "t",
+        )
+        self.assertTrue(msg.mentioned)
+        self.assertEqual(msg.at_other_user_ids, ["12345"])
+
+    def test_raw_segments_carried_from_chain(self) -> None:
+        from core.platform.bridge import _event_to_engine_message
+        from core.platform.components import At, MessageChain, Plain
+
+        class _D:
+            def next_seq(self, cid): return 1
+            def pending_count(self, cid): return 0
+
+        chain = MessageChain([Plain("hi"), At(qq="2488687937")])
+        event = {
+            "conversation_id": "group:1", "user_id": "999", "text": "hi",
+            "message_id": "m1", "is_private": False, "group_id": 1, "chain": chain,
+        }
+        msg = _event_to_engine_message(
+            event, dispatcher=_D(), bot_id="2488687937",
+            trace_builder=lambda conversation_id, seq: "t",
+        )
+        self.assertTrue(any(s.get("type") == "at" for s in msg.raw_segments))
+
+
 if __name__ == "__main__":
     unittest.main()
