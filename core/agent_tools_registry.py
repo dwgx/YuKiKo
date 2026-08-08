@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from utils.text import normalize_text
@@ -117,6 +118,11 @@ class AgentToolRegistry:
         self._prompt_hints: list[PromptHint] = []
         self._context_providers: dict[str, tuple[ContextProvider, int, tuple[str, ...]]] = {}
         self._intent_keyword_routing_enabled = False
+        # 会话级 deny 工具集：conversation_id -> {tool_name: deny_ts}。
+        # 蓝图 §4.5：被 deny 的工具不仅拒绝调用，还要从模型可见工具集移除，
+        # 避免模型反复尝试同一个失败工具。deny 是额外的上下文过滤，
+        # 不改变单次调用的权限门行为。带时间戳，超过 TTL 惰性过期。
+        self._denied_tools: dict[str, dict[str, float]] = {}
 
     def register(self, schema: ToolSchema, handler: ToolHandler) -> None:
         self._schemas[schema.name] = schema
@@ -288,6 +294,58 @@ class AgentToolRegistry:
     # 每个分组始终包含的工具名
     _ALWAYS_INCLUDE = {"final_answer", "think", "navigate_section"}
 
+    # 会话级 deny 的存活时长：超过 30 分钟自动恢复可见（查询时惰性清理）。
+    TOOL_DENY_TTL_SECONDS = 1800
+
+    # ── 会话级 deny 工具集（蓝图 §4.5）──
+    # deny 与权限门正交：权限门在单次调用时拒绝执行，deny 在工具集过滤时
+    # 把工具从模型可见 schema 里剔除。两者独立叠加，deny 不绕过权限门。
+
+    def deny_tools_for(self, conversation_id: str, tool_name: str) -> None:
+        """把工具从指定会话的模型可见集移除（记录当前时间戳）。
+
+        重复 deny 会刷新时间戳：工具持续失败时保持被移除状态。
+        """
+        cid = normalize_text(str(conversation_id or ""))
+        name = normalize_text(str(tool_name or ""))
+        if not cid or not name:
+            return
+        self._denied_tools.setdefault(cid, {})[name] = time.time()
+
+    def clear_denied_tools(self, conversation_id: str) -> None:
+        """清除指定会话的全部 deny 记录（会话结束/切换时调用）。"""
+        cid = normalize_text(str(conversation_id or ""))
+        if cid:
+            self._denied_tools.pop(cid, None)
+
+    def _denied_tools_for(self, conversation_id: str) -> set[str]:
+        """返回指定会话当前生效的 deny 工具名集合。
+
+        惰性清理：查询时剔除超过 TTL 的过期项；会话内全部过期后移除该会话记录。
+        """
+        cid = normalize_text(str(conversation_id or ""))
+        if not cid:
+            return set()
+        denied = self._denied_tools.get(cid)
+        if not denied:
+            return set()
+        now = time.time()
+        expired = [
+            name for name, ts in denied.items() if now - ts >= self.TOOL_DENY_TTL_SECONDS
+        ]
+        for name in expired:
+            del denied[name]
+        if not denied:
+            self._denied_tools.pop(cid, None)
+        return set(denied)
+
+    def filter_tools_denied(self, tool_names: Any, conversation_id: str) -> list[str]:
+        """从工具名列表里剔除当前会话已 deny 的工具（含过期惰性清理）。"""
+        denied = self._denied_tools_for(conversation_id)
+        if not denied:
+            return list(tool_names)
+        return [name for name in tool_names if name not in denied]
+
     def _tool_visible_for_permission(self, name: str, permission_level: str) -> bool:
         level = normalize_text(permission_level or "user").lower() or "user"
         is_super = level == "super_admin"
@@ -303,20 +361,29 @@ class AgentToolRegistry:
             return False
         return True
 
-    def _list_tools_for_permission(self, permission_level: str) -> list[str]:
+    def _list_tools_for_permission(
+        self, permission_level: str, conversation_id: str | None = None
+    ) -> list[str]:
         selected: list[str] = []
         for name in self._schemas.keys():
             if not self._tool_visible_for_permission(name, permission_level):
                 continue
             selected.append(name)
+        if conversation_id:
+            selected = self.filter_tools_denied(selected, conversation_id)
         for must_keep in self._ALWAYS_INCLUDE:
             if must_keep in self._schemas and must_keep not in selected:
                 selected.append(must_keep)
         return selected
 
-    def list_tools_for_permission(self, permission_level: str = "user") -> list[str]:
-        """Return the permission-filtered full tool pool before Navigator scoping."""
-        return self._list_tools_for_permission(permission_level)
+    def list_tools_for_permission(
+        self, permission_level: str = "user", conversation_id: str | None = None
+    ) -> list[str]:
+        """Return the permission-filtered full tool pool before Navigator scoping.
+
+        传入 conversation_id 时额外剔除该会话已 deny 的工具（蓝图 §4.5）。
+        """
+        return self._list_tools_for_permission(permission_level, conversation_id)
 
     def set_intent_keyword_routing_enabled(self, enabled: bool) -> None:
         """兼容旧版 Engine: 仅保留开关 API，不再启用本地关键词路由。"""
@@ -330,6 +397,7 @@ class AgentToolRegistry:
         self,
         message_text: str = "",
         permission_level: str = "user",
+        conversation_id: str | None = None,
         **_kwargs: Any,
     ) -> list[str]:
         """Return all tools visible to the current permission level.
@@ -337,7 +405,7 @@ class AgentToolRegistry:
         Tool selection is fully LLM-driven via the system prompt.
         No local keyword filtering is performed.
         """
-        return self._list_tools_for_permission(permission_level)
+        return self._list_tools_for_permission(permission_level, conversation_id)
 
     def get_schemas_for_prompt_filtered(self, tool_names: list[str]) -> str:
         """只渲染指定工具名的 schema 文档。"""

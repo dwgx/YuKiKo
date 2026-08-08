@@ -382,6 +382,7 @@ class AgentLoop:
         self.allow_silent_on_llm_error = False
         self.repeat_tool_guard_enable = True
         self.max_same_tool_call = 3
+        self.tool_deny_enable = True
         self.max_consecutive_think = 3
         self.tool_timeout_seconds = 28
         self.tool_timeout_seconds_media = 45
@@ -474,6 +475,8 @@ class AgentLoop:
         self.max_same_tool_call = max(
             2, min(8, int(agent_cfg.get("max_same_tool_call", 3)))
         )
+        # 蓝图 §4.5：工具连续失败 / loop 熔断后从模型可见集移除，默认开启。
+        self.tool_deny_enable = bool(agent_cfg.get("tool_deny_enable", True))
         self.max_consecutive_think = max(
             2, min(8, int(agent_cfg.get("max_consecutive_think", 3)))
         )
@@ -1645,8 +1648,10 @@ class AgentLoop:
                     )
                 schemas: list[dict[str, Any]] = []
                 if native_tool_calling and ctx.native_tools:
+                    # 蓝图 §4.5：每步重建 schema 前再滤一次 deny，
+                    # 保证本回合中途被 deny 的工具立刻从模型可见集消失。
                     schemas = self.tool_registry.get_schemas_for_native_tools(
-                        ctx.native_tools
+                        self._filter_denied_tools(ctx, ctx.native_tools)
                     )
 
                 # 每步 LLM 调用计时。此前整条链路只有 agent_total_timeout 记总耗时，
@@ -2540,6 +2545,8 @@ class AgentLoop:
                 tool_name, hash_call(tool_name, tool_args)
             )
             if self._is_loop_guard_blocking_level(loop_level):
+                # 蓝图 §4.5：loop critical/circuit 熔断即从本会话可见集移除该工具。
+                denied_now = self._deny_tool_for_conversation(ctx, tool_name)
                 guard_payload = self._record_guard_block(
                     ctx=ctx,
                     steps=steps,
@@ -2552,6 +2559,8 @@ class AgentLoop:
                         "请换一个工具或直接 final_answer，不要重复相同调用。"
                     ),
                 )
+                if denied_now:
+                    self._append_tool_deny_notice(guard_payload)
                 _log.info(
                     "agent_loop_guard | trace=%s | step=%d | tool=%s | level=%s | streak=%d",
                     ctx.trace_id, step_idx, tool_name, loop_level, loop_streak,
@@ -2637,8 +2646,10 @@ class AgentLoop:
                     )
                     continue
 
-            # 致命级循环拦截：如果某个工具连续抛错超过 2 次，强行熔断
+            # 致命级循环拦截：如果某个工具连续抛错超过 2 次，强行熔断。
+            # 蓝图 §4.5：连续失败（第 3 次尝试）同时从本会话可见集移除该工具。
             if consecutive_tool_errors.get(tool_name, 0) >= 2:
+                denied_now = self._deny_tool_for_conversation(ctx, tool_name)
                 guard_payload = self._record_guard_block(
                     ctx=ctx,
                     steps=steps,
@@ -2648,6 +2659,8 @@ class AgentLoop:
                     reason_key="consecutive_crashes_guard",
                     reason_text="该工具已连续崩溃或报错，底层拒绝执行，不要再调用它。",
                 )
+                if denied_now:
+                    self._append_tool_deny_notice(guard_payload)
                 _log.info(
                     "agent_guard_block | trace=%s | step=%d | tool=%s | guard=%s | repeat=%d | has_artifact=%s",
                     ctx.trace_id,
@@ -2986,6 +2999,54 @@ class AgentLoop:
 
     def _is_loop_guard_warn_level(self, level: str) -> bool:
         return level == "warn"
+
+    # ── 会话级工具 deny（蓝图 §4.5）──
+    # 被 deny 的工具不仅拒绝调用，还要从模型可见工具集（schema）移除，
+    # 避免模型反复尝试同一个失败工具。deny 是额外的上下文过滤，
+    # 不改变单次调用的权限门行为。
+
+    _TOOL_DENY_NOTICE = "该工具本会话已禁用，请换工具或直接说明失败。"
+
+    def _deny_tool_for_conversation(self, ctx: AgentContext, tool_name: str) -> bool:
+        """连续失败 / loop 熔断后把工具从当前会话可见集移除。
+
+        返回 True 表示本次真的登记了 deny（开关关闭或 registry 不支持时返回
+        False，保证旧 registry stub / 测试桩不破）。
+        """
+        if not getattr(self, "tool_deny_enable", True):
+            return False
+        registry = getattr(self, "tool_registry", None)
+        deny = getattr(registry, "deny_tools_for", None)
+        if not callable(deny):
+            return False
+        deny(ctx.conversation_id, tool_name)
+        _log.info(
+            "agent_tool_denied | trace=%s | tool=%s | conversation=%s",
+            ctx.trace_id,
+            tool_name,
+            ctx.conversation_id,
+        )
+        return True
+
+    def _filter_denied_tools(self, ctx: AgentContext, tool_names: Any) -> list[str]:
+        """从工具名列表剔除当前会话已 deny 的工具（模型看不到其 schema）。"""
+        if not getattr(self, "tool_deny_enable", True):
+            return list(tool_names)
+        registry = getattr(self, "tool_registry", None)
+        filt = getattr(registry, "filter_tools_denied", None)
+        if not callable(filt):
+            return list(tool_names)
+        try:
+            return list(filt(tool_names, ctx.conversation_id))
+        except TypeError:
+            return list(tool_names)
+
+    @staticmethod
+    def _append_tool_deny_notice(payload: dict[str, Any]) -> None:
+        """把「本会话已禁用」提示追加进守卫回喂 payload 的 display。"""
+        notice = AgentLoop._TOOL_DENY_NOTICE
+        display = payload.get("display", "")
+        payload["display"] = f"{display}\n\n{notice}" if display else notice
 
     # ── 系统提示词构建 ──
 
@@ -3640,7 +3701,10 @@ class AgentLoop:
         previous = state.active_section
         ok, status = navigator.switch_section(state, section_id)
         selected_tools = navigator.scoped_tools(state) or list(state.visible_tools)
-        ctx.native_tools = selected_tools
+        # 蓝图 §4.5：切分区后重算可见集，同样剔除本会话已 deny 的工具。
+        # 过滤后的清单统一用于 native_tools、schema 文档与模型可见的切换展示。
+        visible_tools = self._filter_denied_tools(ctx, selected_tools)
+        ctx.native_tools = visible_tools
         if ok:
             _log.info(
                 "navigator_switch | trace=%s | from=%s | to=%s | count=%d | reason=%s",
@@ -3654,7 +3718,7 @@ class AgentLoop:
                 "navigator_tool_scope | trace=%s | section=%s | tools=%s",
                 ctx.trace_id,
                 state.active_section,
-                ",".join(selected_tools),
+                ",".join(visible_tools),
             )
         else:
             _log.info(
@@ -3664,15 +3728,15 @@ class AgentLoop:
                 section_id,
                 status,
             )
-        tool_docs = self.tool_registry.get_schemas_for_prompt_filtered(selected_tools)
-        display = navigator.render_switch_result(state, selected_tools, tool_docs)
+        tool_docs = self.tool_registry.get_schemas_for_prompt_filtered(visible_tools)
+        display = navigator.render_switch_result(state, visible_tools, tool_docs)
         payload: dict[str, Any] = {
             "tool": NAVIGATE_SECTION_TOOL,
             "ok": ok,
             "display": display if ok else f"{status}\n{display}",
             "data": {
                 "active_section": state.active_section,
-                "tools": selected_tools,
+                "tools": visible_tools,
                 "switch_count": state.switch_count,
             },
         }
@@ -3710,6 +3774,9 @@ class AgentLoop:
         # Prompt Navigator: 本地只用结构信号预选分区，最终由 LLM 复核/跳转。
         perm_level = self._resolve_permission_level(ctx)
         base_tools = self._list_permission_visible_tools(perm_level)
+        # 蓝图 §4.5：回合开始先把本会话已 deny 的工具从可见集剔除，
+        # Navigator 分区和 schema 渲染都基于这份过滤后的清单。
+        base_tools = self._filter_denied_tools(ctx, base_tools)
         selected_tools, navigator_prompt = self._apply_prompt_navigator_scope(
             ctx,
             base_tools,
