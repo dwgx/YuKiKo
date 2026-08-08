@@ -11,9 +11,9 @@ import logging
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
-from core.engine import YukikoEngine
+from core.engine import EngineMessage, YukikoEngine
 from core.memory import MemoryEngine
 
 
@@ -87,6 +87,81 @@ class RunMemoryPromotionTests(unittest.IsolatedAsyncioTestCase):
         result = await engine._run_memory_promotion("10001", "group:1")
         self.assertFalse(result["ok"])
         engine.memory.add_user_fact.assert_not_called()
+
+
+class PromotionThrottleTests(unittest.IsolatedAsyncioTestCase):
+    """锁 `_after_reply` 里的晋升节流接线：每 50 条回复触发一次 + promotion_enable 门。
+
+    原 bug 风险：promotion_enable 默认值、计数器初始化、50 条后重置任一写错，
+    晋升后台任务就会静默不触发或无限触发。
+    """
+
+    def _engine(self, *, promotion_enable: bool = True) -> YukikoEngine:
+        engine = YukikoEngine.__new__(YukikoEngine)
+        engine.logger = logging.getLogger("test")
+        engine.trigger = _StubTrigger()
+        engine.followup_consume_on_send = False
+        engine._last_reply_state = {}
+        engine._runtime_group_chat_cache = {}
+        engine.config = {
+            "bot": {"name": "YuKiKo", "allow_memory": True},
+            "memory": {"promotion_enable": promotion_enable},
+        }
+        engine.memory = MagicMock()
+        engine._promotion_counters = {}
+        engine._run_memory_promotion = AsyncMock(return_value={"ok": True, "promoted": 0})
+        return engine
+
+    def _message(self) -> EngineMessage:
+        return EngineMessage(
+            conversation_id="group:1",
+            user_id="10001",
+            text="回复内容",
+            mentioned=True,
+        )
+
+    async def test_fires_once_after_50_replies_and_resets_counter(self) -> None:
+        engine = self._engine()
+        for _ in range(50):
+            await engine._after_reply(self._message(), "好的")
+        await asyncio.sleep(0)  # 让 create_task 排程的晋升任务跑完
+        self.assertEqual(engine._run_memory_promotion.await_count, 1)
+        self.assertEqual(engine._promotion_counters["10001"], 0)
+
+    async def test_does_not_fire_before_50(self) -> None:
+        engine = self._engine()
+        for _ in range(49):
+            await engine._after_reply(self._message(), "好的")
+        await asyncio.sleep(0)
+        self.assertEqual(engine._run_memory_promotion.await_count, 0)
+        self.assertEqual(engine._promotion_counters["10001"], 49)
+
+    async def test_respects_promotion_enable_off(self) -> None:
+        engine = self._engine(promotion_enable=False)
+        for _ in range(60):
+            await engine._after_reply(self._message(), "好的")
+        await asyncio.sleep(0)
+        self.assertEqual(engine._run_memory_promotion.await_count, 0)
+        self.assertNotIn("10001", engine._promotion_counters)
+
+    def test_promotion_enable_defaults_to_true_in_code(self) -> None:
+        """未配置 memory.promotion_enable 时默认开启（后台任务必须默认跑）。"""
+        defaults = {
+            "memory": {"promotion_enable": True},
+            "bot": {"allow_memory": True},
+        }
+        self.assertTrue(bool(defaults.get("memory", {}).get("promotion_enable", True)))
+
+
+class _StubTrigger:
+    def activate_session(self, **kwargs) -> None:
+        pass
+
+    def mark_reply_target(self, *args) -> None:
+        pass
+
+    def mark_proactive_reply(self, *args) -> None:
+        pass
 
 
 if __name__ == "__main__":

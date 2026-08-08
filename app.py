@@ -712,7 +712,11 @@ def _silk_encode_for_record_sync(audio_path: Path, max_seconds: int) -> Path | N
                     return silk_path
             except Exception:
                 pass
-        pcm_path = audio_path.with_suffix(".silk_src.pcm")
+        # 中间文件用唯一临时名 + os.replace 原子落盘：同一音频并发编码（不同群同歌）
+        # 不再互相覆盖/unlink（旧固定路径 .silk/.silk_src.pcm 会被并发线程写坏，导致回退 mp3）。
+        uid = uuid4().hex
+        tmp_silk = audio_path.with_name(f".{audio_path.stem}.{uid}.silk")
+        tmp_pcm = audio_path.with_name(f".{audio_path.stem}.{uid}.silk_src.pcm")
         try:
             cmd = [
                 _FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "warning",
@@ -720,26 +724,28 @@ def _silk_encode_for_record_sync(audio_path: Path, max_seconds: int) -> Path | N
             ]
             if max_seconds > 0:
                 cmd += ["-t", str(max_seconds)]
-            cmd.append(str(pcm_path))
+            cmd.append(str(tmp_pcm))
             proc = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
-            if proc.returncode != 0 or not pcm_path.exists() or pcm_path.stat().st_size < 256:
+            if proc.returncode != 0 or not tmp_pcm.exists() or tmp_pcm.stat().st_size < 256:
                 return None
             try:
                 # pilk 0.2.4 签名: encode(pcm, silk, pcm_rate, silk_rate, tencent)。
                 # silk_rate 也传 24000 且 tencent=True 才产出 QQ 可用的 tencent 头 silk；
                 # (24000, True) 会把 True 落到 silk_rate，产出非 tencent 8kHz 低质文件。
-                encoder.encode(str(pcm_path), str(silk_path), 24000, 24000, True)
+                encoder.encode(str(tmp_pcm), str(tmp_silk), 24000, 24000, True)
             except TypeError:
                 try:
-                    encoder.encode(str(pcm_path), str(silk_path), sample_rate=24000, tencent=True)
+                    encoder.encode(str(tmp_pcm), str(tmp_silk), sample_rate=24000, tencent=True)
                 except TypeError:
                     try:
-                        encoder.encode(str(pcm_path), str(silk_path), 24000, True)
+                        encoder.encode(str(tmp_pcm), str(tmp_silk), 24000, True)
                     except TypeError:
-                        with pcm_path.open("rb") as src, silk_path.open("wb") as dst:
+                        with tmp_pcm.open("rb") as src, tmp_silk.open("wb") as dst:
                             encoder.encode(src, dst, 24000, 24000, True)
-            if not silk_path.exists() or silk_path.stat().st_size < 256:
+            if not tmp_silk.exists() or tmp_silk.stat().st_size < 256:
                 return None
+            # 原子落盘到稳定 silk_path，供后续调用/其他层（music）复用。
+            os.replace(tmp_silk, silk_path)
             _log.info(
                 "voice_silk_encode_ok | src=%s | silk=%s | size=%d",
                 audio_path.name,
@@ -748,7 +754,8 @@ def _silk_encode_for_record_sync(audio_path: Path, max_seconds: int) -> Path | N
             )
             return silk_path
         finally:
-            pcm_path.unlink(missing_ok=True)
+            tmp_pcm.unlink(missing_ok=True)
+            tmp_silk.unlink(missing_ok=True)
     except Exception as exc:
         _log.warning("voice_silk_encode_fail | %s", exc)
         return None
@@ -2117,18 +2124,6 @@ def register_handlers(engine: YukikoEngine) -> None:
                             original_duration = await asyncio.to_thread(_probe_audio_duration_seconds_sync, effective_audio_path)
                             is_long_audio = original_duration > float(voice_send_max_seconds) + 0.8
 
-                        # QQ 语音必须 silk 编码：发送前把源音频转成 silk（截断到 max_seconds），
-                        # 否则 mp3 直发在 QQ 端点开无法播放（NapCat 不保证自动转码）。
-                        record_audio_path = effective_audio_path
-                        if effective_audio_path is not None:
-                            silk_candidate = await _silk_encode_for_record(
-                                effective_audio_path, voice_send_max_seconds
-                            )
-                            if silk_candidate is not None:
-                                record_audio_path = silk_candidate
-                        full_audio_uri = _build_file_uri(
-                            record_audio_path if record_audio_path is not None else audio_source
-                        )
                         try_full_for_current = voice_send_try_full_first
                         split_enable_for_current = voice_send_split_enable
                         if is_music_voice_action and voice_send_music_force_full:
@@ -2138,23 +2133,40 @@ def register_handlers(engine: YukikoEngine) -> None:
                         if source_is_silk and effective_audio_path is not None and effective_audio_path != resolved_audio_path:
                             if is_long_audio and split_enable_for_current:
                                 try_full_for_current = False
+                        record_audio_path = effective_audio_path
+                        # 兜底判断需要 full_audio_uri 恒有值：未走直发时是未编码的原文件 URI。
+                        full_audio_uri = _build_file_uri(
+                            effective_audio_path if effective_audio_path is not None else audio_source
+                        )
                         tried_full_direct = False
-                        # 短音频默认直接发送；长音频按配置决定是否先尝试完整发送。
-                        if full_audio_uri and (try_full_for_current or not is_long_audio):
-                            tried_full_direct = True
-                            _log.info(
-                                "voice_send_try_full | trace=%s | src=%s | duration=%.2fs | max=%ss | long=%s",
-                                payload.trace_id,
-                                effective_audio_path.name if effective_audio_path is not None else clip_text(audio_source, 80),
-                                original_duration,
-                                voice_send_max_seconds,
-                                is_long_audio,
+                        # QQ 语音必须 silk 编码：发送前把源音频转成 silk（截断到 max_seconds），
+                        # 否则 mp3 直发在 QQ 端点开无法播放（NapCat 不保证自动转码）。
+                        # 只在"将直发"分支做整段编码——长音频若不直发（等切片）不白编一遍 60s silk。
+                        if try_full_for_current or not is_long_audio:
+                            if effective_audio_path is not None:
+                                silk_candidate = await _silk_encode_for_record(
+                                    effective_audio_path, voice_send_max_seconds
+                                )
+                                if silk_candidate is not None:
+                                    record_audio_path = silk_candidate
+                            full_audio_uri = _build_file_uri(
+                                record_audio_path if record_audio_path is not None else audio_source
                             )
-                            sent_voice = await send_msg(Message(MessageSegment.record(file=full_audio_uri)))
-                            if sent_voice:
-                                _log.info("voice_send_try_full_ok | trace=%s", payload.trace_id)
-                            else:
-                                _log.warning("voice_send_try_full_fail | trace=%s", payload.trace_id)
+                            if full_audio_uri:
+                                tried_full_direct = True
+                                _log.info(
+                                    "voice_send_try_full | trace=%s | src=%s | duration=%.2fs | max=%ss | long=%s",
+                                    payload.trace_id,
+                                    effective_audio_path.name if effective_audio_path is not None else clip_text(audio_source, 80),
+                                    original_duration,
+                                    voice_send_max_seconds,
+                                    is_long_audio,
+                                )
+                                sent_voice = await send_msg(Message(MessageSegment.record(file=full_audio_uri)))
+                                if sent_voice:
+                                    _log.info("voice_send_try_full_ok | trace=%s", payload.trace_id)
+                                else:
+                                    _log.warning("voice_send_try_full_fail | trace=%s", payload.trace_id)
 
                         # 长音频：完整发送失败后可自动切片分段发送。
                         if (

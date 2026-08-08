@@ -4,7 +4,9 @@ import asyncio
 import contextlib
 import json
 
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query
+from starlette.routing import WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from core.webui_route_context import WebUIRouteContext
 
@@ -18,7 +20,6 @@ def build_log_router(ctx: WebUIRouteContext) -> APIRouter:
         log_lines = ctx.read_log_tail(log_file, lines)
         return {"lines": log_lines}
 
-    @router.websocket("/logs/stream")
     async def ws_log_stream(ws: WebSocket):
         if not await ctx.check_ws_auth(ws):
             return
@@ -42,7 +43,7 @@ def build_log_router(ctx: WebUIRouteContext) -> APIRouter:
 
                 current_size = log_file.stat().st_size
                 if current_size > last_size:
-                    with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                    with open(log_file, encoding="utf-8", errors="replace") as f:
                         f.seek(last_size)
                         new_content = f.read()
                         if new_content:
@@ -66,5 +67,10 @@ def build_log_router(ctx: WebUIRouteContext) -> APIRouter:
         finally:
             with contextlib.suppress(Exception):
                 await ws.close()
+
+    # FastAPI 0.141 的 @router.websocket 在真实 uvicorn 下对 ws 升级会提前 close(403)
+    # （与 run_primary 的 @app.websocket 同机制，TestClient 测不出，只影响真实连接）。
+    # 改用 Starlette WebSocketRoute：HTTP 仍走 FastAPI，/logs/stream 的 ws 走此路由。
+    router.routes.append(WebSocketRoute("/logs/stream", ws_log_stream))
 
     return router

@@ -9,15 +9,18 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from app import _silk_encode_for_record, _silk_encode_for_record_sync
 
 _FFMPEG = shutil.which("ffmpeg")
+_APP_PY = Path(__file__).resolve().parent.parent / "app.py"
 
 
 class VoiceSilkRegressionTests(unittest.TestCase):
@@ -69,6 +72,91 @@ class VoiceSilkRegressionTests(unittest.TestCase):
             p.write_bytes(b"\x02" * 500)
             out = asyncio.run(_silk_encode_for_record(p, 0))
             self.assertEqual(out, p)
+
+    def test_concurrent_encode_same_audio_no_collision(self) -> None:
+        """同一音频并发编码（不同群同歌）不互相覆盖：都用唯一临时文件 + os.replace 原子落盘。"""
+        if not _FFMPEG:
+            self.skipTest("ffmpeg not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            mp3 = Path(tmp) / "sine.mp3"
+            self._make_mp3(mp3, seconds=4)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f1 = pool.submit(_silk_encode_for_record_sync, mp3, 60)
+                f2 = pool.submit(_silk_encode_for_record_sync, mp3, 60)
+                out1, out2 = f1.result(), f2.result()
+            self.assertIsNotNone(out1, "并发编码线程 1 不应失败回退 mp3")
+            self.assertIsNotNone(out2, "并发编码线程 2 不应失败回退 mp3")
+            # 返回的是稳定 silk 路径（供后续复用），不是临时名。
+            self.assertEqual(out1, mp3.with_suffix(".silk"))
+            self.assertEqual(out2, mp3.with_suffix(".silk"))
+            self.assertTrue(out1.exists())
+            self.assertGreater(out1.stat().st_size, 256)
+
+    def test_encode_cleans_up_temp_files(self) -> None:
+        """编码后不残留 .silk_src.pcm / 点号开头临时 silk（finally + os.replace）。"""
+        if not _FFMPEG:
+            self.skipTest("ffmpeg not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            mp3 = Path(tmp) / "sine.mp3"
+            self._make_mp3(mp3)
+            out = _silk_encode_for_record_sync(mp3, 60)
+            self.assertIsNotNone(out)
+            leftover_pcm = list(Path(tmp).glob("*.silk_src.pcm"))
+            self.assertEqual(leftover_pcm, [], "pcm 临时文件应在 finally 清理")
+            leftover_tmp_silk = list(Path(tmp).glob(".*.silk"))
+            self.assertEqual(leftover_tmp_silk, [], "silk 临时文件应被 os.replace 或清理")
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["sine.mp3", "sine.silk"])
+
+    def test_returns_stable_silk_path_for_reuse(self) -> None:
+        """原子落盘后返回稳定 path（audio.with_suffix('.silk')），music 层复用不落临时名。"""
+        if not _FFMPEG:
+            self.skipTest("ffmpeg not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            mp3 = Path(tmp) / "sine.mp3"
+            self._make_mp3(mp3)
+            out = _silk_encode_for_record_sync(mp3, 60)
+            self.assertEqual(out, mp3.with_suffix(".silk"))
+
+
+class VoiceSendSilkTimingRegressionTests(unittest.TestCase):
+    """锁 app.py 语音发送的两处优化（review Medium）：
+
+    a. 完整文件转 silk 只在"将直发"分支内执行——长音频若不直发（等切片）不白编。
+    b. silk/pcm 用临时文件 + os.replace 原子落盘，避免同音频并发互相覆盖。
+
+    handle_message 是 ~1400 行的大 handler，无法黑盒驱动，按仓库惯例用 AST/source 判据锁结构。
+    """
+
+    @staticmethod
+    def _app_source() -> str:
+        return _APP_PY.read_text(encoding="utf-8")
+
+    def test_full_file_silk_encode_is_inside_direct_send_branch(self) -> None:
+        src = self._app_source()
+        match = re.search(
+            r"await\s+_silk_encode_for_record\(\s*effective_audio_path,\s*voice_send_max_seconds\s*\)",
+            src,
+        )
+        self.assertIsNotNone(match, "完整文件 silk 编码调用应存在")
+        branch_idx = src.find("if try_full_for_current or not is_long_audio:")
+        self.assertGreater(branch_idx, -1, "直发分支条件应存在")
+        # 调用必须位于直发分支条件之后（长音频不走直发时不会被预编码）。
+        self.assertGreater(match.start(), branch_idx, "完整文件 silk 编码应位于直发分支内")
+        # 分支之前不应再有同参数的无条件调用（旧代码在 tried_full_direct 前先编）。
+        pre = src[:branch_idx]
+        self.assertNotIn(
+            "await _silk_encode_for_record(", pre,
+            "直发分支前不应有完整文件转 silk 的无条件调用",
+        )
+
+    def test_silk_encode_uses_unique_temp_names(self) -> None:
+        src = self._app_source()
+        # 编码函数体内应生成带 uuid 的临时 silk/pcm 名，并用 os.replace 原子落盘。
+        self.assertRegex(src, r"tmp_silk\s*=\s*audio_path\.with_name\(f\"\..*\.silk\"\)")
+        self.assertRegex(src, r"tmp_pcm\s*=\s*audio_path\.with_name\(f\"\..*\.silk_src\.pcm\"\)")
+        self.assertIn("os.replace(tmp_silk, silk_path)", src)
+        # 旧固定路径产物应消失。
+        self.assertNotIn('with_suffix(".silk_src.pcm")', src)
 
 
 if __name__ == "__main__":

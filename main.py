@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
-import io
 import contextlib
+import io
 import logging
 import os
 import socket
@@ -16,11 +16,11 @@ if sys.stdout.encoding and sys.stdout.encoding.lower().replace("-", "") != "utf8
 from pathlib import Path
 
 import nonebot
+from app import create_engine, register_handlers
+from core.setup import needs_setup
+from core.setup import run as run_setup
 from dotenv import load_dotenv
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
-
-from app import create_engine, register_handlers
-from core.setup import needs_setup, run as run_setup
 
 
 def _is_interactive_tty() -> bool:
@@ -129,13 +129,19 @@ nonebot.init()
 driver = nonebot.get_driver()
 driver.register_adapter(OneBotV11Adapter)
 
+# FastAPI 0.141 的 add_api_websocket_route（NoneBot fastapi driver 挂 OneBot ws）在真实
+# uvicorn 下会提前 close(403)。把 OneBot 的 APIWebSocketRoute 换成 Starlette WebSocketRoute。
+from core.nonebot_ws_patch import patch_nonebot_ws_routes
+
+patch_nonebot_ws_routes(driver)
+
 engine = create_engine()
 register_handlers(engine)
 
 # WebUI 管理面板 API
 from core.webui import init_webui
-from starlette.staticfiles import StaticFiles
 from starlette.responses import FileResponse, RedirectResponse, Response
+from starlette.staticfiles import StaticFiles
 
 app = nonebot.get_asgi()
 app.include_router(init_webui(engine))
