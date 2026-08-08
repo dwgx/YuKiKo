@@ -545,12 +545,15 @@ class AgentToolRegistry:
             if key in self._STRICT_QQ_FIELDS:
                 raw_qq = sanitized[key]
                 if (
-                    isinstance(raw_qq, str)
+                    key == "qq"
+                    and isinstance(raw_qq, str)
                     and not normalize_text(raw_qq)
                     and key not in required
                 ):
-                    # 空串且非必填：视为"未传"，交给 handler 兜底
-                    # （如 get_qq_avatar 回退到当前用户），而不是报 invalid_qq。
+                    # 仅 "qq"（可省略的 QQ 号，如 get_qq_avatar）空串视为"未传"，
+                    # 交给 handler 兜底回退当前用户。其它 strict QQ 字段（user_id /
+                    # group_id / qq_number 等）空串仍走 _normalize_qq_id 报 invalid，
+                    # 避免 handler 收到空串后 int("") 崩溃或作用到错误目标。
                     continue
                 qq_id = self._normalize_qq_id(raw_qq)
                 if qq_id is None:

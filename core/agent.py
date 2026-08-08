@@ -429,17 +429,7 @@ class AgentLoop:
         self.tool_args_log_max_chars = 600
 
         # 安全: 需要管理员权限的工具 (与 AgentToolRegistry 保持同步)
-        self._super_admin_tools = {
-            "set_group_leave",
-            "delete_friend",
-            "cli_invoke",
-            "config_update",
-            "admin_command",
-            "clean_cache",
-            "set_qq_avatar",
-            "set_online_status",
-            "set_self_longnick",
-        }
+        self._super_admin_tools = set(AgentToolRegistry._SUPER_ADMIN_TOOLS)
         # 从 registry 取，不再手维护第二份。
         #
         # 原来这里是一份硬编码清单，和 `AgentToolRegistry._GROUP_ADMIN_TOOLS`
@@ -2547,6 +2537,7 @@ class AgentLoop:
                     continue
             if (
                 tool_name in self._group_admin_tools
+                and tool_name != "delete_message"
                 and not self._is_explicit_bot_addressed(ctx)
             ):
                 steps.append(

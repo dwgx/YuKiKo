@@ -968,16 +968,20 @@ def _summarize_credential_payload(payload: Any, domain: str) -> dict[str, Any]:
     has_csrf = any(body.get(key) not in (None, "", 0) for key in _CSRF_PAYLOAD_KEYS)
 
     def _has_rkey(body: dict[str, Any]) -> bool:
-        for key, value in body.items():
-            if "rkey" in normalize_text(str(key)).lower():
-                return True
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict) and any(
-                        "rkey" in normalize_text(str(ik)).lower() for ik in item
-                    ):
+        def _check(obj: Any) -> bool:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if "rkey" in normalize_text(str(k)).lower():
                         return True
-        return False
+                    if _check(v):
+                        return True
+            elif isinstance(obj, list):
+                for item in obj:
+                    if _check(item):
+                        return True
+            return False
+
+        return _check(body)
 
     summary: dict[str, Any] = {
         "redacted": True,
@@ -1284,6 +1288,15 @@ async def _handle_delete_message(args: dict[str, Any], context: dict[str, Any]) 
                 ok=False,
                 error="permission_denied:not_bot_own_message",
                 display="你只能撤回我自己发送的消息，无法撤回他人的消息。",
+            )
+        # 跨群保护：普通用户只能撤回当前会话所在群里的机器人消息，防猜 message_id 跨群删。
+        msg_group_id = normalize_text(str(item.get("group_id", "")))
+        cur_group_id = normalize_text(str(context.get("group_id", "")))
+        if msg_group_id and cur_group_id and msg_group_id != cur_group_id:
+            return ToolCallResult(
+                ok=False,
+                error="permission_denied:cross_group",
+                display="你只能撤回当前群内我发送的消息。",
             )
     await _record_recalled_message_from_message_id(
         message_id,
@@ -4089,8 +4102,8 @@ async def _handle_nc_get_user_status(args: dict[str, Any], context: dict[str, An
 
 async def _handle_translate_en2zh(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     words = args.get("words", "")
-    # registry 的 string 类型强转会把 None/空容器转成 "None"/"[]" 等字面量串，
-    # 这些不是待翻译文本，直接视为缺参，避免把 junk 串当真去调翻译 API。
+    # registry 的 string 强转会把 None 转成空串；但模型可能字面传 "none"/"null"/"[]"
+    # 这类非文本，直接视为缺参，避免把 junk 串当真去调翻译 API。
     _JUNK_WORDS = {"none", "null", "[]", "{}", "()"}
     if isinstance(words, str):
         text = normalize_text(words)

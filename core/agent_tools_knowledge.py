@@ -534,7 +534,7 @@ async def _handle_search_zhihu(args: dict[str, Any], context: dict[str, Any]) ->
     mode = str(args.get("mode", "hot")).strip().lower()
     query = str(args.get("query", "")).strip()
     question_id = str(args.get("question_id", "")).strip()
-    # registry 的 string 强转会把 null 变成 "None"，视为缺参而不是真的去搜 "None"。
+    # registry 的 string 强转把 null 转成空串；模型也可能字面传 "none"/"null"，视为缺参。
     if query.lower() in {"none", "null"}:
         query = ""
     if question_id.lower() in {"none", "null"}:

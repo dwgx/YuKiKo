@@ -1845,6 +1845,17 @@ class MusicEngine:
                 True,
             )
 
+        def _path_pos_tencent() -> Any:
+            # pilk 0.2.4: encode(pcm, silk, pcm_rate, silk_rate, tencent)。
+            # silk_rate 也传 24000 且 tencent=True 才产出 QQ 可用的 tencent 头 silk。
+            return encoder_mod.encode(
+                str(pcm_path),
+                str(silk_path),
+                24000,
+                24000,
+                True,
+            )
+
         def _file_kw_with_bitrate() -> Any:
             with pcm_path.open("rb") as src, silk_path.open("wb") as dst:
                 return encoder_mod.encode(
@@ -1882,16 +1893,28 @@ class MusicEngine:
                     True,
                 )
 
+        def _file_pos_tencent() -> Any:
+            with pcm_path.open("rb") as src, silk_path.open("wb") as dst:
+                return encoder_mod.encode(
+                    src,
+                    dst,
+                    24000,
+                    24000,
+                    True,
+                )
+
         attempts: list[tuple[str, Any]] = []
         if prefer_keywords:
             ordered = [
                 ("kw_with_bitrate", _path_kw_with_bitrate, _file_kw_with_bitrate),
                 ("kw_no_bitrate", _path_kw_no_bitrate, _file_kw_no_bitrate),
+                ("pos_tencent", _path_pos_tencent, _file_pos_tencent),
                 ("pos_with_bitrate", _path_pos_with_bitrate, _file_pos_with_bitrate),
                 ("pos_legacy", _path_pos_legacy, _file_pos_legacy),
             ]
         else:
             ordered = [
+                ("pos_tencent", _path_pos_tencent, _file_pos_tencent),
                 ("pos_with_bitrate", _path_pos_with_bitrate, _file_pos_with_bitrate),
                 ("pos_legacy", _path_pos_legacy, _file_pos_legacy),
                 ("kw_with_bitrate", _path_kw_with_bitrate, _file_kw_with_bitrate),

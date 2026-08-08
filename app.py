@@ -725,13 +725,19 @@ def _silk_encode_for_record_sync(audio_path: Path, max_seconds: int) -> Path | N
             if proc.returncode != 0 or not pcm_path.exists() or pcm_path.stat().st_size < 256:
                 return None
             try:
-                encoder.encode(str(pcm_path), str(silk_path), sample_rate=24000, tencent=True)
+                # pilk 0.2.4 签名: encode(pcm, silk, pcm_rate, silk_rate, tencent)。
+                # silk_rate 也传 24000 且 tencent=True 才产出 QQ 可用的 tencent 头 silk；
+                # (24000, True) 会把 True 落到 silk_rate，产出非 tencent 8kHz 低质文件。
+                encoder.encode(str(pcm_path), str(silk_path), 24000, 24000, True)
             except TypeError:
                 try:
-                    encoder.encode(str(pcm_path), str(silk_path), 24000, True)
+                    encoder.encode(str(pcm_path), str(silk_path), sample_rate=24000, tencent=True)
                 except TypeError:
-                    with pcm_path.open("rb") as src, silk_path.open("wb") as dst:
-                        encoder.encode(src, dst, 24000, True)
+                    try:
+                        encoder.encode(str(pcm_path), str(silk_path), 24000, True)
+                    except TypeError:
+                        with pcm_path.open("rb") as src, silk_path.open("wb") as dst:
+                            encoder.encode(src, dst, 24000, 24000, True)
             if not silk_path.exists() or silk_path.stat().st_size < 256:
                 return None
             _log.info(
@@ -1460,13 +1466,14 @@ def register_handlers(engine: YukikoEngine) -> None:
         voice_limit_default = _as_int(music_cfg_rt.get("max_voice_duration_seconds", 60), 60)
         voice_limit_raw = bot_cfg_rt.get("voice_send_max_seconds", voice_limit_default)
         voice_send_max_seconds = max(0, _as_int(voice_limit_raw, voice_limit_default))
-        # 默认策略：优先整段发送，分段作为可选兜底能力（默认关闭）。
-        voice_send_try_full_first = bool(bot_cfg_rt.get("voice_send_try_full_first", True))
-        voice_send_split_enable = bool(bot_cfg_rt.get("voice_send_split_enable", False))
+        # 默认策略与 config/templates/master.template.yml + _built_in_config_defaults 对齐：
+        # 长音频（>60s）默认走分段（每段 60s silk），短音频整段直发。
+        voice_send_try_full_first = bool(bot_cfg_rt.get("voice_send_try_full_first", False))
+        voice_send_split_enable = bool(bot_cfg_rt.get("voice_send_split_enable", True))
         voice_send_split_max_segments = max(1, min(20, _as_int(bot_cfg_rt.get("voice_send_split_max_segments", 8), 8)))
-        # 点歌语音默认优先整段直发，不走分段切片。
-        voice_send_music_force_full = bool(bot_cfg_rt.get("voice_send_music_force_full", True))
-        voice_send_music_disable_split = bool(bot_cfg_rt.get("voice_send_music_disable_split", True))
+        # 点歌语音默认允许分段，不强制整段直发。
+        voice_send_music_force_full = bool(bot_cfg_rt.get("voice_send_music_force_full", False))
+        voice_send_music_disable_split = bool(bot_cfg_rt.get("voice_send_music_disable_split", False))
         send_rate_max_per_window, send_rate_window_seconds, send_rate_warn_threshold, send_rate_enable = (
             _resolve_send_rate_profile(cfg)
         )
