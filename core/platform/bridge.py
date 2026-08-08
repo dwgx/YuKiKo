@@ -51,11 +51,32 @@ def _event_to_engine_message(
     )
 
 
-async def _reply_to_session(adapter: OneBot11Adapter, session_id: str, response: EngineResponse) -> None:
-    text = str(getattr(response, "text", "") or "")
-    if not text:
-        return
-    await adapter.send_by_session(session_id, MessageChain([Plain(text)]))
+async def _reply_to_session(
+    adapter: OneBot11Adapter,
+    session_id: str,
+    response: EngineResponse,
+    voice_max_seconds: int = 60,
+) -> None:
+    """发送 EngineResponse 到会话：文本 + 语音（silk record）+ 图片 + 视频。"""
+    from core.platform.run_primary import _resolve_record_ref
+    from core.platform.components import Image, Record, Video
+
+    components: list[Any] = []
+    # EngineResponse 的文本字段是 reply_text（不是 text）。
+    text = str(getattr(response, "reply_text", "") or "")
+    if text:
+        components.append(Plain(text))
+    record_ref = await _resolve_record_ref(response, voice_max_seconds)
+    if record_ref:
+        components.append(Record(file=record_ref))
+    image_url = str(getattr(response, "image_url", "") or "")
+    if image_url:
+        components.append(Image(file=image_url))
+    video_url = str(getattr(response, "video_url", "") or "")
+    if video_url:
+        components.append(Video(file=video_url))
+    if components:
+        await adapter.send_by_session(session_id, MessageChain(components))
 
 
 async def register_onebot11_platform(
