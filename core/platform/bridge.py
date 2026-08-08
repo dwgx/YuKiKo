@@ -27,6 +27,7 @@ def _event_to_engine_message(
     dispatcher: Any,
     bot_id: str,
     trace_builder: Any,
+    api_call: Any = None,
 ) -> EngineMessage:
     conversation_id = str(event.get("conversation_id", ""))
     seq = dispatcher.next_seq(conversation_id)
@@ -70,6 +71,7 @@ def _event_to_engine_message(
         at_other_user_ids=at_other_user_ids,
         trace_id=trace_id,
         reply_to_message_id=reply_to_message_id,
+        api_call=api_call,
         event_payload={},
     )
 
@@ -133,10 +135,18 @@ async def register_onebot11_platform(
     )
     bot_id = str(cfg.get("bot_id", ""))
 
+    async def _platform_api_call(api: str, **kwargs: Any) -> Any:
+        # 供工具层经 NapCat 调用 OneBot API（music_play 依赖 api_call 才携带 audio_file）。
+        return await adapter._send_api(api, kwargs)
+
     async def message_handler(event: dict[str, Any]) -> None:
         try:
             payload = _event_to_engine_message(
-                event, dispatcher=dispatcher, bot_id=bot_id, trace_builder=builder
+                event,
+                dispatcher=dispatcher,
+                bot_id=bot_id,
+                trace_builder=builder,
+                api_call=_platform_api_call,
             )
             response: EngineResponse = await engine.handle_message(payload)
             await _reply_to_session(adapter, str(event.get("conversation_id", "")), response)

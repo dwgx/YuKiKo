@@ -386,6 +386,10 @@ def _wire_bridge(engine: Any, adapter: Any, cfg: dict[str, object]) -> None:
     )
     bot_id = str(cfg.get("bot_id", ""))
 
+    async def _platform_api_call(api: str, **kwargs: Any) -> Any:
+        # 供工具层经 NapCat 调用 OneBot API（如 get_msg / set_group_card 等）。
+        return await adapter._send_api(api, kwargs)
+
     async def message_handler(event: dict[str, object]) -> None:
         try:
             payload = _event_to_engine_message(
@@ -393,6 +397,7 @@ def _wire_bridge(engine: Any, adapter: Any, cfg: dict[str, object]) -> None:
                 dispatcher=dispatcher,
                 bot_id=bot_id,
                 trace_builder=lambda conversation_id, seq: f"platform-{conversation_id}-{seq}",
+                api_call=_platform_api_call,
             )
             response = await engine.handle_message(payload)
             conversation_id = str(event.get("conversation_id", ""))

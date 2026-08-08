@@ -220,5 +220,31 @@ class PlatformInboundParseTests(unittest.TestCase):
         self.assertTrue(any(s.get("type") == "at" for s in msg.raw_segments))
 
 
+    def test_api_call_injected_into_message(self) -> None:
+        """平台路径必须注入 api_call（否则 music_play 等工具不携带 audio_file，点歌无语音）。"""
+        from core.platform.bridge import _event_to_engine_message
+        from core.platform.components import MessageChain, Plain
+
+        class _D:
+            def next_seq(self, cid): return 1
+            def pending_count(self, cid): return 0
+
+        async def fake_api(api: str, **kwargs):
+            return {"data": {}, "retcode": 0}
+
+        chain = MessageChain([Plain("点歌 晴天")])
+        event = {
+            "conversation_id": "group:1", "user_id": "999", "text": "点歌 晴天",
+            "message_id": "m1", "is_private": False, "group_id": 1, "chain": chain,
+        }
+        msg = _event_to_engine_message(
+            event, dispatcher=_D(), bot_id="2488687937",
+            trace_builder=lambda conversation_id, seq: "t",
+            api_call=fake_api,
+        )
+        self.assertIsNotNone(msg.api_call)
+        self.assertEqual(msg.api_call, fake_api)
+
+
 if __name__ == "__main__":
     unittest.main()
