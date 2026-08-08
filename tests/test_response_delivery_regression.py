@@ -182,6 +182,7 @@ class ResponseDeliveryMusicVoiceTests(unittest.IsolatedAsyncioTestCase):
             response = EngineResponse(action="music_play", reason="test", audio_file=str(mp3))
             sender = _MockSender()
             trimmed = Path(tmp) / "song.voice60s.mp3"
+            trimmed.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
             with (
                 patch("app._probe_audio_duration_seconds_sync", return_value=200.0),
                 patch(
@@ -209,7 +210,8 @@ class ResponseDeliveryMusicVoiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sender.send_count, 1)
             records = _record_files(sender.sent_chains)
             self.assertEqual(len(records), 1)
-            self.assertTrue(records[0].endswith("song.voice60s.mp3"))
+            # 兜底也走 base64（NapCat 沙盒下 file:// 必败）。
+            self.assertTrue(records[0].startswith("base64://"))
 
     async def test_silk_source_swap_splits_sibling_mp3(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -301,6 +303,7 @@ class ResponseDeliveryMusicVoiceTests(unittest.IsolatedAsyncioTestCase):
             response = EngineResponse(action="reply", reason="test", audio_file=str(mp3))
             sender = _MockSender()
             silk = Path(tmp) / "music_demo.silk"
+            silk.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
             with (
                 patch("app._probe_audio_duration_seconds_sync", return_value=200.0),
                 patch("app._silk_encode_for_record", new=AsyncMock(return_value=silk)),

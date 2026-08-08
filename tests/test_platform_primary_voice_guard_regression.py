@@ -126,6 +126,7 @@ class PlatformPrimaryVoiceSplitTests(unittest.IsolatedAsyncioTestCase):
             _wire_bridge(engine, adapter, {"bot_id": "123"})
 
             silk = Path(tmp) / "clip.silk"
+            silk.write_bytes(b"\x02#!SILK" + b"\x00" * 500)
             with (
                 patch("app._probe_audio_duration_seconds_sync", return_value=30.0),
                 patch("app._silk_encode_for_record", new=AsyncMock(return_value=silk)),
@@ -140,7 +141,8 @@ class PlatformPrimaryVoiceSplitTests(unittest.IsolatedAsyncioTestCase):
                 for f in _record_files(chain)
             ]
             self.assertEqual(len(voice_files), 1)
-            self.assertIn(".silk", voice_files[0])
+            # NapCat 沙盒读不到 file:// 项目路径，语音直接以 base64 发送。
+            self.assertTrue(voice_files[0].startswith("base64://"))
 
 
 class PlatformPrimarySendGuardTests(unittest.IsolatedAsyncioTestCase):

@@ -26,15 +26,17 @@ class OneBot11DispatchTests(unittest.IsolatedAsyncioTestCase):
         self.adapter._send_api = fake_send_api  # type: ignore[method-assign]
 
     async def test_dispatch_send_group_msg(self) -> None:
-        data = await self.adapter._dispatch_api(
+        data, retcode = await self.adapter._dispatch_api(
             "send_group_msg", {"group_id": 42, "message": [{"type": "text", "data": {"text": "hi"}}]}
         )
         self.assertEqual(data, {"message_id": 1})
+        self.assertEqual(retcode, 0)
         self.assertEqual(self.sent_calls[0][0], "send_group_msg")
 
     async def test_unknown_action_returns_empty(self) -> None:
-        data = await self.adapter._dispatch_api("some_unknown", {})
+        data, retcode = await self.adapter._dispatch_api("some_unknown", {})
         self.assertEqual(data, {})
+        self.assertEqual(retcode, 0)
         self.assertEqual(self.sent_calls, [])
 
     async def test_send_by_session_group(self) -> None:

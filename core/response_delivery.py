@@ -326,7 +326,9 @@ async def _send_voice(
     sent_voice = False
     if try_full_for_current or not is_long_audio:
         # QQ 语音必须 silk 编码：只在"将直发"分支做整段编码——长音频若不直发（等切片）不白编。
-        record_audio_path = effective_audio_path
+        # silk 转换失败时**不发裸 mp3**（NapCat 沙盒下 base64 mp3 也必走 ffmpeg 转换、必败），
+        # 记录失败让上层走分段/裁剪兜底或明确提示。
+        record_audio_path = None
         if effective_audio_path is not None:
             silk_candidate = await _silk_encode_for_record(effective_audio_path, max_seconds)
             if silk_candidate is not None:
@@ -349,7 +351,10 @@ async def _send_voice(
                     record_audio_path, guard_send, conversation_id, "full"
                 )
             else:
-                sent_voice = await guard_send(MessageChain([Record(file=full_audio_uri)]))
+                _log.warning(
+                    "deliver_voice_silk_encode_failed | conversation=%s",
+                    conversation_id,
+                )
             if sent_voice:
                 _log.info("deliver_voice_try_full_ok | conversation=%s", conversation_id)
             else:
@@ -435,17 +440,14 @@ async def _send_voice(
         fallback_silk = None
         if send_audio_path is not None:
             fallback_silk = await _silk_encode_for_record(send_audio_path, max_seconds)
-        fallback_uri = build_napcat_file_reference(
-            fallback_silk
-            if fallback_silk is not None
-            else (send_audio_path if send_audio_path is not None else audio_file)
-        )
-        # 已完整尝试过同一路径则不重复发送。
-        if fallback_uri and (not tried_full_direct or fallback_uri != full_audio_uri):
-            sent_voice = await guard_send(MessageChain([Record(file=fallback_uri)]))
-        elif not fallback_uri:
+        if fallback_silk is not None:
+            # 兜底也走 base64（NapCat 沙盒下 file:// 必败）。
+            sent_voice = await _send_record_base64(
+                fallback_silk, guard_send, conversation_id, "fallback"
+            )
+        else:
             _log.warning(
-                "deliver_voice_file_uri_empty | conversation=%s | audio=%s",
+                "deliver_voice_fallback_no_silk | conversation=%s | audio=%s",
                 conversation_id,
                 str(audio_file)[:120],
             )

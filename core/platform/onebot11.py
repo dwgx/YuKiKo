@@ -162,24 +162,45 @@ class OneBot11Adapter(Platform):
             await websocket.close(code=4401)
             return
         self._authenticated = True
-        self._active_ws = websocket
-        self._ws_send_text = lambda text: websocket.send(text)
-        async for raw in websocket:
+        if self._napcat_ws is not None and self._napcat_ws is not websocket:
+            # 只接受 NapCat 单连接；额外连接拒绝（防劫持/自环/槽位占用）。
+            _log.warning("onebot_ws_extra_connection_rejected")
             try:
-                payload = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            echo = payload.get("echo")
-            if echo is not None and echo in self._pending_api:
-                # 我们上行 {action,params,echo} 的回包：resolve 对应 future。
-                future = self._pending_api.pop(echo, None)
-                if future is not None and not future.done():
-                    future.set_result(payload)
-                continue
-            if "action" in payload:
-                await self._handle_api(websocket, payload)
-            else:
-                await self._dispatch_event(payload)
+                await websocket.close(code=4001)
+            except Exception:
+                pass
+            return
+        self._napcat_ws = websocket
+        self._napcat_send = lambda text: websocket.send(text)
+        self._active_ws = websocket
+        self._ws_send_text = self._napcat_send
+        _log.info("onebot_ws_connected | napcat")
+        try:
+            async for raw in websocket:
+                try:
+                    payload = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                echo = payload.get("echo")
+                if echo is not None and echo in self._pending_api:
+                    # 我们上行 {action,params,echo} 的回包：resolve 对应 future。
+                    future = self._pending_api.pop(echo, None)
+                    if future is not None and not future.done():
+                        future.set_result(payload)
+                    continue
+                if "action" in payload:
+                    await self._handle_api(websocket, payload)
+                else:
+                    await self._dispatch_event(payload)
+        except Exception:
+            pass
+        finally:
+            if self._napcat_ws is websocket:
+                self._napcat_ws = None
+                self._napcat_send = None
+            if self._active_ws is websocket:
+                self._active_ws = None
+                self._ws_send_text = None
 
     async def handle_starlette_ws(self, websocket: Any) -> None:
         """Starlette WebSocket 入口（挂 uvicorn 与 WebUI 同端口时用）。"""
@@ -192,20 +213,22 @@ class OneBot11Adapter(Platform):
                 pass
             return
         self._authenticated = True
-        # 第一个连接视为 NapCat（固定用于 API 转发 + 事件接收）。
-        # 额外连接（调试/WebUI 直连）独立接受：可发 API 请求、不替换 NapCat，
-        # 避免 _send_api 把请求发到错误连接（自环）。
-        is_napcat = self._napcat_ws is None
-        if is_napcat:
-            self._napcat_ws = websocket
-            self._napcat_send = lambda text: websocket.send_text(text)
-            self._active_ws = websocket
-            self._ws_send_text = self._napcat_send
-            _log.info("onebot_ws_connected | napcat")
-        else:
-            _log.info("onebot_ws_extra_connected | debug")
-        await websocket.accept()
+        if self._napcat_ws is not None and self._napcat_ws is not websocket:
+            # 只接受 NapCat 单连接。额外连接（调试/劫持）会占用槽位导致 NapCat
+            # 事件被丢弃（失聪）——直接拒绝。NapCat 重连时旧连接 finally 清理后再接受。
+            _log.warning("onebot_ws_extra_connection_rejected")
+            try:
+                await websocket.close(code=4001)
+            except Exception:
+                pass
+            return
+        self._napcat_ws = websocket
+        self._napcat_send = lambda text: websocket.send_text(text)
+        self._active_ws = websocket
+        self._ws_send_text = self._napcat_send
+        _log.info("onebot_ws_connected | napcat")
         try:
+            await websocket.accept()
             while True:
                 raw = await websocket.receive_text()
                 payload = json.loads(raw)
@@ -217,8 +240,7 @@ class OneBot11Adapter(Platform):
                     continue
                 if "action" in payload:
                     await self._handle_api(websocket, payload)
-                elif is_napcat:
-                    # 事件只从 NapCat 连接进来；额外连接不冒充事件源。
+                else:
                     await self._dispatch_event(payload)
         except Exception:
             pass
@@ -244,18 +266,24 @@ class OneBot11Adapter(Platform):
         action = str(payload.get("action", ""))
         params = payload.get("params") or {}
         echo = payload.get("echo")
-        data = await self._dispatch_api(action, params)
-        response = {"status": "ok", "retcode": 0, "data": data, "echo": echo}
+        data, retcode = await self._dispatch_api(action, params)
+        response = {
+            "status": "ok" if retcode == 0 else "failed",
+            "retcode": retcode,
+            "data": data,
+            "echo": echo,
+        }
         # 响应必须发回**请求来源连接**（NapCat 的 API 响应走 NapCat 连接，调试连接走调试连接），
         # 不能用 _send_text（那固定发到 NapCat 连接）。
         send_back = getattr(websocket, "send_text", None) or getattr(websocket, "send", None)
         if send_back is not None:
             await send_back(json.dumps(response, ensure_ascii=False))
 
-    async def _dispatch_api(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def _dispatch_api(self, action: str, params: dict[str, Any]) -> tuple[dict[str, Any], int]:
         """API 分派：支持 OneBot 核心动作（发送/撤回/改群名片/取消息）。
 
-        通过当前 WS 连接上行 `{action, params, echo}` 到 NapCat，按 echo 匹配响应。
+        固定经 NapCat 连接上行 `{action, params, echo}`，返回 (data, retcode)——
+        retcode 透传真实结果，避免调用方谎报成功。
         """
         if action not in {
             "send_group_msg",
@@ -266,9 +294,9 @@ class OneBot11Adapter(Platform):
             "set_group_card",
             "get_msg",
         }:
-            return {}
+            return {}, 0
         response = await self._send_api(action, params)
-        return response.get("data", {})
+        return response.get("data", {}), int(response.get("retcode", 0))
 
     async def _send_api(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         """上行 OneBot API 调用并等响应（echo 匹配）。固定经 NapCat 连接转发。"""

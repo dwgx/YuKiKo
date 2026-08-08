@@ -71,3 +71,4 @@ htmlcov/
 
 # 迁移工作草稿（生成物，可删）
 .migration/
+.playwright-mcp/
