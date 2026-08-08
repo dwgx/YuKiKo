@@ -139,7 +139,7 @@ def _wire_bridge(engine: Any, adapter: Any, cfg: dict[str, object]) -> None:
                 event,
                 dispatcher=dispatcher,
                 bot_id=bot_id,
-                trace_builder=lambda c, s: f"platform-{c}-{s}",
+                trace_builder=lambda conversation_id, seq: f"platform-{conversation_id}-{seq}",
             )
             response = await engine.handle_message(payload)
             components: list[Any] = []
