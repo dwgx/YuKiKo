@@ -6,9 +6,9 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner.svg?t=b29ecf49a2bb" />
-  <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg?t=b29ecf49a2bb" />
-  <img src="docs/assets/banner.svg?t=b29ecf49a2bb" width="100%" alt="YuKiKo — AI QQ bot · OneBot + NapCat + LLM 路由 + 插件 + WebUI" />
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner.svg?t=499222bd9a2a" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg?t=499222bd9a2a" />
+  <img src="docs/assets/banner.svg?t=499222bd9a2a" width="100%" alt="YuKiKo — AI QQ bot · OneBot + NapCat + LLM 路由 + 插件 + WebUI" />
 </picture>
 
 <br/>
