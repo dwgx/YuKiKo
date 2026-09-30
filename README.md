@@ -2,6 +2,25 @@
 
 # YuKiKo Bot
 
+<!-- dwgx-banner:BEGIN -->
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner.svg?t=35808c01582e" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg?t=35808c01582e" />
+  <img src="docs/assets/banner.svg?t=35808c01582e" width="100%" alt="YuKiKo — AI QQ bot · OneBot + NapCat + LLM 路由 + 插件 + WebUI" />
+</picture>
+
+<br/>
+
+Python · MIT · ★20
+
+[guide](https://github.com/dwgx/YuKiKo/blob/main/docs/en/GUIDE.md) · [issues](https://github.com/dwgx/YuKiKo/issues)
+
+</div>
+<!-- dwgx-banner:END -->
+
+
 **基于 NoneBot2 + OneBot V11 的智能 QQ 机器人**
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)

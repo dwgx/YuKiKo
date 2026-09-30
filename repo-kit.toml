@@ -1,0 +1,15 @@
+# repo-kit · 本仓库的 banner 规格
+# 改这个文件，workflow 会重新渲染 docs/assets/banner*.svg 与 README 区块
+# 生成器：https://github.com/dwgx/DWGX/tree/main/repo-kit
+owner = "dwgx"
+
+[[repo]]
+name = "YuKiKo"
+style = "pipe"
+tagline = "AI QQ bot · OneBot + NapCat + LLM 路由 + 插件 + WebUI"
+install = "bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh)"
+lang = "Python"
+license = "MIT"
+stages = ["onebot", "route", "llm", "plugin", "webui"]
+topics = ["ai-gateway", "chatbot", "llm-agent", "onebot", "qq-bot"]
+links = [{ label = "guide", url = "https://github.com/dwgx/YuKiKo/blob/main/docs/en/GUIDE.md" }, { label = "issues", url = "https://github.com/dwgx/YuKiKo/issues" }]
